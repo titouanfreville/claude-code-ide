@@ -1,0 +1,12 @@
+[package]
+name = "moonlight-worktree"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Adapter: git-worktree-per-session isolation + FileLockMediator (FR35, FR52).
+# Implemented in build Slice 3.
+[dependencies]
+moonlight-domain.workspace = true

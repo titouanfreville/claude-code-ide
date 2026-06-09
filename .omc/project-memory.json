@@ -1,0 +1,378 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1781016958821,
+  "projectRoot": "/Users/titouan/perso/claude-code-ide",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": "1.77",
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "cd /Users/titouan/perso/claude-code-ide; export PATH=\"$HOME/.cargo/bin:$PATH\" && rtk cargo build 2>&1 | tail -6 && echo \"=== tests ===\" && rtk cargo test -p moonlight-control -p moonlight-desktop -p moonlight-domain -p moonlight-engine 2>&1 | tail -6 && echo \"=== clippy (touched) ===\" && rtk proxy cargo clippy -p moonlight-control -p moonlight-desktop 2>&1 | grep -c \"^warning: unused\\|^error\"",
+    "testCommand": "cd /Users/titouan/perso/claude-code-ide; export PATH=\"$HOME/.cargo/bin:$PATH\" && rtk cargo build 2>&1 | tail -6 && echo \"=== tests ===\" && rtk cargo test -p moonlight-control -p moonlight-desktop -p moonlight-domain -p moonlight-engine 2>&1 | tail -6 && echo \"=== clippy (touched) ===\" && rtk proxy cargo clippy -p moonlight-control -p moonlight-desktop 2>&1 | grep -c \"^warning: unused\\|^error\"",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "_bmad": {
+      "path": "_bmad",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1781016958809,
+      "keyFiles": []
+    },
+    "apps": {
+      "path": "apps",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1781016958809,
+      "keyFiles": []
+    },
+    "crates": {
+      "path": "crates",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1781016958809,
+      "keyFiles": []
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1781016958810,
+      "keyFiles": [
+        "CACHEDIR.TAG"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "apps/desktop/src/views/workspace.rs",
+      "accessCount": 125,
+      "lastAccessed": 1780988025437,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/session_monitor.rs",
+      "accessCount": 55,
+      "lastAccessed": 1780951095257,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/grid_home.rs",
+      "accessCount": 39,
+      "lastAccessed": 1780990194936,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/db_observer.rs",
+      "accessCount": 36,
+      "lastAccessed": 1780948794255,
+      "type": "file"
+    },
+    {
+      "path": "crates/engine/src/supervisor.rs",
+      "accessCount": 34,
+      "lastAccessed": 1780990364392,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/main.rs",
+      "accessCount": 29,
+      "lastAccessed": 1781017219659,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/services.rs",
+      "accessCount": 26,
+      "lastAccessed": 1780944599525,
+      "type": "file"
+    },
+    {
+      "path": ".ai/handoffs/00-status-and-tasks.md",
+      "accessCount": 25,
+      "lastAccessed": 1780990519727,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/terminal.rs",
+      "accessCount": 24,
+      "lastAccessed": 1780949175334,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/obs.rs",
+      "accessCount": 16,
+      "lastAccessed": 1780927156870,
+      "type": "file"
+    },
+    {
+      "path": "crates/persistence/src/store.rs",
+      "accessCount": 16,
+      "lastAccessed": 1780950975638,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/mod.rs",
+      "accessCount": 12,
+      "lastAccessed": 1780948176636,
+      "type": "file"
+    },
+    {
+      "path": "crates/mcp-server/src/transport.rs",
+      "accessCount": 11,
+      "lastAccessed": 1780944671760,
+      "type": "file"
+    },
+    {
+      "path": "crates/domain/src/trust.rs",
+      "accessCount": 10,
+      "lastAccessed": 1780944526767,
+      "type": "file"
+    },
+    {
+      "path": "crates/mcp-server/src/lib.rs",
+      "accessCount": 9,
+      "lastAccessed": 1780944536605,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/phase_verbs.rs",
+      "accessCount": 9,
+      "lastAccessed": 1780948934783,
+      "type": "file"
+    },
+    {
+      "path": "crates/engine/src/lib.rs",
+      "accessCount": 9,
+      "lastAccessed": 1780950986283,
+      "type": "file"
+    },
+    {
+      "path": "crates/domain/src/ports/store.rs",
+      "accessCount": 9,
+      "lastAccessed": 1780990043015,
+      "type": "file"
+    },
+    {
+      "path": "crates/control/src/server.rs",
+      "accessCount": 9,
+      "lastAccessed": 1781017130365,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/status_bar.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780922324239,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/http.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780942383973,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/term/emulator.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780949264761,
+      "type": "file"
+    },
+    {
+      "path": "crates/mcp-server/src/adapters.rs",
+      "accessCount": 8,
+      "lastAccessed": 1780990162409,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/mcp_host.rs",
+      "accessCount": 7,
+      "lastAccessed": 1780927194533,
+      "type": "file"
+    },
+    {
+      "path": "crates/control/src/lib.rs",
+      "accessCount": 7,
+      "lastAccessed": 1781017166046,
+      "type": "file"
+    },
+    {
+      "path": "Cargo.toml",
+      "accessCount": 6,
+      "lastAccessed": 1780943668409,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/theme.rs",
+      "accessCount": 5,
+      "lastAccessed": 1780928038489,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/structure.rs",
+      "accessCount": 5,
+      "lastAccessed": 1780928038929,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/Cargo.toml",
+      "accessCount": 5,
+      "lastAccessed": 1780943677331,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/file_tree.rs",
+      "accessCount": 5,
+      "lastAccessed": 1780947861407,
+      "type": "file"
+    },
+    {
+      "path": "crates/trust/src/lib.rs",
+      "accessCount": 4,
+      "lastAccessed": 1780922300929,
+      "type": "file"
+    },
+    {
+      "path": "crates/domain/src/phase.rs",
+      "accessCount": 4,
+      "lastAccessed": 1780948903889,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/http_verbs.rs",
+      "accessCount": 3,
+      "lastAccessed": 1780927153138,
+      "type": "file"
+    },
+    {
+      "path": "crates/domain/src/lib.rs",
+      "accessCount": 3,
+      "lastAccessed": 1780942410041,
+      "type": "file"
+    },
+    {
+      "path": "crates/persistence/src/migrations.rs",
+      "accessCount": 3,
+      "lastAccessed": 1780950914584,
+      "type": "file"
+    },
+    {
+      "path": "crates/domain/src/ports/mcp.rs",
+      "accessCount": 3,
+      "lastAccessed": 1780990042646,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/hook_install.rs",
+      "accessCount": 3,
+      "lastAccessed": 1781017245620,
+      "type": "file"
+    },
+    {
+      "path": "crates/domain/src/economy.rs",
+      "accessCount": 2,
+      "lastAccessed": 1780922320978,
+      "type": "file"
+    },
+    {
+      "path": "crates/control/src/classify.rs",
+      "accessCount": 2,
+      "lastAccessed": 1780922635430,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/docker.rs",
+      "accessCount": 2,
+      "lastAccessed": 1780922667165,
+      "type": "file"
+    },
+    {
+      "path": "crates/domain/src/continuity.rs",
+      "accessCount": 2,
+      "lastAccessed": 1780948895688,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/obs_store.rs",
+      "accessCount": 1,
+      "lastAccessed": 1780918760633,
+      "type": "file"
+    },
+    {
+      "path": "CLAUDE.md",
+      "accessCount": 1,
+      "lastAccessed": 1780918781040,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/chrome_requests.rs",
+      "accessCount": 1,
+      "lastAccessed": 1780919208243,
+      "type": "file"
+    },
+    {
+      "path": "crates/control/src/config.rs",
+      "accessCount": 1,
+      "lastAccessed": 1780922313551,
+      "type": "file"
+    },
+    {
+      "path": "crates/control/src/paths.rs",
+      "accessCount": 1,
+      "lastAccessed": 1780922327759,
+      "type": "file"
+    },
+    {
+      "path": "AGENTS.md",
+      "accessCount": 1,
+      "lastAccessed": 1780922372180,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/run.rs",
+      "accessCount": 1,
+      "lastAccessed": 1780925745324,
+      "type": "file"
+    },
+    {
+      "path": "crates/persistence/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1780927139649,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/run_verbs.rs",
+      "accessCount": 1,
+      "lastAccessed": 1780927149703,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

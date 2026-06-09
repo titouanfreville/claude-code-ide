@@ -1,0 +1,82 @@
+[package]
+name = "moonlight-desktop"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "moonlight"
+path = "src/main.rs"
+
+# Composition root + the GPUI grid-home shell (Slice 1). GPUI revs are pinned in
+# the workspace manifest for a reproducible build.
+[dependencies]
+moonlight-domain.workspace = true
+moonlight-core.workspace = true
+moonlight-engine.workspace = true
+moonlight-trust.workspace = true
+moonlight-control.workspace = true
+moonlight-detection.workspace = true
+# Embedded per-session MCP server (Slice 3): the actor verbs CC sessions call,
+# composed in main.rs and injected at launch via `--mcp-config`.
+moonlight-mcp-server.workspace = true
+# Durable managed-session store + audit log (SQLite). Injected into the
+# supervisor and consulted on layout-restore to re-resume managed sessions.
+moonlight-persistence.workspace = true
+tracing.workspace = true
+# `net` for the control IPC socket (hook gate); `rt`/`time` for the hook CLI runtime.
+tokio = { workspace = true, features = ["net"] }
+# `RunVerbExecutor` implements the domain's `#[async_trait]` VerbExecutor port
+# (the MCP run verbs over the shared run registry).
+async-trait.workspace = true
+
+# Desktop UI
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+
+# IDE-classic manual terminal emulator (PTY + ANSI). Public API only (Apache-2.0).
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+# Dock layout + project-space persistence (serde over DockAreaState / recent roots).
+serde.workspace = true
+serde_json.workspace = true
+# Blocking HTTP client behind the `http_request` MCP verb (run via spawn_blocking).
+ureq.workspace = true
+# SQLite + Postgres drivers for the DB-observer panel (read-only browse). Postgres
+# queries run on the background executor (blocking driver), like SQLite.
+rusqlite.workspace = true
+postgres.workspace = true
+# v4 session ids to pin a managed session's `claude --session-id`, so the launched
+# terminal and the grid session (discovered from JSONL) refer to the same session.
+uuid = { version = "1", features = ["v4"] }
+
+# Tree-sitter outline for the Structure panel. The grammars are already compiled into
+# the build (gpui-component's `tree-sitter-languages` feature pulls them) — depending
+# on them directly here reuses the SAME locked versions (no new downloads) and gives
+# us the parser access gpui-component doesn't re-export.
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
+tree-sitter-go = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-java = "0.23"
+
+# macOS Dock icon set at runtime (AppKit). Already in the lockfile transitively via
+# gpui, so this pins no new versions. Feature-gated to the classes we touch.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3", features = ["NSData"] }
+
+# `cargo bundle` packaging metadata. Produces `MoonlightCode.app` with an `.icns`
+# generated from the repo-root icon (run: `cargo bundle --release -p moonlight-desktop`).
+[package.metadata.bundle]
+name = "MoonlightCode"
+identifier = "dev.moonlightcode.desktop"
+icon = ["../../icon.png"]

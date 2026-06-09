@@ -1,0 +1,37 @@
+[package]
+name = "moonlight-mcp-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Adapter: embedded MCP server (rmcp) exposing actor verbs. Each verb follows the
+# mandatory shape: resolve -> PDP -> execute -> audit -> compact result. Slice 3.
+[dependencies]
+moonlight-domain.workspace = true
+# The MCP adapters fold the engine bus (policy snapshots) — an adapter knowing the
+# engine's event type is fine (no cycle: engine → domain only).
+moonlight-engine.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rmcp = { version = "=1.7.0", features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+# Mount rmcp's streamable-HTTP tower service (embedded in-app MCP endpoint). Version
+# tracks rmcp's own dev-dep so the tower `Service` impls line up.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# Tool parameter (de)serialization + JSON-Schema. schemars 1.0 matches rmcp's pin so
+# the `JsonSchema` derive the `#[tool]` macro relies on stays compatible.
+serde = { workspace = true, features = ["derive"] }
+schemars = "1"
+
+[dev-dependencies]
+# The real PDP, so the actor tests exercise actual trust-tier/phase gating.
+moonlight-trust.workspace = true
+# The real SQLite store, so the audit-sink test writes + reads a real DB.
+moonlight-persistence.workspace = true

@@ -1,0 +1,10 @@
+# BMM Module Configuration
+# Minimal config created so planning skills (product-brief, PRD, etc.) can run.
+# Inherits core values from _bmad/core/config.yaml
+
+user_name: Titouan
+communication_language: English
+document_output_language: English
+output_folder: /Users/titouan/perso/claude-code-ide/.bmad-output
+planning_artifacts: /Users/titouan/perso/claude-code-ide/.bmad-output/planning
+project_knowledge: /Users/titouan/perso/claude-code-ide/.bmad-output

@@ -1,0 +1,18 @@
+[package]
+name = "moonlight-persistence"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Adapter: SQLite-backed `ManagedSessionStore` (managed-session identity + the
+# append-only audit log). Forward-only migrations via `PRAGMA user_version`.
+# Domain-only: no engine/UI/tokio — the store is synchronous (local SQLite).
+[dependencies]
+moonlight-domain.workspace = true
+# `bundled` compiles SQLite in-tree (no system libsqlite dependency).
+rusqlite.workspace = true
+# Enum fields (Mode/Phase/AuditAction) are stored as their serde JSON form.
+serde.workspace = true
+serde_json.workspace = true

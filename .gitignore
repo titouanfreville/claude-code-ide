@@ -1,0 +1,10 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# macOS
+.DS_Store
+
+# Local app data (MoonlightCode runtime store lives outside the repo)
+/.moonlight-local

@@ -1,0 +1,85 @@
+# MoonlightCode — Cargo workspace (single repo, single `cargo build`)
+# Layout mirrors .bmad-output/planning/architecture.md (hexagonal, domain-first).
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/core",
+    "crates/engine",
+    "crates/detection",
+    "crates/control",
+    "crates/trust",
+    "crates/persistence",
+    "crates/worktree",
+    "crates/rtk",
+    "crates/mcp-server",
+    "apps/desktop",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+license = "MIT"
+authors = ["Titouan"]
+rust-version = "1.77"
+
+# Shared dependency versions, referenced by member crates via `*.workspace = true`.
+[workspace.dependencies]
+thiserror = "2"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "fs", "time", "io-util"] }
+# Blocking HTTP client for the agent's `http_request` verb (run via spawn_blocking);
+# reuses the rustls already in the tree. Small dep surface for a gated dev tool.
+ureq = "2"
+
+# GPUI desktop UI stack. `gpui`/`gpui_platform` are declared branchless to match
+# how `gpui-component` declares them — this keeps a SINGLE zed git source so all
+# zed crates unify on one checkout. The exact commit is pinned in Cargo.lock
+# (zed `4bee412…` — the rev gpui-component's own lockfile is tested against);
+# `cargo update -p gpui --precise <sha>` re-pins it. Do NOT use `rev =` here: a
+# `rev` source and gpui-component's branchless source would NOT unify, pulling two
+# incompatible `gpui` builds (API drift breaks gpui-component's own code).
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+# `tree-sitter-languages` enables the bundled grammars so the code-editor panel
+# actually syntax-highlights (rust/ts/go/py/json/…); without it `code_editor(lang)`
+# resolves to no grammar (langs are `#[cfg(feature)]`-gated) and renders plain.
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "277f220a6196572116a8fd84fba6c36187094cab", features = ["tree-sitter-languages"] }
+
+# Terminal emulator core (PTY + ANSI parser + grid state) for the IDE-classic
+# manual terminal panel. Pinned to Zed's known-good alacritty fork rev so it stays
+# compatible with the pinned gpui ecosystem. alacritty_terminal is Apache-2.0 — we
+# use ONLY its public API; Zed's GPL terminal/terminal_view crates are not used.
+alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "9d9640d4" }
+
+# SQLite driver for the DB-observer panel (read-only browse). `bundled` compiles
+# SQLite in-tree so there's no system libsqlite dependency.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Synchronous Postgres driver for the DB-observer panel (read-only browse). Blocking
+# (libpq-free, pure Rust) so the panel runs it on the background executor like SQLite.
+postgres = "0.19"
+
+# Internal crates
+moonlight-domain = { path = "crates/domain" }
+moonlight-core = { path = "crates/core" }
+moonlight-engine = { path = "crates/engine" }
+moonlight-detection = { path = "crates/detection" }
+moonlight-control = { path = "crates/control" }
+moonlight-trust = { path = "crates/trust" }
+moonlight-persistence = { path = "crates/persistence" }
+moonlight-worktree = { path = "crates/worktree" }
+moonlight-rtk = { path = "crates/rtk" }
+moonlight-mcp-server = { path = "crates/mcp-server" }
+
+[profile.dev]
+# Faster incremental dev builds; GPUI is heavy so keep opt-level low for our crates.
+opt-level = 0
+
+[profile.release]
+opt-level = 3
+lto = "thin"

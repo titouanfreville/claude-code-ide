@@ -1,0 +1,15 @@
+[package]
+name = "moonlight-engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Core orchestrator: session supervisor, phase machine, event bus, governor.
+# Depends on domain (ports only). Implemented slice-by-slice.
+[dependencies]
+moonlight-domain.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait.workspace = true

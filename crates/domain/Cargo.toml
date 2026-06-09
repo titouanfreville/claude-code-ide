@@ -1,0 +1,14 @@
+[package]
+name = "moonlight-domain"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# PURE crate: entities + trait ports + sentinel errors.
+# Allowed deps only — NO tokio, NO I/O, NO GPUI (enforced in CI).
+[dependencies]
+thiserror.workspace = true
+async-trait.workspace = true
+serde.workspace = true

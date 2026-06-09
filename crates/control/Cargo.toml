@@ -1,0 +1,19 @@
+[package]
+name = "moonlight-control"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+# Adapter: ControlPort implementations.
+# Hybrid posture (Spike 0): sdk_adapter (primary) + hook_adapter (secondary) + observe_only (L0 fallback).
+[dependencies]
+moonlight-domain.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+# Unix-socket control server/client (one-shot request per connection);
+# `sync`/`time` back the held-approval keystone (oneshot + timeout).
+tokio = { workspace = true, features = ["net", "sync", "time"] }

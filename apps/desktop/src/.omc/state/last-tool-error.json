@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd /Users/titouan/perso/claude-code-ide/apps/desktop/src/views/panels && rtk grep -n \\\"fn render\\\\|panel_header\\\\|fn title\\\\|header\\\\|TitleBar\\\\|text_xs\\\\|h(px(\\\" structure.rs | head -20; ...",
+  "error": "Exit code 1\n2 matches in 1 files:\n\nstructure.rs:262:fn title(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl In...\nstructure.rs:268:fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl In...\n(eval):1: == not found",
+  "timestamp": "2026-06-05T20:18:38.771Z",
+  "retry_count": 1
+}
