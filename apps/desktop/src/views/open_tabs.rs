@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when the sidecar shape changes incompatibly; a mismatched file is ignored
 /// (the app then starts with a clean center, same as no file).
-pub const OPEN_TABS_VERSION: u32 = 1;
+pub const OPEN_TABS_VERSION: u32 = 2;
 
 /// The full set of open center tabs at shutdown, grouped by space.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -38,6 +38,11 @@ pub struct SpaceTabs {
     pub space: Option<String>,
     /// Ordered dedup keys of the open center tabs (best-effort order).
     pub tabs: Vec<String>,
+    /// The dedup key of the **session** tab that was last frontmost in this space
+    /// (`session:<id>`), restored as the active tab on return. `None` when no session
+    /// tab was active. Defaulted so a v1 file (pre-field) still deserializes.
+    #[serde(default)]
+    pub active_tab: Option<String>,
 }
 
 /// macOS-first sidecar location under Application Support (next to `layout.json`).
@@ -89,10 +94,12 @@ mod tests {
                 SpaceTabs {
                     space: Some("/repo/a".to_string()),
                     tabs: vec!["session:abc".to_string(), "file:/repo/a/main.rs".to_string()],
+                    active_tab: Some("session:abc".to_string()),
                 },
                 SpaceTabs {
                     space: None,
                     tabs: vec!["db:/tmp/x.sqlite".to_string()],
+                    active_tab: None,
                 },
             ],
         };
@@ -105,6 +112,8 @@ mod tests {
         assert_eq!(back.spaces.len(), 2);
         assert_eq!(back.spaces[0].space.as_deref(), Some("/repo/a"));
         assert_eq!(back.spaces[0].tabs.len(), 2);
+        assert_eq!(back.spaces[0].active_tab.as_deref(), Some("session:abc"));
+        assert_eq!(back.spaces[1].active_tab, None);
         assert_eq!(back.spaces[1].space, None);
         assert_eq!(back.spaces[1].tabs, vec!["db:/tmp/x.sqlite".to_string()]);
     }

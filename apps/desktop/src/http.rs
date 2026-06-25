@@ -19,12 +19,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Cap on retained history records — oldest drop off the front.
 const HISTORY_CAP: usize = 50;
 /// Body preview kept in a history record / returned to the agent.
 const BODY_PREVIEW: usize = 600;
+/// Body kept for the HTTP panel's response pane (the operator reads more than the
+/// agent's compact preview, but still bounded so a huge response can't blow memory).
+const PANEL_BODY: usize = 200_000;
 /// Per-request timeout for the blocking client.
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -95,7 +98,7 @@ impl HttpHistory {
 }
 
 /// One named environment in the manifest: its variables + the hosts it may reach.
-#[derive(Clone, Default, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpEnv {
     #[serde(default)]
     pub vars: BTreeMap<String, String>,
@@ -106,7 +109,7 @@ pub struct HttpEnv {
 }
 
 /// `.moonlight/http/environments.json`: the active environment name + the set.
-#[derive(Clone, Default, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpManifest {
     #[serde(default)]
     pub active: String,
@@ -135,14 +138,65 @@ impl HttpManifest {
     }
 }
 
+/// The `.moonlight/http` directory under a project root (created on save).
+fn http_dir(root: &Path) -> std::path::PathBuf {
+    root.join(".moonlight").join("http")
+}
+
 /// Load the HTTP manifest under `root` (`.moonlight/http/environments.json`). A missing
 /// or unparseable file yields the empty default (loopback/private-only).
 pub fn load_manifest(root: &Path) -> HttpManifest {
-    let path = root.join(".moonlight").join("http").join("environments.json");
-    std::fs::read_to_string(path)
+    std::fs::read_to_string(http_dir(root).join("environments.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Persist the manifest (e.g. after the operator switches the active environment).
+pub fn save_manifest(root: &Path, manifest: &HttpManifest) -> std::io::Result<()> {
+    let dir = http_dir(root);
+    std::fs::create_dir_all(&dir)?;
+    let text = serde_json::to_string_pretty(manifest)
+        .map_err(std::io::Error::other)?;
+    std::fs::write(dir.join("environments.json"), text)
+}
+
+/// A request the operator saved for reuse (the panel's left list / a collection).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedRequest {
+    pub name: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+/// `.moonlight/http/requests.json`: the operator's saved requests.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HttpRequests {
+    #[serde(default)]
+    pub requests: Vec<SavedRequest>,
+}
+
+/// Load the saved requests under `root` (missing/bad file → empty).
+pub fn load_requests(root: &Path) -> HttpRequests {
+    std::fs::read_to_string(http_dir(root).join("requests.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the saved requests. Upsert by name lives in the panel; this just writes.
+pub fn save_requests(root: &Path, reqs: &HttpRequests) -> std::io::Result<()> {
+    let dir = http_dir(root);
+    std::fs::create_dir_all(&dir)?;
+    let text = serde_json::to_string_pretty(reqs)
+        .map_err(std::io::Error::other)?;
+    std::fs::write(dir.join("requests.json"), text)
 }
 
 /// Replace every `{{key}}` occurrence in `template` with its variable value (keys with
@@ -151,6 +205,41 @@ pub fn interpolate(template: &str, vars: &BTreeMap<String, String>) -> String {
     let mut out = template.to_string();
     for (k, v) in vars {
         out = out.replace(&format!("{{{{{k}}}}}"), v);
+    }
+    out
+}
+
+/// Encode key/value pairs as an `application/x-www-form-urlencoded` body (spaces → `+`,
+/// reserved bytes percent-encoded).
+pub fn form_urlencode(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", form_encode(k), form_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Build a JSON **object** from key/value pairs (the JSON body's table mode). Each
+/// value is parsed as JSON when it is valid (so `42`, `true`, `{"a":1}`, `[1,2]` stay
+/// typed) and falls back to a JSON string otherwise. Pretty-printed.
+pub fn json_object_from_pairs(pairs: &[(String, String)]) -> String {
+    let mut map = serde_json::Map::new();
+    for (k, v) in pairs {
+        let val = serde_json::from_str::<serde_json::Value>(v.trim())
+            .unwrap_or_else(|_| serde_json::Value::String(v.clone()));
+        map.insert(k.clone(), val);
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default()
+}
+
+fn form_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
     }
     out
 }
@@ -261,15 +350,23 @@ pub fn parse_payload(payload: &str) -> Result<RequestSpec, String> {
     }
 }
 
-/// The outcome of a blocking send (the executor turns this into an [`HttpCall`] + the
-/// agent-facing compact summary).
+/// The outcome of a blocking send. The executor turns it into an [`HttpCall`] + the
+/// agent-facing compact summary; the HTTP panel renders the fuller fields (status text,
+/// response headers, the larger body).
 pub struct HttpOutcome {
     pub status: Option<u16>,
+    /// The reason phrase (e.g. `OK`, `Not Found`); empty on a transport error.
+    pub status_text: String,
     pub ms: u64,
     pub ok: bool,
     pub bytes: usize,
     pub error: Option<String>,
+    /// Response headers (panel only).
+    pub headers: Vec<(String, String)>,
+    /// Compact body for the agent / history record (≤ [`BODY_PREVIEW`]).
     pub body_preview: String,
+    /// Fuller body for the panel's response pane (≤ [`PANEL_BODY`]).
+    pub body: String,
 }
 
 /// Perform `spec` synchronously with ureq (call on `spawn_blocking`). Never panics;
@@ -295,25 +392,38 @@ pub fn send(spec: &RequestSpec) -> HttpOutcome {
         Err(ureq::Error::Status(_, resp)) => outcome_from_response(resp, ms, false),
         Err(ureq::Error::Transport(t)) => HttpOutcome {
             status: None,
+            status_text: String::new(),
             ms,
             ok: false,
             bytes: 0,
             error: Some(t.to_string()),
+            headers: Vec::new(),
             body_preview: String::new(),
+            body: String::new(),
         },
     }
 }
 
 fn outcome_from_response(resp: ureq::Response, ms: u64, ok2xx: bool) -> HttpOutcome {
     let status = resp.status();
+    let status_text = resp.status_text().to_string();
+    // Capture response headers before `into_string` consumes the response.
+    let headers: Vec<(String, String)> = resp
+        .headers_names()
+        .into_iter()
+        .filter_map(|n| resp.header(&n).map(|v| (n.clone(), v.to_string())))
+        .collect();
     let body = resp.into_string().unwrap_or_default();
     HttpOutcome {
         status: Some(status),
+        status_text,
         ms,
         ok: ok2xx && (200..400).contains(&status),
         bytes: body.len(),
         error: None,
+        headers,
         body_preview: clip(&body, BODY_PREVIEW),
+        body: clip(&body, PANEL_BODY),
     }
 }
 
@@ -436,5 +546,67 @@ mod tests {
         // Newest first; the oldest 5 were dropped.
         assert_eq!(recent[0].url, format!("http://localhost/{}", HISTORY_CAP + 4));
         assert_eq!(recent[2].url, format!("http://localhost/{}", HISTORY_CAP + 2));
+    }
+
+    #[test]
+    fn json_object_keeps_types_and_falls_back_to_string() {
+        let pairs = vec![
+            ("n".to_string(), "42".to_string()),
+            ("b".to_string(), "true".to_string()),
+            ("s".to_string(), "hi there".to_string()),
+            ("o".to_string(), "{\"a\":1}".to_string()),
+        ];
+        let json = json_object_from_pairs(&pairs);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["n"], serde_json::json!(42));
+        assert_eq!(v["b"], serde_json::json!(true));
+        assert_eq!(v["s"], serde_json::json!("hi there"));
+        assert_eq!(v["o"], serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn form_urlencode_encodes_reserved_and_spaces() {
+        let pairs = vec![
+            ("name".to_string(), "a b".to_string()),
+            ("q".to_string(), "x&y=z".to_string()),
+        ];
+        assert_eq!(form_urlencode(&pairs), "name=a+b&q=x%26y%3Dz");
+    }
+
+    #[test]
+    fn saved_requests_and_manifest_round_trip_on_disk() {
+        let root = std::env::temp_dir().join(format!("ml-http-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Missing files → empty defaults.
+        assert!(load_requests(&root).requests.is_empty());
+        assert_eq!(HttpManifest::active_name(&load_manifest(&root)), None);
+
+        // Save + reload requests.
+        let reqs = HttpRequests {
+            requests: vec![SavedRequest {
+                name: "health".into(),
+                method: "GET".into(),
+                url: "{{base_url}}/health".into(),
+                headers: vec![("X-A".into(), "1".into())],
+                body: None,
+            }],
+        };
+        save_requests(&root, &reqs).unwrap();
+        let back = load_requests(&root);
+        assert_eq!(back.requests.len(), 1);
+        assert_eq!(back.requests[0].name, "health");
+        assert_eq!(back.requests[0].url, "{{base_url}}/health");
+        assert_eq!(back.requests[0].headers, vec![("X-A".into(), "1".into())]);
+
+        // Save + reload manifest (active env persists).
+        let mut envs = BTreeMap::new();
+        envs.insert("local".to_string(), HttpEnv::default());
+        let manifest = HttpManifest { active: "local".into(), environments: envs };
+        save_manifest(&root, &manifest).unwrap();
+        let m = load_manifest(&root);
+        assert_eq!(m.active_name().as_deref(), Some("local"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

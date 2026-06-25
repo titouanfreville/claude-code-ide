@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use gpui::EventEmitter;
+use moonlight_domain::agent::AgentKind;
 use moonlight_domain::ids::SessionId;
 use moonlight_domain::phase::Phase;
 use moonlight_domain::session::Session;
@@ -40,13 +41,18 @@ pub enum OpenRequest {
         root: Option<PathBuf>,
         summary: Option<String>,
     },
-    /// Start a new **managed session**: open a focus tab whose embedded terminal
-    /// runs `claude --session-id <id> --permission-mode <…>` in the focused project
-    /// (the "＋ Session" action). `phase` is the operator's chosen starting phase
+    /// Start a new **managed session**: open a focus tab whose embedded terminal runs
+    /// the chosen `agent` CLI (`claude --session-id <id> …` / `agy …`) in the focused
+    /// project (the "＋ Session" action). `phase` is the operator's chosen starting phase
     /// (Plan / Discovery / Auto); its `cc_permission_mode()` drives the launch flag.
-    /// The pinned `id` means the tab and the grid tile (discovered from JSONL) are
-    /// the same session, so clicking the tile later reuses this tab.
-    NewManagedSession { id: SessionId, phase: Phase },
+    /// `agent` selects the backend (`claude` / `agy`). The pinned `id` means the tab and
+    /// the grid tile (discovered from JSONL) are the same session, so clicking the tile
+    /// later reuses this tab.
+    NewManagedSession {
+        id: SessionId,
+        phase: Phase,
+        agent: AgentKind,
+    },
     /// Open (or bring to front) a session's focus tab **by id** — the status-bar
     /// notification click-to-navigate. Unlike [`OpenRequest::Session`] the caller only
     /// has the id, so the workspace reconstructs the monitor from the managed store
@@ -66,6 +72,16 @@ pub enum OpenRequest {
     /// Open a SQL console center tab bound to a data source (from the DB overview tree).
     DbConsole {
         source: DataSource,
+    },
+    /// Open the HTTP request builder (Postman-style center tab; one shared tab).
+    Http,
+    /// Authorize an **external MCP tool** a frozen phase blocked (once / always / refuse).
+    /// `tool` is the full `mcp__server__tool` name; `root` scopes the tab to the
+    /// requesting session's space.
+    McpAuthorize {
+        session: SessionId,
+        tool: String,
+        root: Option<PathBuf>,
     },
 }
 
@@ -89,6 +105,9 @@ impl OpenRequest {
             OpenRequest::DbConsole { source } => {
                 super::panels::db_console::DbConsolePanel::tab_key(source)
             }
+            OpenRequest::Http => super::panels::http_panel::HttpPanel::tab_key().to_string(),
+            // One authorization tab per session (a later tool re-arms the same tab).
+            OpenRequest::McpAuthorize { session, .. } => format!("mcpauth:{}", session.as_str()),
         }
     }
 
@@ -100,6 +119,7 @@ impl OpenRequest {
             OpenRequest::PlanReview { root, .. } => root.clone(),
             OpenRequest::CodeReview { root, .. } => root.clone(),
             OpenRequest::SessionById { root, .. } => root.clone(),
+            OpenRequest::McpAuthorize { root, .. } => root.clone(),
             _ => None,
         }
     }

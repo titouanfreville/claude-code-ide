@@ -23,6 +23,7 @@ use gpui_component::dock::{Panel, PanelEvent};
 
 use std::collections::HashMap;
 
+use moonlight_domain::agent::AgentKind;
 use moonlight_domain::ids::SessionId;
 use moonlight_domain::phase::Phase;
 use moonlight_domain::ports::store::{ManagedSession, ManagedSessionStore};
@@ -242,6 +243,9 @@ pub struct GridHome {
     /// Starting phase for the next "＋ New session" launch, set by the toggle
     /// beside the button. Default `Plan` (the default-deny safety posture).
     new_session_phase: Phase,
+    /// Agent CLI backend for the next "＋ New session" launch, set by the toggle
+    /// beside the button. Default [`AgentKind::ClaudeCode`].
+    new_session_agent: AgentKind,
     /// How the grid orders tiles (header toggle). Default triage ("needs you" first).
     sort_mode: SortMode,
     /// Whether soft-hidden sessions are revealed (header toggle). Default off.
@@ -321,6 +325,7 @@ impl GridHome {
             focus,
             commands,
             new_session_phase: Phase::Plan,
+            new_session_agent: AgentKind::ClaudeCode,
             sort_mode: SortMode::default(),
             show_hidden: false,
             focus_handle: cx.focus_handle(),
@@ -451,13 +456,23 @@ impl Render for GridHome {
             None => std::collections::HashMap::new(),
         };
 
+        // Which agent backend each managed session runs (for the tile badge). Read from
+        // the store; sessions absent from it (external/observed) default to Claude.
+        let agents: std::collections::HashMap<SessionId, AgentKind> = self
+            .store
+            .as_ref()
+            .and_then(|s| s.all_managed().ok())
+            .map(|rows| rows.into_iter().map(|m| (m.id, m.agent)).collect())
+            .unwrap_or_default();
+
         // Capture session + adopted/paused per tile so click handlers are 'static.
         let tiles: Vec<_> = ordered
             .into_iter()
             .map(|s| {
                 let meta = metas.get(&s.id).cloned().unwrap_or_default();
                 let attention = self.model.attention(s);
-                (s.clone(), s.adopted, s.paused, session_tile(s, &meta, attention))
+                let agent = agents.get(&s.id).copied().unwrap_or_default();
+                (s.clone(), s.adopted, s.paused, session_tile(s, &meta, attention, agent))
             })
             .collect();
 
@@ -497,6 +512,42 @@ impl Render for GridHome {
             .child(seg(Phase::Discovery, "Discovery", "new-phase-discovery", _cx))
             .child(seg(Phase::AutoImplement, "Auto", "new-phase-auto", _cx));
 
+        // Backend toggle beside the phase toggle: which agent CLI the new session runs
+        // (`claude` / `agy`). Default Claude Code. The chosen backend rides the launch
+        // request and is persisted on the managed record.
+        let chosen_agent = self.new_session_agent;
+        let agent_seg =
+            |agent: AgentKind, text: &'static str, id: &'static str, cx: &mut Context<Self>| {
+                let active = chosen_agent == agent;
+                let mut s = div()
+                    .id(id)
+                    .px_2()
+                    .py(px(3.))
+                    .cursor_pointer()
+                    .rounded(theme::radius_sm())
+                    .text_size(theme::text_xs());
+                s = if active {
+                    s.bg(theme::tint(theme::accent(), 0.18))
+                        .text_color(theme::accent())
+                } else {
+                    s.text_color(theme::text_muted())
+                };
+                s.child(text).on_click(cx.listener(move |this, _ev, _w, cx| {
+                    this.new_session_agent = agent;
+                    cx.notify();
+                }))
+            };
+        let agent_toggle = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.))
+            .p(px(2.))
+            .rounded(theme::radius_sm())
+            .bg(theme::surface_raised())
+            .child(agent_seg(AgentKind::ClaudeCode, "Claude", "new-agent-claude", _cx))
+            .child(agent_seg(AgentKind::Antigravity, "AGY", "new-agent-agy", _cx));
+
         // "＋ New session" — the primary action: a solid accent button.
         let new_session_btn = div()
             .id("new-session")
@@ -521,8 +572,9 @@ impl Render for GridHome {
                     // tile (discovered from JSONL) are the same managed session.
                     let id = SessionId::new(uuid::Uuid::new_v4().to_string());
                     let phase = this.new_session_phase;
+                    let agent = this.new_session_agent;
                     center.update(cx, |_center, cx| {
-                        cx.emit(OpenRequest::NewManagedSession { id, phase });
+                        cx.emit(OpenRequest::NewManagedSession { id, phase, agent });
                     });
                 }
             }));
@@ -633,6 +685,7 @@ impl Render for GridHome {
             .children(hidden_toggle)
             .child(refresh_btn)
             .child(mode_toggle)
+            .child(agent_toggle)
             .child(new_session_btn);
 
         div()
@@ -1096,6 +1149,7 @@ mod tests {
 
         let untitled = ManagedSession {
             id: SessionId::new("untitled"),
+            agent: moonlight_domain::AgentKind::ClaudeCode,
             root: Some("/repo".to_string()),
             title: None,
             mode: Mode::Auto,
@@ -1134,6 +1188,7 @@ mod tests {
 
         let rec = |id: &str| ManagedSession {
             id: SessionId::new(id),
+            agent: moonlight_domain::AgentKind::ClaudeCode,
             root: Some("/repo".to_string()),
             title: Some("Seeded title".to_string()),
             mode: Mode::Auto,

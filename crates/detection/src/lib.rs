@@ -6,8 +6,10 @@
 //! hooks layer (`PreToolUse`/`Stop`/`Notification`) and a fusing layer land next;
 //! the `ControlPort`/`DetectionSource` split keeps that change isolated.
 
+mod antigravity;
 mod jsonl;
 
+pub use antigravity::{turn_for_agy_line, AntigravityDetectionSource};
 pub use jsonl::{parse_line, phase_from_mode, status_for, Signal, Turn};
 
 use std::collections::{HashMap, HashSet};
@@ -50,6 +52,13 @@ struct FileState {
     /// Whether an `Incomplete` stall alert is currently raised for this session, so
     /// the alert is emitted once on stall and once on recovery (not every poll).
     alerted: bool,
+    /// Whether this session has ever produced a clean stop (`stop_hook_summary`).
+    /// **Self-calibrating:** only once we've seen a clean stop do we know a `Stop` hook
+    /// is active for it — and only then can a quiet `Assistant` turn (no following clean
+    /// stop) be trusted to mean "interrupted mid-generation" rather than the normal
+    /// end-of-turn of a session that simply has no Stop hook. No clean stop seen ⇒ we
+    /// fall back to the conservative `User`-turn-only stall (zero false positives).
+    seen_clean_stop: bool,
 }
 
 /// Default working-vs-waiting threshold: a transcript written within this window is
@@ -145,7 +154,7 @@ impl Default for JsonlDetectionSource {
 
 /// How long ago `path` was last modified (its append recency). Defaults to zero
 /// (treated as just-written) if the time can't be read.
-fn file_age(path: &Path) -> Duration {
+pub(crate) fn file_age(path: &Path) -> Duration {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
@@ -157,7 +166,7 @@ fn file_age(path: &Path) -> Duration {
 /// file shorter than `offset` was truncated/rotated → re-read from the start.
 /// Returns raw bytes (not `read_to_string`) so a tail caught mid-multibyte-char
 /// doesn't error — the caller decodes only the complete (newline-terminated) part.
-fn read_tail(path: &Path, offset: u64) -> std::io::Result<(Vec<u8>, bool)> {
+pub(crate) fn read_tail(path: &Path, offset: u64) -> std::io::Result<(Vec<u8>, bool)> {
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     let (start, rotated) = if len < offset {
@@ -259,7 +268,14 @@ impl DetectionSource for JsonlDetectionSource {
                         }
                         // A turn updates the conversational state; the actual status
                         // is derived below from `last_turn` + how recent the file is.
-                        Signal::Turn(turn) => entry.last_turn = Some(turn),
+                        Signal::Turn(turn) => {
+                            // A clean stop proves a Stop hook is active → we can trust a
+                            // later quiet `Assistant` turn to mean "interrupted".
+                            if turn == Turn::StopClean {
+                                entry.seen_clean_stop = true;
+                            }
+                            entry.last_turn = Some(turn);
+                        }
                         Signal::Plan(plan) if entry.plan.as_deref() != Some(&plan) => {
                             entry.plan = Some(plan.clone());
                             out.push(DetectionEvent::PlanProposed {
@@ -293,13 +309,22 @@ impl DetectionSource for JsonlDetectionSource {
                 });
             }
 
-            // Stall → `Incomplete` ⚠: a session handed a turn (a `User` line — the
-            // operator's prompt or a tool result) that then stays silent far past the
-            // working window stopped without finishing. (A healthy turn keeps writing,
-            // so its age stays small; a long *tool* runs under an `Assistant` turn, not
-            // `User`, so it isn't mistaken for a stall.) Edge-emitted: once on stall,
-            // once on recovery.
-            let stalled = matches!(entry.last_turn, Some(Turn::User)) && age >= self.stall_window;
+            // Stall → `Incomplete` ⚠: a turn that stays silent far past the working
+            // window stopped without finishing. Two reliable cases:
+            //  - a `User` line (operator prompt / tool result) the agent never answered;
+            //  - an `Assistant` turn with no following clean stop — *only* when this
+            //    session has produced a clean stop before (so a `Stop` hook is active
+            //    and "no clean stop" genuinely means cut off, not a hookless normal end).
+            // A long *tool* runs under an `Assistant` turn but is short-lived between
+            // its tool_use and tool_result writes, and a hookless session never trips the
+            // `Assistant` arm — both keep false positives out. Edge-emitted (once each
+            // on stall / recovery).
+            let interruptible_turn = match entry.last_turn {
+                Some(Turn::User) => true,
+                Some(Turn::Assistant) => entry.seen_clean_stop,
+                _ => false,
+            };
+            let stalled = interruptible_turn && age >= self.stall_window;
             if stalled && !entry.alerted {
                 entry.alerted = true;
                 out.push(DetectionEvent::Alert {
@@ -335,6 +360,33 @@ impl DetectionSource for JsonlDetectionSource {
             });
         }
 
+        Ok(out)
+    }
+}
+
+/// Fans a poll out across several [`DetectionSource`]s and concatenates their events,
+/// so the engine — which takes a single source — can observe Claude **and** Antigravity
+/// sessions at once. A source that errors is skipped (its sibling still reports); the
+/// composite never fails the whole poll because one backend's directory is unreadable.
+pub struct CompositeDetectionSource {
+    sources: Vec<Box<dyn DetectionSource>>,
+}
+
+impl CompositeDetectionSource {
+    pub fn new(sources: Vec<Box<dyn DetectionSource>>) -> Self {
+        Self { sources }
+    }
+}
+
+#[async_trait]
+impl DetectionSource for CompositeDetectionSource {
+    async fn poll(&self) -> Result<Vec<DetectionEvent>, ControlError> {
+        let mut out = Vec::new();
+        for source in &self.sources {
+            if let Ok(mut events) = source.poll().await {
+                out.append(&mut events);
+            }
+        }
         Ok(out)
     }
 }
@@ -392,6 +444,55 @@ mod tests {
             delta.contains(&DetectionEvent::Alert {
                 session: id.clone(),
                 alert: None,
+            }),
+            "{delta:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_assistant_stall_only_fires_after_a_clean_stop_proves_a_stop_hook() {
+        let dir = std::env::temp_dir().join(format!("ml-detect-astall-{}", std::process::id()));
+        let project = dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("sess-astall.jsonl");
+
+        let source = JsonlDetectionSource::new(dir.clone(), Duration::from_secs(3600))
+            .with_liveness_window(Duration::ZERO)
+            .with_stall_window(Duration::ZERO);
+        let id = SessionId::new("sess-astall");
+
+        // A quiet `Assistant` turn with NO clean stop ever seen = a hookless session's
+        // normal end → conservatively NOT flagged (no false positive).
+        write(&transcript, "{\"type\":\"assistant\"}\n");
+        let events = source.poll().await.unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                DetectionEvent::Alert { alert: Some(_), .. }
+            )),
+            "{events:?}"
+        );
+
+        // A clean stop appears (stop_hook_summary) → proves a Stop hook is active.
+        write(
+            &transcript,
+            "{\"type\":\"assistant\"}\n{\"type\":\"system\",\"subtype\":\"stop_hook_summary\"}\n",
+        );
+        let _ = source.poll().await.unwrap(); // last turn is now a clean stop → calm.
+
+        // A fresh `Assistant` turn with no following clean stop, gone quiet → the
+        // generation was cut off → Incomplete ⚠.
+        write(
+            &transcript,
+            "{\"type\":\"assistant\"}\n{\"type\":\"system\",\"subtype\":\"stop_hook_summary\"}\n{\"type\":\"assistant\"}\n",
+        );
+        let delta = source.poll().await.unwrap();
+        assert!(
+            delta.contains(&DetectionEvent::Alert {
+                session: id.clone(),
+                alert: Some(AttentionKind::Incomplete),
             }),
             "{delta:?}"
         );

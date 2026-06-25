@@ -25,8 +25,8 @@ use anyhow::Context as _;
 use gpui::prelude::*;
 use gpui::{
     div, px, App, Context, CursorStyle, Edges, Entity, Global, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, SharedString,
-    WeakEntity, Window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, PromptLevel,
+    SharedString, WeakEntity, Window,
 };
 use gpui_component::dock::{
     register_panel, DockArea, DockAreaState, DockItem, DockPlacement, PanelInfo, PanelState,
@@ -38,7 +38,8 @@ use gpui_component::{Root, WindowExt};
 use moonlight_domain::ids::{SessionId, Timestamp};
 use moonlight_domain::phase::Phase;
 use moonlight_domain::ports::store::{ManagedSession, ManagedSessionStore};
-use moonlight_domain::session::SessionStatus;
+use moonlight_domain::session::{AttentionKind, SessionStatus};
+use moonlight_domain::trust::TrustTier;
 use moonlight_engine::{Command, EngineEvent, EventBus};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
@@ -53,7 +54,7 @@ use super::obs_store::ObsStore;
 use super::open_tabs::{self, OpenTabsState, SpaceTabs};
 use super::edit_gate::EditGate;
 use super::grid_home::GridHome;
-use super::mcp_host::{session_launch_flags, McpHostHandle};
+use super::mcp_host::McpHostHandle;
 use super::panels::activity_rail::{activity_rail, RailSnapshot};
 use super::panels::code_editor::{CodeEditorPanel, FormatDocument, SaveFile};
 use super::panels::code_review::CodeReviewPanel;
@@ -62,6 +63,7 @@ use super::panels::db_grid::DbGridPanel;
 use super::panels::db_observer::DbObserverPanel;
 use super::panels::db_source::DataSource;
 use super::panels::file_tree::FileTreePanel;
+use super::panels::mcp_authorize::McpAuthorizePanel;
 use super::panels::plan_review::PlanReviewPanel;
 use super::panels::session_monitor::{attach_command, SessionMonitor};
 use super::panels::spaces::{space_tab_bar, SpaceTab};
@@ -141,6 +143,10 @@ pub struct ShellDeps {
     /// HTTP summary (the executor records; the panel polls). Same shared-handle shape
     /// as `run_registry`.
     pub http_history: crate::http::HttpHistory,
+    /// Operator's auto-phasing toggle (shared with the MCP actor): when on, the agent's
+    /// `request_phase` is auto-approved instead of waiting on the cockpit gate. The
+    /// main toolbar flips it; the actor reads it.
+    pub auto_phase: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The one language-server pool. Shared so the Structure outline's servers are
     /// the same processes whose `publishDiagnostics` feed the Problems window.
     pub lsp_pool: Arc<crate::lsp::LspPool>,
@@ -170,6 +176,7 @@ pub fn init_shell(
     mcp_host: Option<McpHostHandle>,
     run_registry: crate::run::RunRegistry,
     http_history: crate::http::HttpHistory,
+    auto_phase: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let session_meta = cx.new(|_| SessionMetaCache::default());
     let chrome = cx.new(|_| ChromeRequests);
@@ -193,6 +200,7 @@ pub fn init_shell(
         mcp_host,
         run_registry,
         http_history,
+        auto_phase,
         lsp_pool,
         git_console,
     });
@@ -254,12 +262,13 @@ pub fn init_shell(
                     .or(info_root)
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 let mcp = deps.mcp_host.as_ref().and_then(|h| h.url_for(&id));
-                let command = attach_command(&id, rec.phase, mcp.as_deref());
+                let command = attach_command(&id, rec.agent, rec.phase, mcp.as_deref());
                 SessionMonitor::new_managed(
                     id,
                     None,
                     root,
                     command,
+                    rec.agent,
                     rec.phase,
                     deps.bus.subscribe(),
                     cx,
@@ -300,6 +309,10 @@ pub fn init_shell(
     });
     register_panel(cx, "DbConsole", |_, _, info, _window, cx| {
         let view = cx.new(|cx| DbConsolePanel::restore(info, cx));
+        Box::new(view) as Box<dyn PanelView>
+    });
+    register_panel(cx, "Http", |_, _, info, _window, cx| {
+        let view = cx.new(|cx| super::panels::http_panel::HttpPanel::restore(info, cx));
         Box::new(view) as Box<dyn PanelView>
     });
     register_panel(cx, "PlanReview", |_, _, info, _window, cx| {
@@ -370,6 +383,13 @@ pub struct Workspace {
     /// can't be rebuilt cheaply: detection only emits deltas, so a fresh GridHome
     /// would show an empty fleet until activity).
     space_panels: HashMap<Option<SpaceId>, HashMap<String, Arc<dyn PanelView>>>,
+    /// The session tab that was last frontmost **per space** (`OpenRequest::key`, i.e.
+    /// `session:<id>`). Updated whenever a session tab becomes active (the active-context
+    /// observer). On returning to a space, its remembered tab is mounted last so it lands
+    /// frontmost — without this, whichever tab happened to mount last (arbitrary `HashMap`
+    /// order) would steal focus. Seeded from / persisted to the open-tabs sidecar so the
+    /// last-active session also survives a restart.
+    space_active_tab: HashMap<Option<SpaceId>, String>,
     /// The space whose dynamic tabs are currently mounted in the center.
     current_space: Option<SpaceId>,
     /// Whether the status bar's notifications popover is open (stub; prepared for
@@ -426,6 +446,11 @@ pub struct Workspace {
     /// Waiting/Errored. (The fleet grid keeps its own richer model; this is just
     /// the thin slice the chrome needs.)
     session_attention: HashMap<SessionId, (Option<PathBuf>, SessionStatus)>,
+    /// Live per-session ⚠ attention overlay (Stuck/Incomplete), folded from
+    /// [`EngineEvent::SessionAlert`]. Consulted by [`Self::space_attention`] alongside
+    /// status so a space-tab dot also lights for a stuck/incomplete session, not just
+    /// Waiting/Errored. Transient (mirrors the grid's overlay).
+    session_alerts: HashMap<SessionId, AttentionKind>,
     /// Center tabs that were open at the last shutdown for spaces **other** than the
     /// active one — restored lazily (the panels, with their terminals, are rebuilt the
     /// first time that space is switched to, not all at once on launch). Keyed like
@@ -673,12 +698,25 @@ impl Workspace {
                                 });
                             });
                         }
-                        Ok(EngineEvent::ApprovalRequested { session, what }) => {
-                            let text = format!("{what} · {}", notif_label(&labels, &session));
+                        Ok(EngineEvent::ApprovalRequested { session, what, authorize_tool }) => {
+                            let text = match &authorize_tool {
+                                Some(tool) => {
+                                    format!("Authorize {tool} · {}", notif_label(&labels, &session))
+                                }
+                                None => format!("{what} · {}", notif_label(&labels, &session)),
+                            };
                             notifications.update(cx, |n, cx| {
-                                n.push(NotificationKind::Approval, text, Some(session));
+                                n.push(NotificationKind::Approval, text, Some(session.clone()));
                                 cx.notify();
                             });
+                            // An external-MCP authorization opens the dedicated once/always/
+                            // refuse panel in the requesting session's space.
+                            if let Some(tool) = authorize_tool {
+                                let root = roots.get(&session).cloned().flatten();
+                                center.update(cx, |_center, cx| {
+                                    cx.emit(OpenRequest::McpAuthorize { session, tool, root });
+                                });
+                            }
                         }
                         Ok(EngineEvent::PhaseAdvanceRequested { session, to }) => {
                             let text =
@@ -737,7 +775,23 @@ impl Workspace {
                             // Forgotten session: drop its attention entry so a stale
                             // dot doesn't keep a space lit.
                             let _ = this.update(cx, |ws, cx| {
-                                if ws.session_attention.remove(&session).is_some() {
+                                let a = ws.session_attention.remove(&session).is_some();
+                                let b = ws.session_alerts.remove(&session).is_some();
+                                if a || b {
+                                    cx.notify();
+                                }
+                            });
+                        }
+                        Ok(EngineEvent::SessionAlert { session, alert }) => {
+                            // Raise/clear the space-tab dot's ⚠ overlay alongside status.
+                            let _ = this.update(cx, |ws, cx| {
+                                let changed = match alert {
+                                    Some(kind) => {
+                                        ws.session_alerts.insert(session.clone(), kind) != Some(kind)
+                                    }
+                                    None => ws.session_alerts.remove(&session).is_some(),
+                                };
+                                if changed {
                                     cx.notify();
                                 }
                             });
@@ -767,9 +821,18 @@ impl Workspace {
 
         // Re-render the status bar when the frontmost file/session context changes
         // (a caret move, a tab switch, a live session-status update all flow here).
+        // Also remember which **session** tab is frontmost in the current space, so
+        // returning to that space later re-focuses it (see `incoming_ordered`). Only a
+        // session tab can be active in the mounted space, so it's keyed to `current_space`.
         let active_context = cx.global::<ShellDeps>().active_context.clone();
-        cx.observe(&active_context, |_this, _ac, cx| cx.notify())
-            .detach();
+        cx.observe(&active_context, |this, ac, cx| {
+            if let crate::views::active_context::ActiveContext::Session { id, .. } = ac.read(cx) {
+                let key = format!("session:{}", id.as_str());
+                this.space_active_tab.insert(this.current_space.clone(), key);
+            }
+            cx.notify();
+        })
+        .detach();
 
         // Re-render the bar (bell badge + popover) when the notification inbox changes,
         // and pop each *new* notification as a toast (JetBrains-style). Toasts are
@@ -915,10 +978,12 @@ impl Workspace {
         let this = Self {
             dock_area,
             space_panels: HashMap::new(),
+            space_active_tab: HashMap::new(),
             current_space,
             notifications_open: false,
             last_toast_id: None,
             session_attention: HashMap::new(),
+            session_alerts: HashMap::new(),
             pending_space_tabs: HashMap::new(),
             terminal,
             bottom_open: true,
@@ -1041,25 +1106,34 @@ impl Workspace {
             .detach();
     }
 
-    /// Worst needs-operator status color among the sessions under `root`
-    /// (Errored > WaitingInput), or `None` when the space is calm. Drives the
-    /// space tab's attention dot.
-    fn space_attention(&self, root: &Path) -> Option<gpui::Hsla> {
-        let mut worst: Option<SessionStatus> = None;
-        for (path, status) in self.session_attention.values() {
+    /// The space tab's two attention signals among the sessions under `root`:
+    /// `(dot, needs_input)`. The **dot** is the worst "broke / stuck" kind
+    /// (Stuck/Incomplete/Errored) by [`AttentionKind::severity`], or `None` when calm.
+    /// **`needs_input`** is true when any session is awaiting the operator
+    /// ([`AttentionKind::NeedsInput`]) — carried by the blinking caret, *not* the steady
+    /// dot, so a "needs you now" pause is never hidden behind a higher-severity error
+    /// (NeedsInput is the lowest severity and used to be outranked off the tab entirely).
+    fn space_attention(&self, root: &Path) -> (Option<gpui::Hsla>, bool) {
+        let mut worst: Option<AttentionKind> = None;
+        let mut needs_input = false;
+        for (id, (path, status)) in self.session_attention.iter() {
             let Some(path) = path else { continue };
             if !path.starts_with(root) {
                 continue;
             }
-            match status {
-                SessionStatus::Errored => worst = Some(SessionStatus::Errored),
-                SessionStatus::WaitingInput if worst != Some(SessionStatus::Errored) => {
-                    worst = Some(SessionStatus::WaitingInput)
-                }
+            let attn = self
+                .session_alerts
+                .get(id)
+                .copied()
+                .or_else(|| AttentionKind::from_status(*status));
+            match attn {
+                // Carried by the caret, not the dot.
+                Some(AttentionKind::NeedsInput) => needs_input = true,
+                Some(a) if worst.map_or(true, |w| a.severity() > w.severity()) => worst = Some(a),
                 _ => {}
             }
         }
-        worst.map(theme::status_color)
+        (worst.map(theme::attention_color), needs_input)
     }
 
     /// Toggle the left dock (Explorer: file tree + structure). Rail button.
@@ -1067,6 +1141,20 @@ impl Workspace {
         if let Some(dock) = self.dock_area.read(cx).left_dock().cloned() {
             dock.update(cx, |d, cx| d.toggle_open(window, cx));
         }
+    }
+
+    /// Flip the operator's **auto-phasing** opt-in (the shared flag the MCP actor
+    /// reads): when on, the agent's `request_phase` is auto-approved instead of raising
+    /// a cockpit approval. Main-toolbar toggle.
+    pub(crate) fn toggle_auto_phase(&mut self, cx: &mut Context<Self>) {
+        if let Some(deps) = cx.try_global::<ShellDeps>() {
+            let f = &deps.auto_phase;
+            f.store(
+                !f.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        cx.notify();
     }
 
     /// The left dock's current (size, open) so a rebuild keeps the operator's
@@ -1326,6 +1414,7 @@ impl Workspace {
             .collect();
         self.space_panels.retain(|k, _| live.contains(k));
         self.pending_space_tabs.retain(|k, _| live.contains(k));
+        self.space_active_tab.retain(|k, _| live.contains(k));
     }
 
     /// Snapshot the open center tabs (per space) for the shutdown sidecar. For the
@@ -1350,9 +1439,17 @@ impl Workspace {
                 panels.keys().cloned().collect()
             };
             if !tabs.is_empty() {
+                // Persist the last-active session tab only while it's still one of the
+                // space's open tabs (it may have been closed since).
+                let active_tab = self
+                    .space_active_tab
+                    .get(space)
+                    .filter(|k| tabs.contains(k))
+                    .cloned();
                 spaces.push(SpaceTabs {
                     space: space.as_ref().map(|s| s.as_str().to_string()),
                     tabs,
+                    active_tab,
                 });
             }
         }
@@ -1361,9 +1458,15 @@ impl Workspace {
             if seen.contains(space) || tabs.is_empty() {
                 continue;
             }
+            let active_tab = self
+                .space_active_tab
+                .get(space)
+                .filter(|k| tabs.contains(k))
+                .cloned();
             spaces.push(SpaceTabs {
                 space: space.as_ref().map(|s| s.as_str().to_string()),
                 tabs: tabs.clone(),
+                active_tab,
             });
         }
 
@@ -1403,20 +1506,31 @@ impl Workspace {
                     None => continue,
                 },
             };
+            // Restore the last-active session tab for this space (eager or pending), so
+            // the first mount / first switch lands it frontmost (see `incoming_ordered`).
+            if let Some(active_tab) = entry.active_tab {
+                self.space_active_tab.insert(space.clone(), active_tab);
+            }
             if space == self.current_space {
                 let deps = cx.global::<ShellDeps>().clone();
                 let dock = self.dock_area.clone();
                 for key in entry.tabs {
-                    if let Some(panel) = build_center_panel(&deps, &key, space.as_ref(), window, cx) {
-                        dock.update(cx, |area, cx| {
-                            area.add_panel(panel.clone(), DockPlacement::Center, None, window, cx);
-                        });
+                    if let Some(panel) =
+                        build_center_panel(&deps, &key, space.as_ref(), true, window, cx)
+                    {
                         self.space_panels
                             .entry(space.clone())
                             .or_default()
                             .insert(key, panel);
                         mounted += 1;
                     }
+                }
+                // Mount with the remembered-active tab last so it lands frontmost (rather
+                // than whichever tab happened to mount last). See `incoming_ordered`.
+                for panel in self.incoming_ordered(&space) {
+                    dock.update(cx, |area, cx| {
+                        area.add_panel(panel, DockPlacement::Center, None, window, cx);
+                    });
                 }
             } else if !entry.tabs.is_empty() {
                 pending += entry.tabs.len();
@@ -1442,7 +1556,7 @@ impl Workspace {
             {
                 continue; // Already live (e.g. reopened before the first switch).
             }
-            if let Some(panel) = build_center_panel(&deps, &key, space.as_ref(), window, cx) {
+            if let Some(panel) = build_center_panel(&deps, &key, space.as_ref(), true, window, cx) {
                 self.space_panels
                     .entry(space.clone())
                     .or_default()
@@ -1476,24 +1590,36 @@ impl Workspace {
             .get(&old)
             .map(|m| m.values().cloned().collect())
             .unwrap_or_default();
-        let incoming: Vec<Arc<dyn PanelView>> = self
-            .space_panels
-            .get(&new)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default();
+        let incoming = self.incoming_ordered(&new);
 
         dock.update(cx, |area, cx| {
             for panel in &outgoing {
                 area.remove_panel(panel.clone(), DockPlacement::Center, window, cx);
             }
-            for panel in &incoming {
-                area.add_panel(panel.clone(), DockPlacement::Center, None, window, cx);
+            for panel in incoming {
+                area.add_panel(panel, DockPlacement::Center, None, window, cx);
             }
         });
         self.current_space = new;
         // The mounted set changed (and the outgoing space was reconciled against the
         // live keys) — persist so a crash keeps the just-switched layout.
         self.persist_open_tabs_if_changed(cx);
+    }
+
+    /// A space's center panels ordered for mounting: the remembered last-active tab
+    /// (`space_active_tab`) goes **last** so `add_panel` — which activates whatever it
+    /// adds last — lands it frontmost. Everything else keeps arbitrary `HashMap` order
+    /// (it always did). With no remembered tab, this is the previous behavior verbatim.
+    fn incoming_ordered(&self, space: &Option<SpaceId>) -> Vec<Arc<dyn PanelView>> {
+        let Some(map) = self.space_panels.get(space) else {
+            return Vec::new();
+        };
+        let active = self.space_active_tab.get(space);
+        let mut entries: Vec<(&String, &Arc<dyn PanelView>)> = map.iter().collect();
+        // `false` (0) sorts before `true` (1), so the active key ends up last. `sort_by_key`
+        // is stable, so the non-active tabs keep their iteration order.
+        entries.sort_by_key(|(k, _)| active == Some(*k));
+        entries.into_iter().map(|(_, p)| p.clone()).collect()
     }
 
     /// Make the space rooted at `root` active (if such a space is open), mounting its
@@ -1703,7 +1829,7 @@ impl Workspace {
     }
 
     /// "＋ Session": quick-launch a managed CC session from the tab bar (no trip to
-    /// the Sessions grid). Mints a fresh id and opens it in the **Plan** mode (the
+    /// the Sessions grid). Mints a fresh id and opens it in the **Discovery** mode (the
     /// safe default; switch live from the session card). Mirrors GridHome's ＋New.
     pub(crate) fn new_session(&mut self, cx: &mut Context<Self>) {
         let center = cx.global::<ShellDeps>().center.clone();
@@ -1711,7 +1837,8 @@ impl Workspace {
         center.update(cx, |_center, cx| {
             cx.emit(OpenRequest::NewManagedSession {
                 id,
-                phase: Phase::Plan,
+                phase: Phase::Discovery,
+                agent: moonlight_domain::AgentKind::ClaudeCode,
             });
         });
     }
@@ -1833,21 +1960,39 @@ impl Workspace {
             } => Arc::new(cx.new(|cx| {
                 CodeReviewPanel::new(session, root, summary, Some(deps.commands.clone()), cx)
             })),
-            OpenRequest::NewManagedSession { id, phase } => {
-                // Launch CC in the phase's permission mode: Plan ⇒ `--permission-mode
+            OpenRequest::McpAuthorize { session, tool, .. } => Arc::new(cx.new(|cx| {
+                // Live hold: the session is paused on the external tool call, so open
+                // with the once/always/refuse buttons armed.
+                McpAuthorizePanel::new(
+                    session,
+                    tool,
+                    true,
+                    Some(deps.commands.clone()),
+                    deps.bus.subscribe(),
+                    cx,
+                )
+            })),
+            OpenRequest::NewManagedSession { id, phase, agent } => {
+                // Launch the agent in the phase's permission mode: Plan ⇒ `--permission-mode
                 // plan`, everything else ⇒ `auto` (Discovery's no-edit posture is our
-                // PDP's job, not CC's). `mode` is the derived CC-native binary, stored
-                // on the record/roster.
+                // PDP's job, not the CLI's). `mode` is the derived native binary, stored
+                // on the record/roster. The backend (`claude` / `agy`) owns the command shape.
                 let mode = phase.operator_mode();
                 // Stand the session's embedded MCP endpoint up so the agent gets the
                 // `moonlight` actor verbs from its very first turn.
                 let mcp = deps.mcp_host.as_ref().and_then(|h| h.url_for(&id));
-                let command = crate::obs::with_statusline(format!(
-                    "claude --session-id {} --permission-mode {}{}",
-                    id.as_str(),
-                    phase.cc_permission_mode(),
-                    mcp.map(|url| session_launch_flags(&url)).unwrap_or_default()
-                ));
+                let backend = crate::agent_backend::backend_for(agent);
+                // Backend-specific pre-launch side effects (AGY writes its mcp_config so
+                // `/mcp` exposes the moonlight verbs; Claude injects via the launch flag).
+                backend.prepare_launch(mcp.as_deref());
+                let command = crate::agent_backend::wrap_statusline(
+                    agent,
+                    backend.launch_command(&crate::agent_backend::LaunchSpec {
+                        selector: crate::agent_backend::SessionSelector::Fresh(&id),
+                        permission_mode: Some(phase.cc_permission_mode()),
+                        mcp_url: mcp.as_deref(),
+                    }),
+                );
                 let root = deps.focus.read(cx).root();
                 // Record managed identity so a restart re-resumes this as a MANAGED
                 // session (embedded terminal), not a read-only observed one.
@@ -1859,6 +2004,7 @@ impl Workspace {
                     title: None,
                     mode,
                     phase,
+                    agent,
                     // App-created sessions are auto-adopted: the cockpit launched them,
                     // so they're governed from the first tool call (the engine seeds
                     // `adopted` from this record when detection discovers the session).
@@ -1888,12 +2034,17 @@ impl Workspace {
                     );
                     cx.notify();
                 });
+                // Trust-on-open: the first session launched under a project asks the
+                // operator whether to trust it (then remembers the answer); the choice
+                // is applied to this session and re-applied to future ones.
+                maybe_prompt_project_trust(&deps, id.clone(), root.clone(), window, cx);
                 Arc::new(cx.new(|cx| {
                     SessionMonitor::new_managed(
                         id,
                         None,
                         root,
                         command,
+                        agent,
                         phase,
                         deps.bus.subscribe(),
                         cx,
@@ -1914,13 +2065,14 @@ impl Workspace {
                             .or(root)
                             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                         let mcp = deps.mcp_host.as_ref().and_then(|h| h.url_for(&id));
-                        let command = attach_command(&id, rec.phase, mcp.as_deref());
+                        let command = attach_command(&id, rec.agent, rec.phase, mcp.as_deref());
                         Arc::new(cx.new(|cx| {
                             SessionMonitor::new_managed(
                                 id,
                                 None,
                                 root,
                                 command,
+                                rec.agent,
                                 rec.phase,
                                 deps.bus.subscribe(),
                                 cx,
@@ -1945,6 +2097,7 @@ impl Workspace {
             OpenRequest::DbConsole { source } => {
                 Arc::new(cx.new(|cx| DbConsolePanel::new(source, cx)))
             }
+            OpenRequest::Http => Arc::new(cx.new(super::panels::http_panel::HttpPanel::new)),
         };
 
         dock.update(cx, |area, cx| {
@@ -1993,10 +2146,15 @@ fn panel_state_key(panel: &PanelState) -> Option<String> {
 /// `session:` tab resumes a managed session in its embedded terminal (else shows the
 /// read-only transcript) **without** changing adoption. `space` roots the session/review
 /// when the managed record carries no root. `None` for an unknown key.
+/// Rebuild a center tab from its dedup `key`. `restoring` is `true` only on the
+/// IDE-restart restore paths ([`Workspace::restore_open_tabs`] / [`Workspace::realize_pending`]):
+/// a managed session rebuilt then, under an auto-resume project, is armed to nudge itself
+/// to continue once it comes back up stalled (see [`SessionMonitor::arm_restore_resume`]).
 fn build_center_panel(
     deps: &ShellDeps,
     key: &str,
     space: Option<&SpaceId>,
+    restoring: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<Arc<dyn PanelView>> {
@@ -2013,18 +2171,26 @@ fn build_center_panel(
                         .or_else(|| space_root.clone())
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                     let mcp = deps.mcp_host.as_ref().and_then(|h| h.url_for(&id));
-                    let command = attach_command(&id, rec.phase, mcp.as_deref());
-                    Arc::new(cx.new(|cx| {
+                    let command = attach_command(&id, rec.agent, rec.phase, mcp.as_deref());
+                    // Arm the restart auto-resume nudge for a restored managed session whose
+                    // project opted in — it fires once the session comes back up stalled.
+                    let arm = restoring && deps.focus.read(cx).project_auto_resume(&root);
+                    let mon = cx.new(|cx| {
                         SessionMonitor::new_managed(
                             id,
                             None,
                             root,
                             command,
+                            rec.agent,
                             rec.phase,
                             deps.bus.subscribe(),
                             cx,
                         )
-                    }))
+                    });
+                    if arm {
+                        mon.update(cx, |m, _| m.arm_restore_resume());
+                    }
+                    Arc::new(mon)
                 }
                 None => match space_root {
                     Some(root) => Arc::new(cx.new(|cx| {
@@ -2109,6 +2275,64 @@ fn notif_label(labels: &HashMap<SessionId, String>, id: &SessionId) -> String {
 
 /// Wall-clock now as epoch millis, for stamping a managed-session record's
 /// `created_at`/`last_seen` (the domain itself has no clock).
+/// Trust-on-open prompt: the first managed session launched under a project asks the
+/// operator whether to trust it, then remembers the answer in the project space. The
+/// choice is applied to this session (via `SetTrust`, which lands once the engine tracks
+/// it) and persisted so later sessions and restarts come up at the chosen tier.
+///
+/// No-op when (a) there's no open space for `root` to remember against, or (b) the
+/// project's trust is already known — restored sessions then pick the tier up from the
+/// space on their first sighting (see [`SessionMonitor`]'s upsert fold).
+fn maybe_prompt_project_trust(
+    deps: &ShellDeps,
+    id: SessionId,
+    root: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let focus = deps.focus.clone();
+    {
+        let ps = focus.read(cx);
+        if ps.space_id_for_root(&root).is_none() || ps.project_trust(&root).is_some() {
+            return;
+        }
+    }
+    let label = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| root.display().to_string());
+    // Index ↔ tier must match the order below.
+    let answers = ["Trust", "Read-only", "Don't trust"];
+    let receiver = window.prompt(
+        PromptLevel::Info,
+        &format!("Trust the project “{label}”?"),
+        Some(
+            "Trust lets this project's sessions act autonomously at their tier. Read-only \
+             permits reads but gates writes. Don't trust gates every action. You can change \
+             this anytime from a session's Trust selector.",
+        ),
+        &answers,
+        cx,
+    );
+    let commands = deps.commands.clone();
+    cx.spawn(async move |_this, cx| {
+        let Ok(choice) = receiver.await else {
+            return;
+        };
+        let tier = match choice {
+            0 => TrustTier::Trusted,
+            1 => TrustTier::ReadOnly,
+            _ => TrustTier::Observed,
+        };
+        let _ = focus.update(cx, |ps, _cx| ps.set_project_trust(&root, tier));
+        // Apply to the just-launched session; by answer time the engine has usually
+        // tracked it. (If not, the monitor re-applies the persisted tier on first sight.)
+        let _ = commands.send(Command::SetTrust { session: id, tier });
+    })
+    .detach();
+}
+
 fn now_ms() -> Timestamp {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2306,11 +2530,15 @@ impl Render for Workspace {
             let tabs: Vec<SpaceTab> = ps
                 .spaces()
                 .iter()
-                .map(|s| SpaceTab {
-                    id: s.id.clone(),
-                    label: s.label.clone(),
-                    active: active.as_ref() == Some(&s.id),
-                    attention: self.space_attention(&s.root),
+                .map(|s| {
+                    let (attention, needs_input) = self.space_attention(&s.root);
+                    SpaceTab {
+                        id: s.id.clone(),
+                        label: s.label.clone(),
+                        active: active.as_ref() == Some(&s.id),
+                        attention,
+                        needs_input,
+                    }
                 })
                 .collect();
             (tabs, active.is_none())
@@ -2418,6 +2646,10 @@ impl Render for Workspace {
                     .map(|c| cx.global::<ShellDeps>().run_registry.command_running(c.id()))
                     .unwrap_or(false),
                 run_configs,
+                auto_phase: cx
+                    .global::<ShellDeps>()
+                    .auto_phase
+                    .load(std::sync::atomic::Ordering::Relaxed),
             }
         };
 

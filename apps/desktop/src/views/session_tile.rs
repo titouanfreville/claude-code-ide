@@ -8,23 +8,11 @@
 
 use gpui::prelude::*;
 use gpui::{div, px, FontWeight, Hsla};
-use moonlight_domain::session::{AttentionKind, Session, SessionStatus};
+use moonlight_domain::agent::AgentKind;
+use moonlight_domain::session::{AttentionKind, Session};
 
 use super::session_meta::SessionMeta;
 use super::theme;
-
-/// Colour for an attention warning glyph: the "did not complete" cases burn red, the
-/// self-reported "I'm stuck" amber.
-fn attn_color(k: AttentionKind) -> Hsla {
-    match k {
-        AttentionKind::Errored | AttentionKind::Incomplete => {
-            theme::status_color(SessionStatus::Errored)
-        }
-        AttentionKind::Stuck | AttentionKind::NeedsInput => {
-            theme::status_color(SessionStatus::WaitingInput)
-        }
-    }
-}
 
 /// Render one session as a tile element. `meta` carries the operator's custom name
 /// and color (default when unset). `attention` is the louder ⚠ overlay (the agent
@@ -35,6 +23,7 @@ pub fn session_tile(
     s: &Session,
     meta: &SessionMeta,
     attention: Option<AttentionKind>,
+    agent: AgentKind,
 ) -> impl IntoElement {
     let status = s.status;
     let scolor = theme::status_color(status);
@@ -101,7 +90,7 @@ pub fn session_tile(
                                 .children(warn.map(|a| {
                                     div()
                                         .flex_shrink_0()
-                                        .text_color(attn_color(a))
+                                        .text_color(theme::attention_color(a))
                                         .text_size(theme::text_sm())
                                         .child(a.glyph().to_string())
                                 }))
@@ -133,11 +122,17 @@ pub fn session_tile(
                                 .items_center()
                                 .gap_2()
                                 .child(chip(s.phase.label(), theme::phase_color(s.phase)))
+                                // Backend badge — only for non-Claude (Claude is the
+                                // implicit default, kept un-badged to avoid clutter).
+                                .children(
+                                    (agent != AgentKind::ClaudeCode)
+                                        .then(|| chip("AGY", theme::accent())),
+                                )
                                 .child(
                                     div()
                                         .text_color(theme::text_muted())
                                         .text_size(theme::text_sm())
-                                        // Derived from phase so it never drifts from CC's real mode.
+                                        // Derived from phase so it never drifts from the real mode.
                                         .child(s.phase.mode_label()),
                                 ),
                         ),

@@ -203,6 +203,11 @@ impl SessionSupervisor {
             Command::RehydrateFleet => self.hydrate_from_store(),
             Command::ForgetSession { session } => self.forget_session(session),
             Command::FlagSession { session, alert } => self.flag_session(session, alert),
+            // Handled by the composition-root command router (runtime overlay + config
+            // persist) before reaching the supervisor; arm kept for exhaustiveness.
+            Command::AuthorizeAlwaysTool { .. } => {
+                tracing::debug!("AuthorizeAlwaysTool reached supervisor — expected router to consume it");
+            }
         }
     }
 
@@ -862,6 +867,7 @@ mod tests {
         let store = Arc::new(FakeStore {
             managed_rec: Some(ManagedSession {
                 id: SessionId::new("m1"),
+                agent: moonlight_domain::AgentKind::ClaudeCode,
                 root: Some("/repo".into()),
                 title: None,
                 mode: Mode::Auto,
@@ -916,6 +922,7 @@ mod tests {
             managed_all: vec![
                 ManagedSession {
                     id: SessionId::new("a"),
+                    agent: moonlight_domain::AgentKind::ClaudeCode,
                     root: Some("/repo/a".into()),
                     title: None,
                     mode: Mode::Auto,
@@ -929,6 +936,7 @@ mod tests {
                 },
                 ManagedSession {
                     id: SessionId::new("b"),
+                    agent: moonlight_domain::AgentKind::ClaudeCode,
                     root: Some("/repo/b".into()),
                     title: None,
                     mode: Mode::Plan,
@@ -977,6 +985,7 @@ mod tests {
             // The persisted record rests Idle in phase Plan.
             managed_all: vec![ManagedSession {
                 id: SessionId::new("s"),
+                agent: moonlight_domain::AgentKind::ClaudeCode,
                 root: Some("/repo".into()),
                 title: None,
                 mode: Mode::Plan,

@@ -45,6 +45,13 @@ pub enum McpVerb {
     /// every phase gate and runs autonomously at any tier (a stuck agent must always be
     /// able to call for help, in any phase).
     ReportBlocked,
+    /// **Read-only orientation:** report the session's *current* workflow phase and what
+    /// it allows (project writes? AI-workspace writes? which CC mode), plus what `next`
+    /// would advance to. A pure read with no side effect — passes every phase gate and
+    /// runs at any tier — so a session can always discover where it is before deciding
+    /// whether to [`RequestPhase`](McpVerb::RequestPhase). The fix for phase *mismatch*:
+    /// the agent never has to guess its phase.
+    PhaseStatus,
 }
 
 impl McpVerb {
@@ -66,6 +73,8 @@ impl McpVerb {
             McpVerb::RequestPhase => TrustTier::Trusted,
             // A cry for help must never be gated — any session, any tier, can self-report.
             McpVerb::ReportBlocked => TrustTier::Observed,
+            // Orientation must never be gated — any session, any tier, can ask where it is.
+            McpVerb::PhaseStatus => TrustTier::Observed,
         }
     }
 
@@ -92,6 +101,8 @@ impl McpVerb {
                 // Not literally a read, but a no-project-side-effect status signal that
                 // must pass the frozen-phase gate (a stuck agent reports in any phase).
                 | McpVerb::ReportBlocked
+                // A pure read of the session's own phase — passes the frozen-phase gate.
+                | McpVerb::PhaseStatus
         )
     }
 }

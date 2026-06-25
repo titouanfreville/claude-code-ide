@@ -25,6 +25,7 @@
 use std::path::{Path, PathBuf};
 
 use moonlight_domain::ids::SessionId;
+use moonlight_domain::trust::TrustTier;
 use serde::{Deserialize, Serialize};
 
 use super::space_sessions::{self, SpaceSession};
@@ -61,6 +62,18 @@ pub struct Space {
     /// roster file. Skipped in `projects.json` — the roster file owns it.
     #[serde(skip)]
     pub sessions: Vec<SpaceSession>,
+    /// The operator's persisted trust decision for this project (asked once on first
+    /// session launch, then remembered). `None` until answered — sessions launch at
+    /// the engine default (`Observed`) and the operator is prompted. Once set, every
+    /// session under this root is brought to this tier (and the Trust selector persists
+    /// changes back here). See [`ProjectSpace::project_trust`].
+    #[serde(default)]
+    pub trust: Option<TrustTier>,
+    /// When on, a session under this project that stalls/stops mid-work is automatically
+    /// resumed with a continue prompt (opt-in per project, default off). See
+    /// [`ProjectSpace::project_auto_resume`].
+    #[serde(default)]
+    pub auto_resume: bool,
 }
 
 impl Space {
@@ -79,6 +92,8 @@ impl Space {
             root,
             label,
             sessions,
+            trust: None,
+            auto_resume: false,
         }
     }
 }
@@ -350,6 +365,47 @@ impl ProjectSpace {
             match space.sessions.iter_mut().find(|s| s.id == session.id) {
                 Some(existing) => *existing = session,
                 None => space.sessions.push(session),
+            }
+        }
+    }
+
+    /// The operator's persisted trust decision for the open space at `root`, if any.
+    /// `None` means either no open space for `root` or the operator hasn't been asked
+    /// yet (the launch path prompts, then [`set_project_trust`](Self::set_project_trust)
+    /// records the answer).
+    pub fn project_trust(&self, root: &Path) -> Option<TrustTier> {
+        self.spaces.iter().find(|s| s.root == *root)?.trust
+    }
+
+    /// Persist the project's trust tier (the operator's answer to the trust prompt, or a
+    /// later change via the session's Trust selector). No-op when no space is open for
+    /// `root` (trust is remembered per opened project). Persists to `projects.json`.
+    pub fn set_project_trust(&mut self, root: &Path, tier: TrustTier) {
+        if let Some(space) = self.spaces.iter_mut().find(|s| s.root == *root) {
+            if space.trust != Some(tier) {
+                space.trust = Some(tier);
+                self.save();
+            }
+        }
+    }
+
+    /// Whether the project at `root` opts into auto-resuming a stalled/stopped session.
+    /// `false` when no space is open for `root` or the operator left it off (default).
+    pub fn project_auto_resume(&self, root: &Path) -> bool {
+        self.spaces
+            .iter()
+            .find(|s| s.root == *root)
+            .map(|s| s.auto_resume)
+            .unwrap_or(false)
+    }
+
+    /// Toggle the project's auto-resume opt-in. No-op when no space is open for `root`.
+    /// Persists to `projects.json`.
+    pub fn set_project_auto_resume(&mut self, root: &Path, on: bool) {
+        if let Some(space) = self.spaces.iter_mut().find(|s| s.root == *root) {
+            if space.auto_resume != on {
+                space.auto_resume = on;
+                self.save();
             }
         }
     }
@@ -657,6 +713,54 @@ mod tests {
         assert_eq!(loaded.active, Some(SpaceId("/tmp/y".into())));
         assert_eq!(loaded.recent, state.recent);
         assert!(!loaded.follow_focus);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_trust_and_auto_resume_persist_per_space() {
+        let mut space = ProjectSpace::default();
+        let a = PathBuf::from("/tmp/a");
+
+        // Unknown until the space is opened and the operator decides.
+        assert_eq!(space.project_trust(&a), None);
+        assert!(!space.project_auto_resume(&a));
+        // No space yet → setters are no-ops (nothing to remember against).
+        space.set_project_trust(&a, TrustTier::Trusted);
+        assert_eq!(space.project_trust(&a), None);
+
+        space.open_root(a.clone());
+        space.set_project_trust(&a, TrustTier::Trusted);
+        space.set_project_auto_resume(&a, true);
+        assert_eq!(space.project_trust(&a), Some(TrustTier::Trusted));
+        assert!(space.project_auto_resume(&a));
+
+        // A different project is independent.
+        let b = PathBuf::from("/tmp/b");
+        space.open_root(b.clone());
+        assert_eq!(space.project_trust(&b), None);
+        assert!(!space.project_auto_resume(&b));
+    }
+
+    #[test]
+    fn trust_and_auto_resume_round_trip_through_persistence() {
+        let dir = std::env::temp_dir().join(format!("mlc-trust-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("projects.json");
+
+        let mut x = Space::from_root(PathBuf::from("/tmp/x"));
+        x.trust = Some(TrustTier::ReadOnly);
+        x.auto_resume = true;
+        let state = PersistState {
+            spaces: vec![x],
+            active: None,
+            recent: vec![],
+            follow_focus: true,
+        };
+        save_to(&path, &state).unwrap();
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.spaces[0].trust, Some(TrustTier::ReadOnly));
+        assert!(loaded.spaces[0].auto_resume);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

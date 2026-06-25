@@ -18,11 +18,14 @@ use serde_json::Value;
 /// absolute) entries match the write's absolute path regardless of repo — e.g. the
 /// harness keeps its plan files in `~/.claude/plans/`, which a Plan-phase session
 /// must be able to write. Confirmed for this workspace: planning/handoff dirs, the
-/// BMad output + module trees, the OMC/RTK tool state, and the project `docs/` dir.
+/// BMad working + output + module trees, the project `.claude/` config (commands,
+/// skills, settings), the OMC/RTK tool state, and the project `docs/` dir.
 pub const DEFAULT_AI_ROOTS: &[&str] = &[
     ".ai",
+    ".bmad",
     ".bmad-output",
     "_bmad",
+    ".claude",
     ".omc",
     ".rtk",
     "docs",
@@ -95,9 +98,11 @@ impl AiWorkspace {
         self
     }
 
-    /// Whether the operator vouched `tool_name` as read-only via `safe_tools`.
+    /// Whether the operator vouched `tool_name` as read-only via `safe_tools`. An entry
+    /// is either an exact tool name or a trailing-`*` glob vouching a whole server's
+    /// tools (`mcp__phoenix__*` matches `mcp__phoenix__run_select_query`).
     pub fn is_safe_tool(&self, tool_name: &str) -> bool {
-        self.safe_tools.iter().any(|t| t == tool_name)
+        self.safe_tools.iter().any(|t| safe_tool_matches(t, tool_name))
     }
 
     /// Layer `user` then `workspace` config over the built-in [`DEFAULT_AI_ROOTS`].
@@ -207,6 +212,16 @@ fn is_under(rel: &str, root: &str) -> bool {
     rel == root || rel.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
 }
 
+/// Match a `safe_tools` entry against a tool name: exact, or a single trailing-`*`
+/// wildcard matching any suffix (`mcp__phoenix__*` ⊇ `mcp__phoenix__run_select_query`).
+/// A lone `*` is ignored (empty prefix would vouch every tool — never what's meant).
+pub(crate) fn safe_tool_matches(pattern: &str, tool_name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => !prefix.is_empty() && tool_name.starts_with(prefix),
+        None => pattern == tool_name,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,8 +236,11 @@ mod tests {
         let ai = ai();
         for p in [
             "/repo/.ai/handoffs/00-status.md",
+            "/repo/.bmad/config.yaml",
             "/repo/.bmad-output/planning/prd.md",
             "/repo/_bmad/bmm/x.md",
+            "/repo/.claude/commands/foo.md",
+            "/repo/.claude/settings.local.json",
             "/repo/.omc/state/s.json",
             "/repo/docs/plan.md",
         ] {
@@ -283,10 +301,11 @@ mod tests {
             ai.scope_of(&format!("{home}/.claude/settings.json"), "/repo"),
             WriteScope::Project
         );
-        // A repo-local `.claude/plans` lookalike is not the home-anchored root.
+        // A repo-local `.claude/**` path is AiWorkspace via the repo-relative `.claude`
+        // root — independent of the home-anchored `~/.claude/plans` root above.
         assert_eq!(
             ai.scope_of("/repo/.claude/plansX/x.md", "/repo"),
-            WriteScope::Project
+            WriteScope::AiWorkspace
         );
     }
 
@@ -315,6 +334,25 @@ mod tests {
         assert!(!ai.is_safe_tool("mcp__x__ast_grep_replace"));
         // Default carries no vouched tools.
         assert!(!AiWorkspace::default().is_safe_tool("anything"));
+    }
+
+    #[test]
+    fn safe_tools_support_a_trailing_server_glob() {
+        // `mcp__phoenix__*` vouches every tool the phoenix server exposes (the "always
+        // allow this server" affordance), while exact entries match only themselves.
+        let ai = AiWorkspace::default()
+            .with_safe_tools(["mcp__phoenix__*".to_string(), "mcp__db__run_select".to_string()]);
+        assert!(ai.is_safe_tool("mcp__phoenix__run_select_query"));
+        assert!(ai.is_safe_tool("mcp__phoenix__open_snowflake_request"));
+        assert!(ai.is_safe_tool("mcp__db__run_select"));
+        // A different server is not covered by the phoenix glob.
+        assert!(!ai.is_safe_tool("mcp__other__run_select_query"));
+        // An exact entry does not match siblings.
+        assert!(!ai.is_safe_tool("mcp__db__run_update"));
+        // A lone `*` must not vouch everything.
+        assert!(!AiWorkspace::default()
+            .with_safe_tools(["*".to_string()])
+            .is_safe_tool("mcp__anything__delete"));
     }
 
     #[test]

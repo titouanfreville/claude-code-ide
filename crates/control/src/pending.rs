@@ -46,8 +46,17 @@ pub enum Decision {
 pub trait ApprovalNotifier: Send + Sync {
     /// A session's action is held pending approval. `what` is a short
     /// human-readable description (e.g. "approve plan", "run `rm -rf …`"); `plan`
-    /// carries the proposed plan markdown when the held action is `ExitPlanMode`.
-    fn approval_requested(&self, session: &SessionId, what: &str, plan: Option<&str>);
+    /// carries the proposed plan markdown when the held action is `ExitPlanMode`;
+    /// `mcp_tool` carries the full `mcp__server__tool` name when the held action is an
+    /// external MCP tool a frozen phase blocked (so the cockpit can offer per-tool /
+    /// per-server "always allow"). Both are `None` for a plain danger-zone hold.
+    fn approval_requested(
+        &self,
+        session: &SessionId,
+        what: &str,
+        plan: Option<&str>,
+        mcp_tool: Option<&str>,
+    );
 }
 
 /// Registry of in-flight held approvals, keyed by session.

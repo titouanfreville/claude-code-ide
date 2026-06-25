@@ -4,6 +4,7 @@
 //! crates) implement the trait ports defined under [`ports`]; the desktop app
 //! wires concrete adapters into these ports at its composition root.
 
+pub mod agent;
 pub mod audit;
 pub mod continuity;
 pub mod economy;
@@ -16,6 +17,7 @@ pub mod session;
 pub mod trust;
 
 // Convenience re-exports for the most-used types.
+pub use agent::{AgentKind, McpInjection};
 pub use audit::{AuditAction, AuditEntry};
 pub use economy::{GovernorAction, RateHeadroom, TokenStat};
 pub use errors::{ControlError, DomainError, StoreError, TrustError};

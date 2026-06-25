@@ -8,6 +8,9 @@
 //! the UI layer. Concrete adapters are built and injected into ports here â the
 //! single wiring place.
 
+mod agent_backend;
+mod agy_hook;
+mod agy_setup;
 mod docker;
 mod git;
 mod hook_install;
@@ -34,11 +37,11 @@ use gpui::{AppContext, WindowOptions};
 use gpui_component::Root;
 
 use moonlight_control::{
-    load_config, query_hook, user_config_path, AiWorkspaceResolver, ApprovalNotifier,
-    ControlServer, Decision, GateView, HookRequest, HookResponse, KeystoneApprovalGate,
-    ObserveOnlyControl, PendingApprovals, SteerControl,
+    append_safe_tool, load_config, query_hook, user_config_path, AiWorkspaceResolver,
+    ApprovalNotifier, ControlServer, Decision, GateView, HookRequest, HookResponse,
+    KeystoneApprovalGate, ObserveOnlyControl, PendingApprovals, RuntimeSafeTools, SteerControl,
 };
-use moonlight_detection::JsonlDetectionSource;
+use moonlight_detection::{AntigravityDetectionSource, CompositeDetectionSource, JsonlDetectionSource};
 use moonlight_domain::ids::SessionId;
 use moonlight_domain::phase::Phase;
 use moonlight_domain::ports::{
@@ -81,10 +84,17 @@ fn main() {
     // CLI subcommands (handled before any GUI/tracing init):
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        // Claude Code invokes `moonlight hook <event>` per hook. Fail-open: any
-        // error path just allows the action.
-        Some("hook") => return run_hook(),
-        // `moonlight hooks {install,uninstall,status}` manages CC hook registration.
+        // Agent CLIs invoke `moonlight hook <event>` per tool call. Fail-open: any
+        // error path just allows the action. Claude sends `pre-tool-use`; the AGY
+        // plugin sends `agy-pre-tool-use` (different payload shape + verdict format).
+        Some("hook") => {
+            return match args.get(2).map(String::as_str) {
+                Some("agy-pre-tool-use") => run_hook_agy(),
+                _ => run_hook(),
+            };
+        }
+        // `moonlight hooks {install,uninstall,status} [claude|agy|all]` manages hook
+        // registration for both backends.
         Some("hooks") => return hook_install::run(&args),
         // CC's `statusLine` command for app-launched sessions: capture obs + echo a line.
         Some("statusline") => return run_statusline(),
@@ -140,7 +150,16 @@ fn main() {
         // One bus-backed notifier shared by the hook server and the MCP approval
         // gate — both surface their holds through the same cockpit affordance.
         let notifier: Arc<dyn ApprovalNotifier> = Arc::new(BusNotifier { bus: bus.clone() });
-        spawn_control_server(gate_view.clone(), pending.clone(), notifier.clone());
+        // Runtime "always allow" overlay: the control server reads it to vouch a held
+        // external-MCP tool; the command router (below) appends to it when the operator
+        // clicks "always allow". Shared `Arc` so the decision takes effect immediately.
+        let runtime_safe: RuntimeSafeTools = Arc::default();
+        spawn_control_server(
+            gate_view.clone(),
+            pending.clone(),
+            notifier.clone(),
+            runtime_safe.clone(),
+        );
 
         // Fold engine facts into the gate read-model (on GPUI's executor).
         {
@@ -203,6 +222,10 @@ fn main() {
         // Services view's HTTP summary polls it (same one-state-two-worlds shape as the
         // run registry).
         let http_history = http::HttpHistory::new();
+        // Operator's auto-phasing toggle (off by default): a shared flag the main
+        // toolbar flips and the actor reads — when on, a `request_phase` Prompt is
+        // auto-approved instead of waiting on the cockpit gate.
+        let auto_phase = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // Executor stack (outer → inner): phase verb (request_phase) → http_request →
         // run verbs → the shell-backed run_with_coverage. Each layer handles its own
         // verbs and delegates the rest.
@@ -211,6 +234,7 @@ fn main() {
             mcp_policy.clone(),
             Arc::new(phase_verbs::PhaseVerbExecutor::new(
                 commands.clone(),
+                mcp_policy.clone(),
                 Arc::new(http_verbs::HttpVerbExecutor::new(
                     http_history.clone(),
                     Arc::new(run_verbs::RunVerbExecutor::new(
@@ -227,13 +251,16 @@ fn main() {
                 notifier.clone(),
                 None,
             )),
-        ));
+        ).with_auto_phase(auto_phase.clone()));
         let mcp_host = McpHostHandle::build(McpHost::new(actor, mcp_policy));
 
         // Clones the engine loop owns: it resolves held approvals against `pending`
         // and republishes the resumed status on `bus`.
         let loop_pending = pending.clone();
         let loop_bus = bus.clone();
+        // The engine loop also owns a handle to the runtime "always allow" overlay so
+        // an `AuthorizeAlwaysTool` command can vouch a pattern (and persist it).
+        let loop_runtime_safe = runtime_safe.clone();
         // The shell shares the same store so a restored managed-session tab can be
         // re-resumed (see the SessionMonitor registry arm in `views::workspace`).
         let shell_store = store.clone();
@@ -267,6 +294,7 @@ fn main() {
                     mcp_host,
                     run_registry,
                     http_history,
+                    auto_phase,
                 );
 
                 let workspace = cx.new(|cx| Workspace::new(window, cx));
@@ -280,10 +308,16 @@ fn main() {
             // â engine â bus â UI). Reads the operator's real `~/.claude/projects`.
             run_engine_loop(
                 supervisor,
-                JsonlDetectionSource::default(),
+                // Observe BOTH backends: Claude's `~/.claude/projects` and AGY's
+                // `~/.gemini/antigravity-cli/brain`.
+                CompositeDetectionSource::new(vec![
+                    Box::new(JsonlDetectionSource::default()),
+                    Box::new(AntigravityDetectionSource::default()),
+                ]),
                 command_rx,
                 loop_pending,
                 loop_bus,
+                loop_runtime_safe,
                 cx.clone(),
             )
             .await;
@@ -302,6 +336,7 @@ async fn run_engine_loop(
     mut command_rx: mpsc::UnboundedReceiver<Command>,
     pending: Arc<PendingApprovals>,
     bus: EventBus,
+    runtime_safe: RuntimeSafeTools,
     cx: gpui::AsyncApp,
 ) {
     // Rehydrate the managed fleet from the durable store before the first poll, so a
@@ -313,7 +348,7 @@ async fn run_engine_loop(
     loop {
         // Apply any queued operator commands first.
         while let Ok(command) = command_rx.try_recv() {
-            dispatch_command(&mut supervisor, &pending, &bus, command).await;
+            dispatch_command(&mut supervisor, &pending, &bus, &runtime_safe, command).await;
         }
         // Then reconcile against the detection source.
         match source.poll().await {
@@ -328,7 +363,7 @@ async fn run_engine_loop(
         tokio::select! {
             _ = cx.background_executor().timer(DETECTION_INTERVAL) => {}
             Some(command) = command_rx.recv() => {
-                dispatch_command(&mut supervisor, &pending, &bus, command).await;
+                dispatch_command(&mut supervisor, &pending, &bus, &runtime_safe, command).await;
             }
         }
     }
@@ -368,18 +403,69 @@ async fn dispatch_command(
     supervisor: &mut SessionSupervisor,
     pending: &PendingApprovals,
     bus: &EventBus,
+    runtime_safe: &RuntimeSafeTools,
     command: Command,
 ) {
-    if let Some(command) = route_approval(pending, bus, command) {
+    // The durable half of "always allow" (a user-config write) is a filesystem side
+    // effect kept out of the unit-tested `route_approval` core — do it here.
+    if let Command::AuthorizeAlwaysTool { pattern, .. } = &command {
+        persist_always_allow(pattern);
+    }
+    if let Some(command) = route_approval(pending, bus, runtime_safe, command) {
         supervisor.handle_command(command).await;
+    }
+}
+
+/// Persist an "always allow" tool pattern to the user config (`~/.moonlight/config.json`)
+/// so it survives a restart. Best-effort: the runtime overlay already gives the decision
+/// immediate effect, so a missing `HOME` or a write error only costs durability (logged).
+fn persist_always_allow(pattern: &str) {
+    match std::env::var_os("HOME") {
+        Some(home) => {
+            let path = user_config_path(home);
+            if let Err(e) = append_safe_tool(&path, pattern) {
+                tracing::warn!(error = %e, %pattern,
+                    "failed to persist always-allow to user config (still active this session)");
+            }
+        }
+        None => {
+            tracing::warn!(%pattern, "no HOME — always-allow not persisted (active this session)")
+        }
     }
 }
 
 /// If `command` resolves a pending held approval, resolve it (and republish the
 /// session as running) and return `None`. Otherwise return the command unchanged
-/// for the supervisor to handle. Pure except for the registry/bus side effects, so
-/// the routing logic is unit-testable.
-fn route_approval(pending: &PendingApprovals, bus: &EventBus, command: Command) -> Option<Command> {
+/// for the supervisor to handle. Pure except for the registry/bus/config side effects,
+/// so the routing logic is unit-testable.
+///
+/// `AuthorizeAlwaysTool` is the "always allow" decision on a held external-MCP
+/// authorization: it vouches the pattern in the runtime overlay (immediate effect) and
+/// persists it to the user config (durable), then approves the held call. The persist is
+/// best-effort — a failed write still leaves the vouch active for the session.
+fn route_approval(
+    pending: &PendingApprovals,
+    bus: &EventBus,
+    runtime_safe: &RuntimeSafeTools,
+    command: Command,
+) -> Option<Command> {
+    if let Command::AuthorizeAlwaysTool { session, pattern } = &command {
+        // Vouch the pattern for the rest of the session (immediate effect); the durable
+        // user-config write is done by the caller (`dispatch_command`).
+        runtime_safe
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(pattern.clone());
+        // Approve the held call now; the overlay makes future calls pass without a prompt.
+        if pending.resolve(session, Decision::Approve) {
+            bus.publish(EngineEvent::SessionStateChanged {
+                session: session.clone(),
+                status: SessionStatus::Running,
+            });
+        }
+        return None;
+    }
+
     let (session, decision) = match &command {
         Command::ApproveAction { session } => (session.clone(), Decision::Approve),
         Command::DenyAction { session, reason } => (
@@ -533,7 +619,13 @@ struct BusNotifier {
 }
 
 impl ApprovalNotifier for BusNotifier {
-    fn approval_requested(&self, session: &SessionId, what: &str, plan: Option<&str>) {
+    fn approval_requested(
+        &self,
+        session: &SessionId,
+        what: &str,
+        plan: Option<&str>,
+        mcp_tool: Option<&str>,
+    ) {
         if let Some(plan) = plan {
             self.bus.publish(EngineEvent::PlanProposed {
                 session: session.clone(),
@@ -543,6 +635,7 @@ impl ApprovalNotifier for BusNotifier {
         self.bus.publish(EngineEvent::ApprovalRequested {
             session: session.clone(),
             what: what.to_string(),
+            authorize_tool: mcp_tool.map(str::to_string),
         });
         // Float the tile into the "needs you" queue while it's blocked on us.
         self.bus.publish(EngineEvent::SessionStateChanged {
@@ -560,6 +653,7 @@ fn spawn_control_server(
     gate_view: GateView,
     pending: Arc<PendingApprovals>,
     notifier: Arc<dyn ApprovalNotifier>,
+    runtime_safe: RuntimeSafeTools,
 ) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -600,7 +694,8 @@ fn spawn_control_server(
                             // at install) is the only ceiling.
                             None,
                         )
-                        .with_ai_resolver(ai_workspace_resolver()),
+                        .with_ai_resolver(ai_workspace_resolver())
+                        .with_runtime_safe(runtime_safe),
                     )
                     .serve(listener)
                     .await;
@@ -668,6 +763,46 @@ fn run_hook() {
     }
 }
 
+/// Serve one **Antigravity** (`agy`) `PreToolUse` hook call. Same control-server query
+/// as [`run_hook`], but AGY's payload shape and verdict format differ: we normalize the
+/// payload onto the shared [`HookRequest`] (see [`agy_hook`]) and emit AGY's
+/// `{"decision": …, "systemMessage": …}` verdict. Fail-open (allow) on any error.
+fn run_hook_agy() {
+    use std::io::Read;
+
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        emit_agy_allow();
+        return;
+    }
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&input) else {
+        emit_agy_allow();
+        return;
+    };
+    let request = agy_hook::normalize(&payload);
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        emit_agy_allow();
+        return;
+    };
+    let response = rt.block_on(query_hook(&control_socket_path(), &request, HOOK_TIMEOUT));
+
+    match response {
+        HookResponse::Deny { reason } => {
+            println!("{}", serde_json::json!({ "decision": "deny", "systemMessage": reason }));
+        }
+        HookResponse::Allow => emit_agy_allow(),
+    }
+}
+
+/// AGY's allow verdict. Emitted explicitly (AGY's own hooks do too) on the allow path
+/// and on every fail-open error, so a broken or absent MoonlightCode never blocks `agy`.
+fn emit_agy_allow() {
+    println!("{}", serde_json::json!({ "decision": "allow", "systemMessage": "" }));
+}
+
 /// CC's `statusLine` command for an app-launched session: read the statusline JSON
 /// from stdin, drop a per-session obs snapshot the app polls (see [`obs`]), and then
 /// **chain to the operator's own status line** (their global `statusLine`, e.g. the
@@ -725,6 +860,7 @@ fn startup_self_check() {
         verb: Some(McpVerb::RunWithCoverage),
         danger: DangerClass::Safe,
         write_scope: None,
+        prompt_on_project_freeze: false,
         description: "run tests with coverage".into(),
     };
     match pdp.decide(&demo) {
@@ -750,6 +886,7 @@ mod tests {
         let handled = route_approval(
             &pending,
             &bus,
+            &RuntimeSafeTools::default(),
             Command::ApproveAction {
                 session: s1.clone(),
             },
@@ -778,6 +915,7 @@ mod tests {
         let handled = route_approval(
             &pending,
             &bus,
+            &RuntimeSafeTools::default(),
             Command::DenyAction {
                 session: s1.clone(),
                 reason: "revise".into(),
@@ -800,10 +938,40 @@ mod tests {
         let forwarded = route_approval(
             &pending,
             &bus,
+            &RuntimeSafeTools::default(),
             Command::ApproveAction {
                 session: SessionId::new("ghost"),
             },
         );
         assert!(matches!(forwarded, Some(Command::ApproveAction { .. })));
+    }
+
+    #[test]
+    fn authorize_always_vouches_pattern_and_approves_held_call() {
+        let pending = PendingApprovals::new();
+        let bus = EventBus::new(16);
+        let runtime_safe = RuntimeSafeTools::default();
+        let s1 = SessionId::new("s1");
+        let mut hook_rx = pending.register(s1.clone());
+
+        let handled = route_approval(
+            &pending,
+            &bus,
+            &runtime_safe,
+            Command::AuthorizeAlwaysTool {
+                session: s1.clone(),
+                pattern: "mcp__phoenix__*".into(),
+            },
+        );
+
+        // Consumed (never forwarded to the supervisor)…
+        assert!(handled.is_none());
+        // …the held call is approved…
+        assert_eq!(hook_rx.try_recv().unwrap(), Decision::Approve);
+        // …and the pattern is vouched in the runtime overlay for the rest of the session.
+        assert!(runtime_safe
+            .read()
+            .unwrap()
+            .contains("mcp__phoenix__*"));
     }
 }

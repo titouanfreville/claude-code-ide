@@ -127,6 +127,15 @@ impl PlanReviewPanel {
                 self.reject_input = None;
                 was
             }
+            // The session was forgotten/removed (e.g. ↻ Reset, or it ended): no hold can
+            // still be outstanding, so disarm the buttons rather than leave a stale
+            // Approve/Reject that would resolve nothing.
+            EngineEvent::SessionRemoved { session } if session == watched => {
+                let was = self.pending || self.reject_input.is_some();
+                self.pending = false;
+                self.reject_input = None;
+                was
+            }
             _ => false,
         }
     }

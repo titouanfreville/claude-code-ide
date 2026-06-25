@@ -27,6 +27,16 @@ pub fn classify(tool_name: &str, tool_input: &Value) -> DangerClass {
         | "WebFetch" | "ExitPlanMode" | "BashOutput" | "SlashCommand" | "AskUserQuestion"
         | "Agent" | "Skill" | "ToolSearch" | "ScheduleWakeup" => DangerClass::Safe,
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => DangerClass::Risky,
+        // MoonlightCode's own actor verbs (`mcp__moonlight__*`) are independently
+        // policy-gated + audited by the embedded MCP server and its PDP. Two are pure
+        // control-plane / signaling calls that must reach the operator from *any*
+        // phase: `request_phase` is how a frozen session asks to move the gate — the
+        // generic MCP heuristic below reads its leading verb `request` as non-read and
+        // marks it Risky, so a frozen phase would deny the very escape hatch (the
+        // server's `is_phase_control` auto-prompt never gets a chance to run).
+        // `report_blocked` only raises a ⚠ attention signal. Neither mutates the
+        // workspace; classify them Safe so the hook defers to the server's gate.
+        "mcp__moonlight__request_phase" | "mcp__moonlight__report_blocked" => DangerClass::Safe,
         "Bash" => {
             let cmd = tool_input
                 .get("command")
@@ -587,5 +597,21 @@ mod tests {
         }
         // Workflow stays mutating until its subagent cascade is verified to re-gate.
         assert_eq!(classify("Workflow", &json!({})), DangerClass::Risky);
+    }
+
+    #[test]
+    fn moonlight_control_verbs_are_safe_so_frozen_phases_dont_trap_the_session() {
+        // `request_phase` must reach the operator from any phase — it's how a frozen
+        // session asks to move the gate. The generic MCP heuristic reads its leading
+        // verb `request` as non-read (Risky), which a frozen phase would deny, trapping
+        // the session. Special-cased to Safe so the hook defers to the server's gate.
+        assert_eq!(
+            classify("mcp__moonlight__request_phase", &json!({ "phase": "auto" })),
+            DangerClass::Safe
+        );
+        assert_eq!(
+            classify("mcp__moonlight__report_blocked", &json!({})),
+            DangerClass::Safe
+        );
     }
 }

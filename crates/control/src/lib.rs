@@ -19,12 +19,12 @@ pub mod pending;
 pub mod server;
 
 pub use classify::classify;
-pub use config::{load_config, user_config_path, AiWorkspaceResolver};
+pub use config::{append_safe_tool, load_config, user_config_path, AiWorkspaceResolver};
 pub use gate::{decide, evaluate, GateDecision, GateState, HoldKind, EXIT_PLAN_MODE};
 pub use paths::{classify_write_scope, AiWorkspace, AiWorkspaceConfig};
 pub use ipc::{HookRequest, HookResponse};
 pub use pending::{ApprovalNotifier, Decision, PendingApprovals};
-pub use server::{query_hook, ControlServer, GateView, DEFAULT_HOLD};
+pub use server::{query_hook, ControlServer, GateView, RuntimeSafeTools, DEFAULT_HOLD};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -159,8 +159,9 @@ impl KeystoneApprovalGate {
 impl ApprovalGate for KeystoneApprovalGate {
     async fn request(&self, session: &SessionId, what: &str) -> ApprovalDecision {
         let rx = self.pending.register(session.clone());
-        // No plan markdown for an actor verb — the description carries the context.
-        self.notifier.approval_requested(session, what, None);
+        // No plan markdown (nor an external-MCP tool name) for an actor verb — the
+        // description carries the context.
+        self.notifier.approval_requested(session, what, None, None);
         // Bounded (`Some`) → race the budget; unbounded (`None`) → await the operator
         // forever (the `Err`/elapsed arm is then unreachable — no rushed deny).
         let outcome = match self.timeout {
@@ -197,7 +198,7 @@ mod tests {
 
     struct NopNotifier;
     impl ApprovalNotifier for NopNotifier {
-        fn approval_requested(&self, _: &SessionId, _: &str, _: Option<&str>) {}
+        fn approval_requested(&self, _: &SessionId, _: &str, _: Option<&str>, _: Option<&str>) {}
     }
 
     #[tokio::test]

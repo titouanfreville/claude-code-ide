@@ -187,6 +187,15 @@ impl VerbToolServer {
     async fn report_blocked(&self, params: Parameters<ReportBlockedParams>) -> String {
         self.dispatch(McpVerb::ReportBlocked, params.0.reason).await
     }
+
+    /// Report the current workflow phase and what it allows — read-only, no approval.
+    #[tool(
+        name = "phase_status",
+        description = "Report your current workflow phase (Discovery / Plan / Auto / Test / Review / Commit) and exactly what it allows: whether project-file edits and AI-workspace notes are permitted, and what `next` would advance to. Read-only — no approval, no side effect, works in any phase. Call this first when unsure which phase you are in, before deciding whether to request_phase, so you never act on the wrong phase."
+    )]
+    async fn phase_status(&self) -> String {
+        self.dispatch(McpVerb::PhaseStatus, String::new()).await
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -197,10 +206,11 @@ impl ServerHandler for VerbToolServer {
         info.instructions = Some(
             "MoonlightCode actor verbs (policy-gated + audited). Available: \
              run_with_coverage; run_list_targets / run_start / run_stop / run_status / \
-             run_logs (the IDE's Run console — shared with the operator); request_phase \
-             (ask the operator to change the workflow phase — always operator-approved); \
-             report_blocked (signal you are stuck and need the operator — raises a ⚠ on \
-             your session)."
+             run_logs (the IDE's Run console — shared with the operator); phase_status \
+             (read-only: which workflow phase you are in and what it allows — call it \
+             when unsure before requesting a change); request_phase (ask the operator to \
+             change the workflow phase — always operator-approved); report_blocked \
+             (signal you are stuck and need the operator — raises a ⚠ on your session)."
                 .to_string(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();

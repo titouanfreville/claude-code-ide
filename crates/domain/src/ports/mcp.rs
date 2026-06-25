@@ -47,6 +47,13 @@ pub struct PermissionRequest {
     /// `Project`). `None` when the action isn't a path-attributable file write (reads,
     /// most Bash commands) — the PDP then treats any write as `Project` (conservative).
     pub write_scope: Option<WriteScope>,
+    /// When a frozen phase would deny this as a project write, prompt the operator for
+    /// approval instead of denying outright. Set for external MCP tool calls
+    /// (`mcp__*`, excluding MoonlightCode's own verbs): a frozen phase should let the
+    /// operator authorize an external read/query ad hoc (once / always) rather than
+    /// hard-refusing it. Project file edits and Bash leave this `false` — the product
+    /// freeze on them is absolute.
+    pub prompt_on_project_freeze: bool,
     /// Human-readable description of the action (for prompts / audit).
     pub description: String,
 }

@@ -40,6 +40,11 @@ pub struct ActorService {
     /// Holds a `Prompt` verb until the operator decides. Use [`DenyingApprovalGate`]
     /// where no approval channel exists (preserves default-deny).
     approval: Arc<dyn ApprovalGate>,
+    /// Operator's **auto-phasing** opt-in (a shared global toggle). When on, a
+    /// `Prompt` on a **control-plane** verb (`request_phase`) is auto-approved instead
+    /// of waiting on the cockpit gate — the operator has pre-authorized the agent to
+    /// move its own phase. Off by default; never affects any other verb.
+    auto_phase: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ActorService {
@@ -56,51 +61,61 @@ impl ActorService {
             executor,
             audit,
             approval,
+            auto_phase: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    /// Run an approved verb and audit it (shared by the `Allow` path and an
-    /// operator-approved `Prompt`). Execution errors surface as a non-ok result, not
-    /// a hard error — the agent sees what failed.
-    async fn execute_and_audit(
-        &self,
-        req: &ActorRequest,
-        snapshot: &SessionPolicySnapshot,
-    ) -> Result<ActorResult, ControlError> {
-        match self
-            .executor
-            .execute(&req.session, snapshot.root.as_deref(), req.verb, &req.payload)
-            .await
-        {
-            Ok(raw) => {
-                let compact = compact_output(&raw);
-                self.audit.record(
-                    &req.session,
-                    AuditAction::VerbExecuted {
-                        verb: req.verb,
-                        summary: summary_line(&compact),
-                    },
-                    true,
-                );
-                Ok(ActorResult {
-                    ok: true,
-                    compact_output: compact,
-                })
+    /// Share the operator's auto-phasing toggle (the UI flips this `AtomicBool`); when
+    /// on, control-plane `Prompt`s auto-approve. Defaults off when never set.
+    pub fn with_auto_phase(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.auto_phase = flag;
+        self
+    }
+}
+
+/// Run an approved verb and audit it. A **free function** (not a method) so the
+/// deferred phase-control path can call it from a detached task without borrowing
+/// `&self`. Shared by the `Allow` path, the auto-phase path, and an operator-approved
+/// `Prompt`. Execution errors surface as a non-ok result, not a hard error — the agent
+/// sees what failed.
+async fn execute_and_audit(
+    executor: &Arc<dyn VerbExecutor>,
+    audit: &Arc<dyn AuditSink>,
+    req: &ActorRequest,
+    snapshot: &SessionPolicySnapshot,
+) -> ActorResult {
+    match executor
+        .execute(&req.session, snapshot.root.as_deref(), req.verb, &req.payload)
+        .await
+    {
+        Ok(raw) => {
+            let compact = compact_output(&raw);
+            audit.record(
+                &req.session,
+                AuditAction::VerbExecuted {
+                    verb: req.verb,
+                    summary: summary_line(&compact),
+                },
+                true,
+            );
+            ActorResult {
+                ok: true,
+                compact_output: compact,
             }
-            Err(err) => {
-                let message = err.to_string();
-                self.audit.record(
-                    &req.session,
-                    AuditAction::VerbExecuted {
-                        verb: req.verb,
-                        summary: format!("failed: {message}"),
-                    },
-                    false,
-                );
-                Ok(ActorResult {
-                    ok: false,
-                    compact_output: message,
-                })
+        }
+        Err(err) => {
+            let message = err.to_string();
+            audit.record(
+                &req.session,
+                AuditAction::VerbExecuted {
+                    verb: req.verb,
+                    summary: format!("failed: {message}"),
+                },
+                false,
+            );
+            ActorResult {
+                ok: false,
+                compact_output: message,
             }
         }
     }
@@ -123,6 +138,10 @@ impl McpActor for ActorService {
             verb: Some(req.verb),
             danger: danger_class(req.verb),
             write_scope: None,
+            // MoonlightCode's own verbs route through their own control-plane gate
+            // (request_phase auto-approves; reads pass) — they don't use the external
+            // MCP prompt-on-freeze path.
+            prompt_on_project_freeze: false,
             description: describe(req),
         };
         let outcome = self
@@ -132,10 +151,71 @@ impl McpActor for ActorService {
 
         match outcome {
             // Allow → execute → audit → compact result (steps 3-5).
-            PermissionOutcome::Allow => self.execute_and_audit(req, &snapshot).await,
-            // Prompt → hold for the operator. Approve runs it (audited Approved, then
-            // VerbExecuted); Deny (or a timeout in the gate) refuses it.
+            PermissionOutcome::Allow => {
+                Ok(execute_and_audit(&self.executor, &self.audit, req, &snapshot).await)
+            }
+            // Prompt → the operator must decide.
             PermissionOutcome::Prompt { .. } => {
+                if req.verb.is_phase_control() {
+                    // Auto-phasing: the operator pre-authorized phase changes, so run it
+                    // inline (fast — no hold), audited as an auto-approval.
+                    if self.auto_phase.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.audit.record(
+                            &req.session,
+                            AuditAction::Approved {
+                                what: format!("auto-phase · {}", describe(req)),
+                            },
+                            false,
+                        );
+                        return Ok(
+                            execute_and_audit(&self.executor, &self.audit, req, &snapshot).await,
+                        );
+                    }
+                    // Otherwise: do NOT hold the MCP tool call open on an unbounded human
+                    // decision. The approval gate waits for the operator indefinitely
+                    // (`timeout: None`); a tool call held that long outlives the client's
+                    // tool-call timeout and the transport drops mid-call (the response is
+                    // lost — the live `request_phase` failure). Instead acknowledge now
+                    // and run the operator approval + the phase change in a detached task.
+                    // The agent rediscovers the new phase via `phase_status` / the next
+                    // verb's phase footer — it is told never to assume it changed.
+                    let approval = self.approval.clone();
+                    let executor = self.executor.clone();
+                    let audit = self.audit.clone();
+                    let what = describe(req);
+                    let req = req.clone();
+                    let snapshot = snapshot.clone();
+                    tokio::spawn(async move {
+                        match approval.request(&req.session, &what).await {
+                            ApprovalDecision::Approve => {
+                                audit.record(
+                                    &req.session,
+                                    AuditAction::Approved { what: what.clone() },
+                                    false,
+                                );
+                                let _ = execute_and_audit(&executor, &audit, &req, &snapshot).await;
+                            }
+                            ApprovalDecision::Deny { reason } => {
+                                audit.record(
+                                    &req.session,
+                                    AuditAction::Denied { what, reason },
+                                    false,
+                                );
+                            }
+                        }
+                    });
+                    return Ok(ActorResult {
+                        ok: true,
+                        compact_output: "Phase change requested — submitted to the operator for \
+                            approval. It is not applied until the operator approves, and this call \
+                            does not wait for that. Call phase_status to confirm the active phase \
+                            (or watch the phase footer on your next tool result)."
+                            .to_string(),
+                    });
+                }
+                // A non-phase Prompt (trust-tier / danger-zone): the agent needs the
+                // verb's actual result, so block on the operator as before. Approve runs
+                // it (audited Approved, then VerbExecuted); Deny refuses it.
                 match self.approval.request(&req.session, &describe(req)).await {
                     ApprovalDecision::Approve => {
                         self.audit.record(
@@ -143,7 +223,7 @@ impl McpActor for ActorService {
                             AuditAction::Approved { what: describe(req) },
                             false,
                         );
-                        self.execute_and_audit(req, &snapshot).await
+                        Ok(execute_and_audit(&self.executor, &self.audit, req, &snapshot).await)
                     }
                     ApprovalDecision::Deny { reason } => {
                         self.audit.record(
@@ -216,6 +296,8 @@ fn danger_class(verb: McpVerb) -> DangerClass {
         McpVerb::RequestPhase => DangerClass::Safe,
         // A status self-report: harmless, runs autonomously in any phase.
         McpVerb::ReportBlocked => DangerClass::Safe,
+        // A pure read of the session's own phase: harmless, runs in any phase.
+        McpVerb::PhaseStatus => DangerClass::Safe,
     }
 }
 
@@ -432,6 +514,116 @@ mod tests {
             verb: McpVerb::RunWithCoverage,
             payload: String::new(),
         }
+    }
+
+    fn phase_req() -> ActorRequest {
+        ActorRequest {
+            session: SessionId::new("s1"),
+            verb: McpVerb::RequestPhase,
+            payload: "auto".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn phase_control_prompt_acks_immediately_then_executes_on_approval() {
+        // request_phase must NOT hold the MCP call open on the operator decision (that
+        // unbounded hold dropped the transport mid-call). It returns an ack at once and
+        // does not run synchronously; the approval + phase change happen out of band.
+        // Here the gate approves, so the verb eventually runs.
+        let exec = Arc::new(FakeExecutor::ok("Phase change approved: Plan -> Auto"));
+        let audit = Arc::new(FakeAudit::default());
+        let svc = service_with(
+            Some(snapshot(Phase::Plan, TrustTier::Observed)),
+            exec.clone(),
+            audit.clone(),
+            Arc::new(FakeGate(ApprovalDecision::Approve)),
+        );
+        let out = svc.run(&phase_req()).await.unwrap();
+        // Immediate ack — success (the *submission* succeeded), not the executed result,
+        // and the executor has not run yet.
+        assert!(out.ok, "{out:?}");
+        assert!(
+            out.compact_output.to_lowercase().contains("operator"),
+            "ack must say it is pending operator approval: {out:?}"
+        );
+        assert!(!exec.was_called(), "must not execute synchronously");
+        // Let the detached approval task run to completion.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(exec.was_called(), "verb runs once the operator approves");
+        assert!(audit
+            .actions()
+            .iter()
+            .any(|a| matches!(a, AuditAction::Approved { .. })));
+    }
+
+    #[tokio::test]
+    async fn phase_control_prompt_denied_out_of_band_never_executes() {
+        // The ack is returned regardless of the eventual decision; a background deny
+        // (default-deny gate) audits a Denial and never runs the verb.
+        let exec = Arc::new(FakeExecutor::ok("unused"));
+        let audit = Arc::new(FakeAudit::default());
+        let svc = service(
+            Some(snapshot(Phase::Plan, TrustTier::Observed)),
+            exec.clone(),
+            audit.clone(),
+        );
+        let out = svc.run(&phase_req()).await.unwrap();
+        assert!(out.ok, "the submission itself succeeds: {out:?}");
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!exec.was_called(), "a denied phase change never executes");
+        assert!(audit
+            .actions()
+            .iter()
+            .any(|a| matches!(a, AuditAction::Denied { .. })));
+    }
+
+    #[tokio::test]
+    async fn auto_phase_on_auto_approves_a_control_plane_prompt() {
+        // With the operator's auto-phasing toggle on, the same Prompt is auto-approved
+        // and the verb runs — without ever reaching the (default-deny) gate.
+        let exec = Arc::new(FakeExecutor::ok("moving to the Auto phase"));
+        let audit = Arc::new(FakeAudit::default());
+        let svc = service(
+            Some(snapshot(Phase::Plan, TrustTier::Observed)),
+            exec.clone(),
+            audit.clone(),
+        )
+        .with_auto_phase(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let out = svc.run(&phase_req()).await.unwrap();
+        assert!(out.ok, "{out:?}");
+        assert!(exec.was_called());
+        // Audited as an approval (auto) + the execution.
+        assert!(audit
+            .actions()
+            .iter()
+            .any(|a| matches!(a, AuditAction::Approved { .. })));
+    }
+
+    #[tokio::test]
+    async fn auto_phase_never_touches_a_non_control_verb() {
+        // A normal verb that Prompts (low tier) is NOT auto-approved by auto-phasing —
+        // it still goes to the gate (here default-deny).
+        let exec = Arc::new(FakeExecutor::ok("ok"));
+        let audit = Arc::new(FakeAudit::default());
+        let svc = service(
+            // OpenReview at Observed tier → Prompt (tier too low).
+            Some(snapshot(Phase::AutoImplement, TrustTier::Observed)),
+            exec.clone(),
+            audit,
+        )
+        .with_auto_phase(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let req = ActorRequest {
+            session: SessionId::new("s1"),
+            verb: McpVerb::OpenReview,
+            payload: String::new(),
+        };
+        let out = svc.run(&req).await.unwrap();
+        assert!(!out.ok, "{out:?}");
+        assert!(!exec.was_called());
     }
 
     #[tokio::test]

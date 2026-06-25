@@ -18,7 +18,7 @@
 
 use gpui::{point, px, rgb, App, BoxShadow, Hsla, Pixels};
 use moonlight_domain::phase::Phase;
-use moonlight_domain::session::SessionStatus;
+use moonlight_domain::session::{AttentionKind, SessionStatus};
 
 fn c(hex: u32) -> Hsla {
     rgb(hex).into()
@@ -216,6 +216,18 @@ pub fn status_color(s: SessionStatus) -> Hsla {
         SessionStatus::Errored => c(0xe5484d),
         SessionStatus::Idle => c(0x6b7280),
         SessionStatus::Paused => c(0x9aa0aa),
+    }
+}
+
+/// Colour for a session **attention** signal (the ⚠ overlay + the space-tab dot): a
+/// "did not finish correctly" alert (Incomplete/Errored) burns the error red, a "needs
+/// you" pause (Stuck/NeedsInput) the waiting amber.
+pub fn attention_color(k: AttentionKind) -> Hsla {
+    match k {
+        AttentionKind::Errored | AttentionKind::Incomplete => status_color(SessionStatus::Errored),
+        AttentionKind::Stuck | AttentionKind::NeedsInput => {
+            status_color(SessionStatus::WaitingInput)
+        }
     }
 }
 

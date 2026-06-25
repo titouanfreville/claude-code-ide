@@ -25,9 +25,10 @@ use super::CloseTab;
 
 actions!(moonlight_session, [SplitRight, SplitLeft, SplitUp, SplitDown]);
 
+use moonlight_domain::agent::AgentKind;
 use moonlight_domain::ids::{SessionId, Timestamp};
 use moonlight_domain::phase::Phase;
-use moonlight_domain::session::{Session, SessionStatus};
+use moonlight_domain::session::{AttentionKind, Session, SessionStatus};
 use moonlight_domain::trust::TrustTier;
 use moonlight_engine::{Command, EngineEvent};
 use tokio::sync::broadcast;
@@ -42,8 +43,20 @@ use crate::views::session_meta::{self, NameSource, SessionColor, SessionMeta, Se
 use crate::views::theme;
 use crate::views::workspace::ShellDeps;
 
+/// The prompt injected into a stalled session when its project opted into auto-resume
+/// (see [`SessionMonitor::maybe_auto_resume`]). Phrased to make CC re-read its own
+/// recent context and finish the in-flight work rather than start something new.
+const AUTO_RESUME_PROMPT: &str =
+    "You appear to have stopped mid-task. Re-read your recent context and continue where \
+     you left off until the work is complete.";
+
 pub struct SessionMonitor {
     id: SessionId,
+    /// Which agent CLI backend drives this session (`claude` / `agy`). Set at
+    /// construction from the managed record (or the new-session request) and used
+    /// by [`try_resume`](Self::try_resume) / [`relaunch_terminal`](Self::relaunch_terminal)
+    /// so a resume relaunches the same backend it was created with.
+    agent: AgentKind,
     /// Live read-model of the focused session; `None` until an upsert arrives
     /// (e.g. after layout rehydrate, where only the id is known).
     session: Option<Session>,
@@ -83,17 +96,37 @@ pub struct SessionMonitor {
     rename_input: Option<Entity<InputState>>,
     /// Whether the color-swatch palette is expanded in the header.
     color_open: bool,
-    /// Whether the info header is condensed: the top row (status, color, name,
-    /// actions) plus the phase + trust controls stay, but the Path field and the
-    /// advance/resume affordances fold away so the embedded CC terminal claims the
-    /// reclaimed height. Operator-toggled from the header chevron. The terminal
-    /// itself is always shown — condensing only trims header chrome.
+    /// Whether the condensed-header Phase selector dropdown is open.
+    phase_open: bool,
+    /// Whether the condensed-header Trust selector dropdown is open.
+    trust_open: bool,
+    /// Whether the info header is condensed: the whole facts card (phase stepper,
+    /// trust selector, Path) plus the advance/resume affordances fold away, and Phase
+    /// + Trust collapse into two compact dropdown buttons in the header top row, so the
+    /// embedded CC terminal claims the reclaimed height. Operator-toggled from the
+    /// header chevron. The terminal itself is always shown — condensing only trims chrome.
     header_collapsed: bool,
     /// Whether a `/compact` injection is currently armed on the embedded terminal
     /// (the auto-compact hysteresis state — see [`Self::check_auto_compact`]).
     compact_armed: bool,
     /// The space's auto-compact policy (`.moonlight/config.json`), loaded at build.
     compact_cfg: auto_compact::AutoCompactConfig,
+    /// The most recent attention alert folded for this session, so the auto-resume
+    /// trigger fires only on the *transition* into `Incomplete` (a stall while handed a
+    /// turn), not on every repeated alert. See [`Self::maybe_auto_resume`].
+    last_alert: Option<AttentionKind>,
+    /// One-shot arm for the auto-resume nudge. Set **only** when this managed session is
+    /// rebuilt as part of an **IDE-restart restore** under an auto-resume project (see
+    /// [`Self::arm_restore_resume`]); cleared once the nudge fires. A live session that
+    /// merely stalls is never armed, so auto-resume no longer fires on natural stalls —
+    /// only on restart. See [`Self::maybe_auto_resume`].
+    resume_armed: bool,
+    /// Whether the persisted project trust tier has been applied to this session yet.
+    /// Set the first time the engine row arrives (or it's confirmed there's nothing to
+    /// apply), so the project's remembered trust is brought to a fresh/restored session
+    /// exactly once, without fighting later operator overrides. See
+    /// [`Self::maybe_apply_project_trust`].
+    applied_project_trust: bool,
     /// Holds the bus subscription alive for the panel's lifetime.
     _subscription: Option<Task<()>>,
     /// Holds the transcript-refresh poll alive (non-managed sessions only).
@@ -109,7 +142,9 @@ impl SessionMonitor {
         rx: broadcast::Receiver<EngineEvent>,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(id, initial, None, None, rx, cx)
+        // Observed/rehydrated sessions are external — `claude` by default (AGY sessions
+        // aren't launched this way). A managed restore overrides via the record's agent.
+        Self::build(id, initial, None, None, AgentKind::ClaudeCode, rx, cx)
     }
 
     /// Build a **new managed** session that embeds a live terminal running `command`
@@ -120,6 +155,7 @@ impl SessionMonitor {
         initial: Option<Session>,
         root: PathBuf,
         command: String,
+        agent: AgentKind,
         phase: Phase,
         rx: broadcast::Receiver<EngineEvent>,
         cx: &mut Context<Self>,
@@ -131,7 +167,7 @@ impl SessionMonitor {
         // terminal *is* the session's content region.
         let terminal =
             cx.new(|cx| TerminalPanel::new_running_in(root.clone(), &command, cx).embedded());
-        Self::build(id, initial, Some(terminal), Some(root), rx, cx)
+        Self::build(id, initial, Some(terminal), Some(root), agent, rx, cx)
     }
 
     /// Build a monitor for an **observed** session rooted at `root`. If the agent
@@ -153,10 +189,11 @@ impl SessionMonitor {
         let terminal = auto.then(|| {
             let phase = initial.as_ref().map(|s| s.phase).unwrap_or_else(Phase::on_done);
             let mcp = crate::views::mcp_host::url_for_session(&id, cx);
-            let command = attach_command(&id, phase, mcp.as_deref());
+            let command = attach_command(&id, AgentKind::ClaudeCode, phase, mcp.as_deref());
             cx.new(|cx| TerminalPanel::new_running_in(root.clone(), &command, cx).embedded())
         });
-        Self::build(id, initial, terminal, Some(root), rx, cx)
+        // Observed sessions are external `claude` — see [`new`].
+        Self::build(id, initial, terminal, Some(root), AgentKind::ClaudeCode, rx, cx)
     }
 
     fn build(
@@ -164,6 +201,7 @@ impl SessionMonitor {
         initial: Option<Session>,
         terminal: Option<Entity<TerminalPanel>>,
         resume_root: Option<PathBuf>,
+        agent: AgentKind,
         rx: broadcast::Receiver<EngineEvent>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -173,7 +211,13 @@ impl SessionMonitor {
                 match rx.recv().await {
                     Ok(event) => {
                         let applied = weak.update(cx, |this, cx| {
+                            // Auto-resume watches alerts (which `apply_event` doesn't
+                            // fold), so check it on every event before the row fold.
+                            this.maybe_auto_resume(&event, cx);
                             if this.apply_event(&event) {
+                                // First engine row is our cue to apply the project's
+                                // remembered trust tier (once) to this session.
+                                this.maybe_apply_project_trust(cx);
                                 // Keep the status bar fresh while this session is the
                                 // frontmost tab (status/phase/title can change live).
                                 if this.active {
@@ -261,6 +305,7 @@ impl SessionMonitor {
 
         Self {
             id,
+            agent,
             session: initial,
             terminal,
             resume_root,
@@ -274,9 +319,16 @@ impl SessionMonitor {
             meta,
             rename_input: None,
             color_open: false,
-            header_collapsed: false,
+            phase_open: false,
+            trust_open: false,
+            // Default to a collapsed header so the session view opens compact;
+            // the operator expands it via the ▾/▴ collapse button when needed.
+            header_collapsed: true,
             compact_armed: false,
             compact_cfg,
+            last_alert: None,
+            resume_armed: false,
+            applied_project_trust: false,
             _subscription: Some(subscription),
             _history: history,
         }
@@ -293,7 +345,7 @@ impl SessionMonitor {
         };
         let phase = self.session.as_ref().map(|s| s.phase).unwrap_or_else(Phase::on_done);
         let mcp = crate::views::mcp_host::url_for_session(&self.id, cx);
-        let command = attach_command(&self.id, phase, mcp.as_deref());
+        let command = attach_command(&self.id, self.agent, phase, mcp.as_deref());
         let terminal = cx.new(|cx| TerminalPanel::new_running_in(root, &command, cx).embedded());
         if let Some(io) = cx.try_global::<ShellDeps>().map(|d| d.session_io.clone()) {
             io.register(self.id.clone(), terminal.downgrade());
@@ -348,6 +400,100 @@ impl SessionMonitor {
             }
             _ => false,
         }
+    }
+
+    /// Bring this session to the project's persisted trust tier, once, when the engine
+    /// row first arrives. Honors the operator's remembered "trust this project" decision
+    /// for both freshly-launched and restored sessions (the engine seeds every session
+    /// at the default-deny `Observed`). Runs at most once — later operator overrides via
+    /// the Trust selector are not undone.
+    fn maybe_apply_project_trust(&mut self, cx: &mut Context<Self>) {
+        if self.applied_project_trust {
+            return;
+        }
+        let Some(current) = self.session.as_ref().map(|s| s.trust_tier) else {
+            return; // no row yet — try again on the next upsert
+        };
+        // We have a row: this is our one shot to align trust (mark done either way).
+        self.applied_project_trust = true;
+        let Some(deps) = cx.try_global::<ShellDeps>().cloned() else {
+            return;
+        };
+        let Some(root) = self.space_root() else {
+            return;
+        };
+        let Some(tier) = deps.focus.read(cx).project_trust(&root) else {
+            return; // project trust not decided yet — the launch prompt will SetTrust
+        };
+        if current != tier {
+            let _ = deps.commands.send(Command::SetTrust {
+                session: self.id.clone(),
+                tier,
+            });
+        }
+    }
+
+    /// Arm the **restart** auto-resume nudge on this session. Called once, from the
+    /// restore path ([`build_center_panel`](crate::views::workspace)), when a managed
+    /// session is rebuilt as the IDE comes back up under an auto-resume project. The
+    /// nudge itself fires from [`maybe_auto_resume`](Self::maybe_auto_resume) the next
+    /// time detection flags the restored session as stalled mid-turn (`Incomplete`).
+    /// No terminal ⇒ nothing to nudge, so leave it disarmed.
+    pub fn arm_restore_resume(&mut self) {
+        if self.terminal.is_some() {
+            self.resume_armed = true;
+        }
+    }
+
+    /// Auto-resume on **IDE restart**: when a managed session was restored at startup
+    /// (and so [armed](Self::arm_restore_resume)) and detection then flags it as stalled
+    /// mid-turn (`Incomplete` — handed a turn, then silent past the working window), nudge
+    /// it to continue by injecting a resume prompt into its embedded terminal. One-shot:
+    /// disarmed once fired. Edge-triggered on the transition *into* `Incomplete` (tracked
+    /// via [`last_alert`](Self::last_alert)).
+    ///
+    /// This deliberately does **not** fire for a live session that merely goes quiet —
+    /// only restored sessions are ever armed, so a natural mid-session stall is left for
+    /// the operator. (A session whose terminal is gone is never armed either; process-level
+    /// resume stays the operator's explicit `↻`/resume affordance.)
+    fn maybe_auto_resume(&mut self, event: &EngineEvent, cx: &mut Context<Self>) {
+        let EngineEvent::SessionAlert { session, alert } = event else {
+            return;
+        };
+        if *session != self.id {
+            return;
+        }
+        let became_incomplete = *alert == Some(AttentionKind::Incomplete)
+            && self.last_alert != Some(AttentionKind::Incomplete);
+        self.last_alert = *alert;
+        // Only a session armed by the restart restore is eligible (gates out live stalls).
+        if !became_incomplete || !self.resume_armed {
+            return;
+        }
+        let Some(deps) = cx.try_global::<ShellDeps>().cloned() else {
+            return;
+        };
+        let Some(root) = self.space_root() else {
+            return;
+        };
+        if !deps.focus.read(cx).project_auto_resume(&root) {
+            return;
+        }
+        // The CC process drives its own embedded terminal; nudge it there. No terminal
+        // ⇒ nothing to resume in place (leave it to the operator's explicit resume).
+        let Some(term) = deps.session_io.terminal(&self.id) else {
+            return;
+        };
+        // One-shot: a restored session is nudged at most once, even if it stalls again.
+        self.resume_armed = false;
+        tracing::info!(
+            session = %self.id.as_str(),
+            "auto-resume: restored session stalled mid-turn — injecting continue prompt"
+        );
+        cx.spawn(async move |_, cx| {
+            let _ = term.update(cx, |t, _| t.send_text(&format!("{AUTO_RESUME_PROMPT}\r")));
+        })
+        .detach();
     }
 
     /// Push this session's name / status / phase to the shared
@@ -532,20 +678,32 @@ fn resumable(status: SessionStatus) -> bool {
 /// `mcp_url` (the session's embedded MCP endpoint, see [`crate::views::mcp_host`])
 /// appends the `--mcp-config` flag so the agent gets the `moonlight` actor verbs;
 /// `None` (host down / static views) launches without MCP.
-pub fn attach_command(id: &SessionId, phase: Phase, mcp_url: Option<&str>) -> String {
-    let mut command = if crate::transcript::transcript_path(id.as_str()).is_some() {
-        format!("claude --resume {}", id.as_str())
+pub fn attach_command(
+    id: &SessionId,
+    agent: AgentKind,
+    phase: Phase,
+    mcp_url: Option<&str>,
+) -> String {
+    use crate::agent_backend::{backend_for, LaunchSpec, SessionSelector};
+    // Resume the existing conversation when a transcript exists; otherwise start fresh
+    // pinned to the same id (see the ghost-session note above). Backend-agnostic: the
+    // command shape is the backend's job (ClaudeCode is byte-identical to before).
+    let (selector, permission_mode) = if crate::transcript::transcript_path(id.as_str()).is_some()
+    {
+        (SessionSelector::Resume(id), None)
     } else {
-        format!(
-            "claude --session-id {} --permission-mode {}",
-            id.as_str(),
-            phase.cc_permission_mode()
-        )
+        (SessionSelector::Fresh(id), Some(phase.cc_permission_mode()))
     };
-    if let Some(url) = mcp_url {
-        command.push_str(&crate::views::mcp_host::session_launch_flags(url));
-    }
-    crate::obs::with_statusline(command)
+    let backend = backend_for(agent);
+    // Backend-specific pre-launch side effects (AGY writes its mcp_config; Claude no-op).
+    backend.prepare_launch(mcp_url);
+    let command = backend.launch_command(&LaunchSpec {
+        selector,
+        permission_mode,
+        mcp_url,
+    });
+    // Statusline `--settings` is Claude-only; AGY would reject it (see wrap_statusline).
+    crate::agent_backend::wrap_statusline(agent, command)
 }
 
 /// A placeholder session record so the header/facts render before discovery, in
@@ -597,10 +755,19 @@ impl Panel for SessionMonitor {
     }
 
     fn title(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        super::tab_title(
+        // A leading blinking amber caret when this session is awaiting the operator, so a
+        // *background* session needing input is spottable across the dock tab bar. Uses
+        // the per-tab `title` (rendered for every tab) — not `title_suffix`, which the
+        // library renders only for the active tab, off at the far right of the bar.
+        let needs_input = self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.status == SessionStatus::WaitingInput);
+        let seed = cx.entity_id().as_u64();
+        let title = super::tab_title(
             self.title_text(),
             self.meta.palette_color().map(|c| c.hsla()),
-            cx.entity_id().as_u64(),
+            seed,
             self.tab_panel.clone(),
             Arc::new(cx.entity()),
             self.focus_handle.clone(),
@@ -610,7 +777,30 @@ impl Panel for SessionMonitor {
                     .menu("Split Right", Box::new(SplitRight))
                     .menu("Split Down", Box::new(SplitDown))
             },
-        )
+        );
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .when(needs_input, |d| {
+                d.child(super::needs_input_caret(("dock-tab-caret", seed)))
+            })
+            // Backend badge on the tab — only non-Claude (Claude is the implicit default),
+            // so the operator can tell which runner a session tab uses at a glance.
+            .when(self.agent == AgentKind::Antigravity, |d| {
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(4.))
+                        .rounded(theme::radius_sm())
+                        .bg(theme::tint(theme::accent(), 0.18))
+                        .text_color(theme::accent())
+                        .text_size(theme::text_xs())
+                        .child("AGY"),
+                )
+            })
+            .child(title)
     }
 
     /// Capture the tab panel so the tab bar's "×" can close this session.
@@ -678,6 +868,10 @@ impl Render for SessionMonitor {
                 // compacted/reset — both drive CC in its embedded terminal.
                 let compact = self.terminal.is_some().then(|| self.compact_button(cx));
                 let reset = self.terminal.is_some().then(|| self.reset_button(cx));
+                // Per-project auto-resume opt-in toggle — only meaningful for a managed
+                // session whose project we can remember the flag against.
+                let auto_resume = (self.terminal.is_some() && self.space_root().is_some())
+                    .then(|| self.auto_resume_button(cx));
                 // Rename/color persist into the space's `.moonlight/`; only offered
                 // when we can resolve that root.
                 let can_edit = self.space_root().is_some();
@@ -734,6 +928,12 @@ impl Render for SessionMonitor {
                     }
                 };
 
+                // Condensed: Phase + Trust fold into compact dropdown buttons in the
+                // header (before the action buttons), since their full rows are hidden.
+                let condensed = self.header_collapsed;
+                let phase_pill = condensed.then(|| self.phase_pill(s.phase, cx));
+                let trust_pill = condensed.then(|| self.trust_pill(s.trust_tier, cx));
+
                 let top = div()
                     .flex()
                     .flex_row()
@@ -747,6 +947,9 @@ impl Render for SessionMonitor {
                     )
                     .children(can_edit.then(|| self.color_dot(cx)))
                     .child(name_row)
+                    .children(phase_pill)
+                    .children(trust_pill)
+                    .children(auto_resume)
                     .children(compact)
                     .children(reset)
                     // Condense the header to hand more height to the CC terminal.
@@ -764,6 +967,8 @@ impl Render for SessionMonitor {
                 }
                 head.child(top)
                     .children(self.color_open.then(|| self.color_palette(cx)))
+                    .children((condensed && self.phase_open).then(|| self.phase_menu(s.phase, cx)))
+                    .children((condensed && self.trust_open).then(|| self.trust_menu(s.trust_tier, cx)))
             }
             None => div()
                 .text_color(theme::text_muted())
@@ -771,32 +976,34 @@ impl Render for SessionMonitor {
                 .child(format!("waiting for session {}…", self.id.as_str())),
         };
 
-        // The session's facts as a quiet, labelled card. Phase + trust always stay;
-        // the Path field folds away when the header is condensed, so the terminal
-        // gets that height back.
+        // The session's facts as a quiet, labelled card (phase stepper, trust
+        // selector, Path). The whole card folds away when the header is condensed —
+        // Phase + Trust then live as compact dropdowns in the header top row — so the
+        // terminal gets that height back.
         let condensed = self.header_collapsed;
-        let fields = self.session.as_ref().map(|s| {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(7.))
-                .rounded(theme::radius_md())
-                .border_1()
-                .border_color(theme::border_subtle())
-                .bg(theme::surface_raised())
-                .px_3()
-                .py(px(11.))
-                .child(self.phase_stepper(s.phase, cx))
-                .child(self.trust_selector(s.trust_tier, cx))
-                .children((!condensed).then(|| {
-                    field(
+        let fields = (!condensed)
+            .then(|| self.session.as_ref())
+            .flatten()
+            .map(|s| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(7.))
+                    .rounded(theme::radius_md())
+                    .border_1()
+                    .border_color(theme::border_subtle())
+                    .bg(theme::surface_raised())
+                    .px_3()
+                    .py(px(11.))
+                    .child(self.phase_stepper(s.phase, cx))
+                    .child(self.trust_selector(s.trust_tier, cx))
+                    .child(field(
                         "Path",
                         s.attached_path.as_deref().unwrap_or("—"),
                         theme::text_secondary(),
                         true,
-                    )
-                }))
-        });
+                    ))
+            });
 
         div()
             .track_focus(&self.focus_handle)
@@ -861,9 +1068,9 @@ impl SessionMonitor {
             .into_any_element()
     }
 
-    /// The header chevron that condenses/expands the info header: condensed keeps the
-    /// top row plus phase + trust and folds away the Path field and advance/resume
-    /// chrome, handing that height to the always-visible CC terminal.
+    /// The header chevron that condenses/expands the info header: condensed folds away
+    /// the whole facts card and the advance/resume chrome (Phase + Trust survive as
+    /// compact header dropdowns), handing that height to the always-visible CC terminal.
     fn collapse_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let glyph = if self.header_collapsed { "▾" } else { "▴" };
         self.icon_button(
@@ -871,10 +1078,202 @@ impl SessionMonitor {
             glyph,
             |this, _w, cx| {
                 this.header_collapsed = !this.header_collapsed;
+                // Expanding removes the pills, so any open dropdown would dangle.
+                this.phase_open = false;
+                this.trust_open = false;
                 cx.notify();
             },
             cx,
         )
+    }
+
+    /// Compact header button surfacing the current **Phase** (condensed header only).
+    /// Click opens the [`Self::phase_menu`] dropdown. Clickable only for a steerable
+    /// managed session (one we own a PTY for); otherwise it reads as a static chip.
+    fn phase_pill(&self, phase: Phase, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let color = theme::phase_color(phase);
+        let caret = if self.phase_open { "▴" } else { "▾" };
+        let mut pill = div()
+            .id("phase-pill")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .px_2()
+            .py(px(2.))
+            .rounded(theme::radius_sm())
+            .bg(theme::tint(color, 0.16))
+            .text_color(color)
+            .text_size(theme::text_sm())
+            .font_weight(FontWeight::MEDIUM)
+            .child(format!("Phase: {}", phase.label()))
+            .child(div().text_size(theme::text_xs()).child(caret));
+        if self.terminal.is_some() {
+            pill = pill
+                .cursor_pointer()
+                .hover(|d| d.bg(theme::tint(color, 0.26)))
+                .on_click(cx.listener(|this, _e, _w, cx| this.toggle_phase_menu(cx)));
+        }
+        pill.into_any_element()
+    }
+
+    /// Compact header button surfacing the current **Trust** tier (condensed header
+    /// only). Click opens the [`Self::trust_menu`] dropdown. Always operator-settable
+    /// (trust feeds our PDP, not CC), so it stays clickable regardless of terminal.
+    fn trust_pill(&self, tier: TrustTier, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let caret = if self.trust_open { "▴" } else { "▾" };
+        div()
+            .id("trust-pill")
+            .cursor_pointer()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .px_2()
+            .py(px(2.))
+            .rounded(theme::radius_sm())
+            .bg(theme::surface_base())
+            .text_color(theme::text_secondary())
+            .text_size(theme::text_sm())
+            .hover(|d| d.bg(theme::surface_overlay()))
+            .child(format!("Trust: {}", trust_label(tier)))
+            .child(
+                div()
+                    .text_size(theme::text_xs())
+                    .text_color(theme::text_muted())
+                    .child(caret),
+            )
+            .on_click(cx.listener(|this, _e, _w, cx| this.toggle_trust_menu(cx)))
+            .into_any_element()
+    }
+
+    /// The Phase dropdown: every workflow phase as a selectable row (label + its
+    /// operator-mode hint), the current one highlighted. Picking one routes through
+    /// [`Self::request_phase`] and closes the menu.
+    fn phase_menu(&self, current: Phase, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut menu = div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .p(px(4.))
+            .rounded(theme::radius_sm())
+            .border_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::surface_raised());
+        for p in Phase::ALL {
+            let active = p == current;
+            let color = theme::phase_color(p);
+            let mut item = div()
+                .id(p.label())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py(px(3.))
+                .rounded(theme::radius_sm())
+                .text_size(theme::text_sm())
+                .child(
+                    div()
+                        .w(px(64.))
+                        .text_color(if active { color } else { theme::text_secondary() })
+                        .child(p.label()),
+                )
+                .child(
+                    div()
+                        .text_size(theme::text_xs())
+                        .text_color(theme::text_muted())
+                        .child(p.mode_label()),
+                );
+            if active {
+                item = item.bg(theme::tint(color, 0.16)).font_weight(FontWeight::SEMIBOLD);
+            } else {
+                item = item.cursor_pointer().hover(|d| d.bg(theme::surface_overlay())).on_click(
+                    cx.listener(move |this, _e, window, cx| {
+                        this.phase_open = false;
+                        this.request_phase(p, window, cx);
+                    }),
+                );
+            }
+            menu = menu.child(item);
+        }
+        menu.into_any_element()
+    }
+
+    /// The Trust dropdown: each tier as a selectable row (label + one-line meaning),
+    /// the current one highlighted. Picking one routes through [`Self::request_trust`]
+    /// and closes the menu.
+    fn trust_menu(&self, current: TrustTier, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let opts = [
+            (TrustTier::Observed, "Everything prompts"),
+            (TrustTier::ReadOnly, "Read-only verbs autonomous"),
+            (TrustTier::Standard, "Read + low-risk writes autonomous"),
+            (TrustTier::Trusted, "Broad autonomy (danger still prompts)"),
+        ];
+        let mut menu = div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .p(px(4.))
+            .rounded(theme::radius_sm())
+            .border_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::surface_raised());
+        for (t, desc) in opts {
+            let active = t == current;
+            let mut item = div()
+                .id(trust_label(t))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py(px(3.))
+                .rounded(theme::radius_sm())
+                .text_size(theme::text_sm())
+                .child(
+                    div()
+                        .w(px(64.))
+                        .text_color(if active { theme::accent() } else { theme::text_secondary() })
+                        .child(trust_label(t)),
+                )
+                .child(
+                    div()
+                        .text_size(theme::text_xs())
+                        .text_color(theme::text_muted())
+                        .child(desc),
+                );
+            if active {
+                item = item.bg(theme::tint(theme::accent(), 0.16)).font_weight(FontWeight::SEMIBOLD);
+            } else {
+                item = item.cursor_pointer().hover(|d| d.bg(theme::surface_overlay())).on_click(
+                    cx.listener(move |this, _e, _w, cx| {
+                        this.trust_open = false;
+                        this.request_trust(t, cx);
+                    }),
+                );
+            }
+            menu = menu.child(item);
+        }
+        menu.into_any_element()
+    }
+
+    /// Toggle the condensed-header Phase dropdown (mutually exclusive with the Trust
+    /// and color popovers, so only one floats below the header at a time).
+    fn toggle_phase_menu(&mut self, cx: &mut Context<Self>) {
+        self.phase_open = !self.phase_open;
+        self.trust_open = false;
+        self.color_open = false;
+        cx.notify();
+    }
+
+    /// Toggle the condensed-header Trust dropdown (mutually exclusive with the Phase
+    /// and color popovers).
+    fn toggle_trust_menu(&mut self, cx: &mut Context<Self>) {
+        self.trust_open = !self.trust_open;
+        self.phase_open = false;
+        self.color_open = false;
+        cx.notify();
     }
 
     /// A small text pill (Save / Cancel) for the rename row.
@@ -980,6 +1379,48 @@ impl SessionMonitor {
         .into_any_element()
     }
 
+    /// A small toggle pill for the project's **auto-resume** opt-in (managed sessions
+    /// only). When on, a stall under this project re-prompts the session to continue
+    /// (see [`Self::maybe_auto_resume`]). State is the project's, so it reads/writes the
+    /// space flag — flipping it affects every session under the same root.
+    fn auto_resume_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let on = match (self.space_root(), cx.try_global::<ShellDeps>().cloned()) {
+            (Some(root), Some(deps)) => deps.focus.read(cx).project_auto_resume(&root),
+            _ => false,
+        };
+        let (bg, fg) = if on {
+            (theme::tint(theme::accent(), 0.18), theme::accent())
+        } else {
+            (theme::tint(theme::text_muted(), 0.12), theme::text_secondary())
+        };
+        div()
+            .id("session-auto-resume")
+            .cursor_pointer()
+            .px_2()
+            .py(px(3.))
+            .rounded(px(6.))
+            .bg(bg)
+            .text_color(fg)
+            .text_size(px(11.))
+            .child(if on { "⟳ auto-resume: on" } else { "⟳ auto-resume: off" })
+            .on_click(cx.listener(|this, _ev, _w, cx| this.toggle_auto_resume(cx)))
+            .into_any_element()
+    }
+
+    /// Flip the project's auto-resume opt-in (persists to the project space).
+    fn toggle_auto_resume(&mut self, cx: &mut Context<Self>) {
+        let Some(deps) = cx.try_global::<ShellDeps>().cloned() else {
+            return;
+        };
+        let Some(root) = self.space_root() else {
+            return;
+        };
+        let now = deps.focus.read(cx).project_auto_resume(&root);
+        deps.focus
+            .update(cx, |ps, _cx| ps.set_project_auto_resume(&root, !now));
+        cx.notify();
+    }
+
     /// A small "↻ Reset" pill in the card header (managed sessions only).
     fn reset_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
@@ -1031,12 +1472,38 @@ impl SessionMonitor {
         let _ = deps.commands.send(Command::ForgetSession {
             session: self.id.clone(),
         });
-        // Launch the successor (records store/roster, opens its tab + terminal)…
+        // Launch the successor (records store/roster, opens its tab + terminal). The
+        // emit is queued and flushed at the end of *this* effect cycle, so the new tab
+        // is added before the spawned close below runs on the next tick.
         deps.center.update(cx, |_c, cx| {
-            cx.emit(OpenRequest::NewManagedSession { id: new_id, phase });
+            // The successor keeps the same agent backend as the session being reset.
+            cx.emit(OpenRequest::NewManagedSession {
+                id: new_id,
+                phase,
+                agent: self.agent,
+            });
         });
-        // …and retire this tab, which shows the dead id.
-        super::close_this_tab(&self.tab_panel, cx.entity(), window, cx);
+        // …then retire this tab (it shows the dead id). Deferred to the next tick rather
+        // than closed synchronously here: closing it inline would leave the tab panel
+        // momentarily empty (the successor opens via the deferred emit above), and an
+        // empty dock tears the window down — the "Reset closes the window" crash. By the
+        // time this spawn resumes, the successor tab exists, so the panel is never empty.
+        //
+        // The close runs inside `cx.update` (window + App), **not** inside a
+        // `SessionMonitor` lease: `remove_panel` fires `PanelView::on_removed` on this
+        // very panel (which *is* the `SessionMonitor` entity), so re-entering through
+        // `this.update_in` here double-leases the entity and aborts the process
+        // ("cannot update SessionMonitor while it is already being updated"). Capturing
+        // the tab-panel handle + our own entity up-front lets the removal lease the
+        // entity itself. Mirrors `PlanReviewPanel::close_and_return_to_session`.
+        let tab_panel = self.tab_panel.clone();
+        let me = cx.entity();
+        cx.spawn_in(window, async move |_, cx| {
+            let _ = cx.update(|window, cx| {
+                super::close_this_tab(&tab_panel, me, window, cx);
+            });
+        })
+        .detach();
     }
 
     /// A small "⊜ Compact" pill beside ↻ Reset (managed sessions only) — runs CC's
@@ -1374,11 +1841,18 @@ impl SessionMonitor {
         if let Some(s) = self.session.as_mut() {
             s.trust_tier = tier;
         }
-        if let Some(tx) = cx.try_global::<ShellDeps>().map(|d| d.commands.clone()) {
-            let _ = tx.send(Command::SetTrust {
+        if let Some(deps) = cx.try_global::<ShellDeps>().cloned() {
+            let _ = deps.commands.send(Command::SetTrust {
                 session: self.id.clone(),
                 tier,
             });
+            // Persist the operator's choice as this project's remembered trust, so new
+            // sessions and restarts come up at this tier (and we don't re-prompt). The
+            // alignment is already done for this session, so block the one-shot re-apply.
+            self.applied_project_trust = true;
+            if let Some(root) = self.space_root() {
+                deps.focus.update(cx, |ps, _cx| ps.set_project_trust(&root, tier));
+            }
         }
         cx.notify();
     }
@@ -1394,13 +1868,16 @@ impl SessionMonitor {
             return;
         };
         let mcp = crate::views::mcp_host::url_for_session(&self.id, cx);
-        let command = crate::obs::with_statusline(format!(
-            "claude --resume {} --permission-mode {}{}",
-            self.id.as_str(),
-            native_mode,
-            mcp.map(|url| crate::views::mcp_host::session_launch_flags(&url))
-                .unwrap_or_default()
-        ));
+        let backend = crate::agent_backend::backend_for(self.agent);
+        backend.prepare_launch(mcp.as_deref());
+        let command = crate::agent_backend::wrap_statusline(
+            self.agent,
+            backend.launch_command(&crate::agent_backend::LaunchSpec {
+                selector: crate::agent_backend::SessionSelector::Resume(&self.id),
+                permission_mode: Some(native_mode),
+                mcp_url: mcp.as_deref(),
+            }),
+        );
         let terminal =
             cx.new(|cx| TerminalPanel::new_running_in(root, &command, cx).embedded());
         if let Some(io) = cx.try_global::<ShellDeps>().map(|d| d.session_io.clone()) {
@@ -1626,6 +2103,17 @@ fn field(label: &str, value: &str, value_color: Hsla, mono: bool) -> impl IntoEl
         } else {
             value_el
         })
+}
+
+/// The short operator-facing label for a trust tier (mirrors the segmented
+/// `trust_selector` text, reused by the condensed-header pill + dropdown).
+fn trust_label(tier: TrustTier) -> &'static str {
+    match tier {
+        TrustTier::Observed => "Observe",
+        TrustTier::ReadOnly => "Read",
+        TrustTier::Standard => "Std",
+        TrustTier::Trusted => "Trusted",
+    }
 }
 
 /// A labelled row carrying an arbitrary value element (the Mode selector), laid

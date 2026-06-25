@@ -50,16 +50,42 @@ impl PolicyDecisionPoint for DefaultPdp {
                 WriteScope::Project => req.phase.allows_writes(),
             };
             if !permitted {
-                let what = match scope {
-                    WriteScope::AiWorkspace => "is fully frozen (commit gate)",
-                    WriteScope::Project => "freezes project files",
+                // An external MCP tool the freeze would block is offered to the operator
+                // for ad-hoc authorization (once / always) rather than hard-denied — a
+                // read/query against an external service is the kind of thing an operator
+                // may well want to permit while exploring. Project file edits and Bash
+                // leave the flag false and fall through to the hard deny below.
+                if scope == WriteScope::Project && req.prompt_on_project_freeze {
+                    return Ok(PermissionOutcome::Prompt {
+                        reason: format!(
+                            "phase {} freezes project state; authorize external tool? {}",
+                            req.phase.label(),
+                            req.description
+                        ),
+                    });
+                }
+                // Name the phase *and* the remedy: the denial is the moment the agent
+                // most needs to know how to get unblocked (request a phase change), so
+                // it doesn't just retry the same write.
+                let (what, remedy) = match scope {
+                    WriteScope::AiWorkspace => (
+                        "is fully frozen (commit gate)",
+                        "the commit gate freezes every write — ask the operator, or call \
+                         request_phase to move off Commit",
+                    ),
+                    WriteScope::Project => (
+                        "freezes project files",
+                        "call request_phase('auto') to ask the operator for write access \
+                         (or phase_status to confirm where you are)",
+                    ),
                 };
                 return Ok(PermissionOutcome::Deny {
                     reason: format!(
-                        "phase {} {}; cannot perform: {}",
+                        "phase {} {}; cannot perform: {} — {}",
                         req.phase.label(),
                         what,
-                        req.description
+                        req.description,
+                        remedy
                     ),
                 });
             }
@@ -108,7 +134,22 @@ mod tests {
             verb,
             danger,
             write_scope,
+            prompt_on_project_freeze: false,
             description: "test action".into(),
+        }
+    }
+
+    /// A project-scoped write request flagged to prompt-on-freeze (an external MCP tool).
+    fn mcp_prompt_req(phase: Phase) -> PermissionRequest {
+        PermissionRequest {
+            prompt_on_project_freeze: true,
+            ..req_scoped(
+                phase,
+                TrustTier::Trusted,
+                None,
+                DangerClass::Risky,
+                Some(WriteScope::Project),
+            )
         }
     }
 
@@ -213,6 +254,45 @@ mod tests {
                 None,
                 DangerClass::Risky,
                 Some(WriteScope::AiWorkspace),
+            ))
+            .unwrap();
+        assert!(matches!(out, PermissionOutcome::Deny { .. }));
+    }
+
+    #[test]
+    fn external_mcp_prompts_instead_of_denying_in_frozen_phases() {
+        let pdp = DefaultPdp;
+        // An external MCP tool the freeze would block is offered to the operator
+        // (once / always) rather than hard-denied — in every frozen phase.
+        for phase in [Phase::Discovery, Phase::Plan, Phase::Commit] {
+            let out = pdp.decide(&mcp_prompt_req(phase)).unwrap();
+            assert!(
+                matches!(out, PermissionOutcome::Prompt { .. }),
+                "{phase:?} should prompt for an external MCP tool, got {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_on_freeze_flag_does_not_relax_write_phases() {
+        let pdp = DefaultPdp;
+        // In a write phase the flag is moot — the write is permitted outright, no prompt.
+        let out = pdp.decide(&mcp_prompt_req(Phase::AutoImplement)).unwrap();
+        assert_eq!(out, PermissionOutcome::Allow);
+    }
+
+    #[test]
+    fn prompt_on_freeze_flag_does_not_affect_unflagged_writes() {
+        let pdp = DefaultPdp;
+        // A project write WITHOUT the flag (Edit/Write/Bash) still hard-denies in a
+        // frozen phase — the freeze on the product is absolute.
+        let out = pdp
+            .decide(&req_scoped(
+                Phase::Discovery,
+                TrustTier::Trusted,
+                None,
+                DangerClass::Risky,
+                Some(WriteScope::Project),
             ))
             .unwrap();
         assert!(matches!(out, PermissionOutcome::Deny { .. }));

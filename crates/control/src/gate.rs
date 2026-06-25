@@ -51,6 +51,19 @@ pub enum HoldKind {
     Plan { plan: Option<String> },
     /// A danger-zone / prompt-required action: `reason` describes what wants doing.
     Danger { reason: String },
+    /// An external MCP tool a frozen phase would block, offered to the operator for
+    /// ad-hoc authorization (once / always). `tool_name` is the full `mcp__server__tool`
+    /// name so the cockpit can offer "always allow this tool" vs "always allow this
+    /// server" (`mcp__server__*`); `reason` explains the freeze.
+    McpAuthorize { tool_name: String, reason: String },
+}
+
+/// Whether `tool_name` is an **external** MCP tool — one served by a connected MCP
+/// server other than MoonlightCode's own actor (`mcp__moonlight__*`). These are the
+/// tools a frozen phase offers to the operator for ad-hoc authorization rather than
+/// hard-denying (MoonlightCode's own verbs are gated by the embedded MCP server's PDP).
+pub fn is_external_mcp_tool(tool_name: &str) -> bool {
+    tool_name.starts_with("mcp__") && !tool_name.starts_with("mcp__moonlight__")
 }
 
 /// The gate's verdict for a tool call: act immediately, or hold for the operator.
@@ -105,6 +118,7 @@ pub fn evaluate(
     } else {
         classify(tool_name, tool_input)
     };
+    let external_mcp = is_external_mcp_tool(tool_name);
     let req = PermissionRequest {
         session: session.clone(),
         phase: gate.phase,
@@ -112,6 +126,9 @@ pub fn evaluate(
         verb: None,
         danger,
         write_scope,
+        // External MCP tools get an operator prompt instead of a hard deny when a
+        // frozen phase would block them (so they can be authorized once / always).
+        prompt_on_project_freeze: external_mcp,
         description: format!("tool `{tool_name}`"),
     };
 
@@ -121,6 +138,13 @@ pub fn evaluate(
         Ok(Deny { reason }) => GateDecision::Deny {
             reason: format!("MoonlightCode: {reason}"),
         },
+        // An external MCP tool held by a frozen phase becomes an authorize prompt
+        // (carrying the tool name so the cockpit can offer per-tool / per-server
+        // "always"); any other prompt (danger zone, low tier) is a plain danger hold.
+        Ok(Prompt { reason }) if external_mcp => GateDecision::Hold(HoldKind::McpAuthorize {
+            tool_name: tool_name.to_string(),
+            reason,
+        }),
         Ok(Prompt { reason }) => GateDecision::Hold(HoldKind::Danger { reason }),
         Err(_) => GateDecision::Allow, // fail-open
     }
@@ -151,7 +175,8 @@ pub fn decide(
         GateDecision::Hold(HoldKind::Plan { .. }) => HookResponse::Deny {
             reason: "MoonlightCode: plan awaiting approval".to_string(),
         },
-        GateDecision::Hold(HoldKind::Danger { reason }) => HookResponse::Deny {
+        GateDecision::Hold(HoldKind::Danger { reason })
+        | GateDecision::Hold(HoldKind::McpAuthorize { reason, .. }) => HookResponse::Deny {
             reason: format!("MoonlightCode: {reason} (awaiting approval)"),
         },
     }
@@ -177,11 +202,18 @@ mod tests {
             if is_write {
                 // Mirror DefaultPdp: AI-workspace writes survive a frozen phase;
                 // project (or unknown-scope) writes do not.
-                let permitted = match req.write_scope.unwrap_or(WriteScope::Project) {
+                let scope = req.write_scope.unwrap_or(WriteScope::Project);
+                let permitted = match scope {
                     WriteScope::AiWorkspace => req.phase.allows_ai_workspace_writes(),
                     WriteScope::Project => req.phase.allows_writes(),
                 };
                 if !permitted {
+                    // Mirror DefaultPdp: an external MCP tool prompts instead of denying.
+                    if scope == WriteScope::Project && req.prompt_on_project_freeze {
+                        return Ok(PermissionOutcome::Prompt {
+                            reason: "authorize external tool".into(),
+                        });
+                    }
                     return Ok(PermissionOutcome::Deny {
                         reason: "frozen phase".into(),
                     });
@@ -361,6 +393,105 @@ mod tests {
                 reason: "danger zone".to_string()
             })
         );
+    }
+
+    #[test]
+    fn external_mcp_tool_detection() {
+        assert!(is_external_mcp_tool("mcp__phoenix__run_select_query"));
+        assert!(is_external_mcp_tool("mcp__rustrover__execute_sql_query"));
+        // MoonlightCode's own verbs are not "external".
+        assert!(!is_external_mcp_tool("mcp__moonlight__request_phase"));
+        assert!(!is_external_mcp_tool("mcp__moonlight__run_start"));
+        // Non-MCP tools are not MCP at all.
+        assert!(!is_external_mcp_tool("Bash"));
+        assert!(!is_external_mcp_tool("Edit"));
+    }
+
+    #[test]
+    fn external_mcp_prompt_becomes_an_authorize_hold_carrying_the_tool_name() {
+        let out = evaluate(
+            Some(&adopted_auto()),
+            &sid(),
+            "mcp__phoenix__run_select_query",
+            &json!({}),
+            None,
+            false,
+            &PromptPdp,
+        );
+        assert_eq!(
+            out,
+            GateDecision::Hold(HoldKind::McpAuthorize {
+                tool_name: "mcp__phoenix__run_select_query".to_string(),
+                reason: "danger zone".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn moonlight_verb_prompt_stays_a_plain_danger_hold() {
+        // A prompt for MoonlightCode's own verb is not the external-authorize path.
+        let out = evaluate(
+            Some(&adopted_auto()),
+            &sid(),
+            "mcp__moonlight__run_start",
+            &json!({}),
+            None,
+            false,
+            &PromptPdp,
+        );
+        assert_eq!(
+            out,
+            GateDecision::Hold(HoldKind::Danger {
+                reason: "danger zone".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn external_mcp_in_frozen_phase_holds_for_authorization_not_deny() {
+        // End-to-end through evaluate(): a non-read-verb phoenix tool (classify → Risky)
+        // in a frozen Discovery phase becomes an authorize hold, not a hard deny.
+        let discovery = GateState {
+            adopted: true,
+            phase: Phase::Discovery,
+            trust: TrustTier::Standard,
+            ..Default::default()
+        };
+        let out = evaluate(
+            Some(&discovery),
+            &sid(),
+            "mcp__phoenix__run_select_query",
+            &json!({}),
+            None,
+            false,
+            &TestPdp,
+        );
+        assert!(
+            matches!(out, GateDecision::Hold(HoldKind::McpAuthorize { .. })),
+            "got {out:?}"
+        );
+        // A read-verb phoenix tool is Safe and just passes (no hold).
+        let read = evaluate(
+            Some(&discovery),
+            &sid(),
+            "mcp__phoenix__get_budget",
+            &json!({}),
+            None,
+            false,
+            &TestPdp,
+        );
+        assert_eq!(read, GateDecision::Allow);
+        // A project Edit in the same frozen phase still hard-denies (freeze is absolute).
+        let edit = evaluate(
+            Some(&discovery),
+            &sid(),
+            "Edit",
+            &json!({ "file_path": "/repo/src/main.rs" }),
+            Some(WriteScope::Project),
+            false,
+            &TestPdp,
+        );
+        assert!(matches!(edit, GateDecision::Deny { .. }), "got {edit:?}");
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 
+use crate::agent::AgentKind;
 use crate::audit::AuditEntry;
 use crate::continuity::{BaselineMetric, SessionSummary};
 use crate::errors::StoreError;
@@ -54,6 +55,10 @@ pub struct ManagedSession {
     pub title: Option<String>,
     pub mode: Mode,
     pub phase: Phase,
+    /// Which agent CLI drives this session (`claude` / `agy`). Persisted so a restart
+    /// relaunches the same backend. Defaults to [`AgentKind::ClaudeCode`] for records
+    /// written before backend selection existed (the migration backfills them).
+    pub agent: AgentKind,
     pub adopted: bool,
     pub paused: bool,
     /// Whether the operator pinned the phase (manual override of auto-advance).

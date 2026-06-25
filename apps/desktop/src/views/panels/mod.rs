@@ -28,6 +28,8 @@ pub mod db_observer;
 pub mod db_source;
 pub mod file_tree;
 pub mod git_panel;
+pub mod http_panel;
+pub mod mcp_authorize;
 pub mod outline;
 pub mod plan_review;
 pub mod problems;
@@ -42,17 +44,43 @@ pub mod toolbar;
 
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, anchored, deferred, div, px, AnyElement, App, Context, DismissEvent, Entity,
-    FocusHandle, Hsla, MouseButton, MouseDownEvent, Pixels, Point, SharedString, Subscription,
-    WeakEntity, Window,
+    actions, anchored, deferred, div, px, pulsating_between, AnyElement, Animation, AnimationExt,
+    App, Context, DismissEvent, Entity, FocusHandle, Hsla, MouseButton, MouseDownEvent, Pixels,
+    Point, SharedString, Subscription, WeakEntity, Window,
 };
 use gpui_component::dock::{Panel, PanelView, TabPanel};
 use gpui_component::menu::PopupMenu;
+use moonlight_domain::session::AttentionKind;
 
 use crate::views::theme;
+
+/// A softly blinking amber **input caret** (`▮`) — the "this session is waiting for *you*
+/// to type" beacon, mirroring a terminal cursor. Shared by the space-tab bar and the dock
+/// session tabs so the two surfaces signal `NeedsInput` identically. Motion is reserved
+/// for `NeedsInput`: a blink always means "needs you now", which is why the steady error /
+/// stuck dot stays motionless. `id` must be unique per call site (it keys the animation
+/// state) — callers seed it with the tab index or the panel's entity id.
+pub fn needs_input_caret(id: impl Into<gpui::ElementId>) -> impl IntoElement {
+    let amber = theme::attention_color(AttentionKind::NeedsInput);
+    div()
+        .flex_none()
+        .text_color(amber)
+        .text_size(px(12.))
+        .child("▮")
+        .with_animation(
+            id,
+            // ~1.1s breath; eased 0.25↔1.0 opacity reads as a calm cursor blink rather
+            // than a hard on/off — alive and waiting, not alarming.
+            Animation::new(Duration::from_millis(1100))
+                .repeat()
+                .with_easing(pulsating_between(0.25, 1.0)),
+            |el, delta| el.opacity(delta),
+        )
+}
 
 actions!(moonlight_tab, [CloseTab]);
 

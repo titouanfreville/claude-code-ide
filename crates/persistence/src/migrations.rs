@@ -40,6 +40,10 @@ const MIGRATIONS: &[&str] = &[
     // 5 — operator soft-hide: mask a "not relevant anymore" session from the
     // default fleet view (recoverable via "show hidden"; transcript untouched).
     "ALTER TABLE managed_session ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;",
+    // 6 — which agent CLI backend drives the session (`claude` / `agy`). Stored as
+    // serde-JSON like the other enum columns; the default `"ClaudeCode"` backfills
+    // every pre-existing row (they were all Claude Code).
+    "ALTER TABLE managed_session ADD COLUMN agent TEXT NOT NULL DEFAULT '\"ClaudeCode\"';",
 ];
 
 /// Apply every migration the database hasn't seen yet, in order. Idempotent: a

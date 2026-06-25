@@ -20,15 +20,27 @@ use serde_json::{json, Value};
 /// `moonlight hooks install` after changing this so the installed entry is refreshed.
 const HOOK_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// Dispatch a `hooks` subcommand. `args` is the full process argv.
+/// Dispatch a `hooks` subcommand. `args` is the full process argv:
+/// `moonlight hooks <install|uninstall|status> [claude|agy|all]` (target defaults to
+/// `claude` for back-compat). `agy` manages the Antigravity plugin gate; `all` does both.
 pub fn run(args: &[String]) {
-    match args.get(2).map(String::as_str) {
-        Some("install") => install(),
-        Some("uninstall") => uninstall(),
-        Some("status") | None => status(),
-        Some(other) => {
-            eprintln!("unknown hooks subcommand: {other}");
-            eprintln!("usage: moonlight hooks [install|uninstall|status]");
+    let sub = args.get(2).map(String::as_str);
+    let target = args.get(3).map(String::as_str);
+    let do_claude = matches!(target, None | Some("claude") | Some("all"));
+    let do_agy = matches!(target, Some("agy") | Some("all"));
+
+    if do_agy {
+        crate::agy_setup::run(sub);
+    }
+    if do_claude {
+        match sub {
+            Some("install") => install(),
+            Some("uninstall") => uninstall(),
+            Some("status") | None => status(),
+            Some(other) => {
+                eprintln!("unknown hooks subcommand: {other}");
+                eprintln!("usage: moonlight hooks [install|uninstall|status] [claude|agy|all]");
+            }
         }
     }
 }

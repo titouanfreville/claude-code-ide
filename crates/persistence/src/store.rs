@@ -51,8 +51,8 @@ impl ManagedSessionStore for Store {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO managed_session
-                (id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                (id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen, agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                 root         = excluded.root,
                 title        = excluded.title,
@@ -75,6 +75,7 @@ impl ManagedSessionStore for Store {
                 s.hidden as i64,
                 s.created_at.as_millis(),
                 s.last_seen.as_millis(),
+                enc(&s.agent)?,
             ],
         )
         .map_err(backend)?;
@@ -109,7 +110,7 @@ impl ManagedSessionStore for Store {
         let conn = self.lock();
         let raw = conn
             .query_row(
-                "SELECT id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen
+                "SELECT id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen, agent
                  FROM managed_session WHERE id = ?1",
                 [id.as_str()],
                 raw_managed,
@@ -123,7 +124,7 @@ impl ManagedSessionStore for Store {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen
+                "SELECT id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen, agent
                  FROM managed_session ORDER BY created_at ASC, id ASC",
             )
             .map_err(backend)?;
@@ -200,6 +201,7 @@ struct RawManaged {
     hidden: i64,
     created_at: i64,
     last_seen: i64,
+    agent: String,
 }
 
 fn raw_managed(row: &Row) -> rusqlite::Result<RawManaged> {
@@ -215,6 +217,7 @@ fn raw_managed(row: &Row) -> rusqlite::Result<RawManaged> {
         hidden: row.get(8)?,
         created_at: row.get(9)?,
         last_seen: row.get(10)?,
+        agent: row.get(11)?,
     })
 }
 
@@ -231,6 +234,7 @@ fn managed_from_raw(r: RawManaged) -> Result<ManagedSession, StoreError> {
         hidden: r.hidden != 0,
         created_at: Timestamp::from_millis(r.created_at),
         last_seen: Timestamp::from_millis(r.last_seen),
+        agent: dec(&r.agent)?,
     })
 }
 
@@ -281,6 +285,7 @@ fn dec<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moonlight_domain::agent::AgentKind;
     use moonlight_domain::audit::AuditAction;
     use moonlight_domain::phase::Phase;
     use moonlight_domain::session::Mode;
@@ -292,6 +297,7 @@ mod tests {
             title: Some("Refactor auth".into()),
             mode: Mode::Plan,
             phase: Phase::Plan,
+            agent: AgentKind::ClaudeCode,
             adopted: false,
             paused: false,
             phase_pinned: false,
@@ -321,6 +327,39 @@ mod tests {
         assert_eq!(got.as_ref(), Some(&rec));
 
         assert!(store.managed(&SessionId::new("nope")).unwrap().is_none());
+    }
+
+    #[test]
+    fn agent_backend_round_trips() {
+        // A non-default backend (Antigravity) survives a persist→restore so a restart
+        // relaunches `agy`, not `claude`.
+        let store = Store::open_in_memory().unwrap();
+        let mut rec = managed("agy-1", 1000);
+        rec.agent = AgentKind::Antigravity;
+        store.upsert_managed(&rec).unwrap();
+
+        let got = store.managed(&SessionId::new("agy-1")).unwrap().unwrap();
+        assert_eq!(got.agent, AgentKind::Antigravity);
+    }
+
+    #[test]
+    fn legacy_rows_backfill_to_claude_code() {
+        // A row inserted without the `agent` column (the pre-migration record shape)
+        // gets the schema DEFAULT, which decodes to ClaudeCode — old sessions stay
+        // Claude on restart rather than failing to decode.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .lock()
+            .execute(
+                "INSERT INTO managed_session
+                    (id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen)
+                 VALUES ('legacy', NULL, NULL, '\"Auto\"', '\"Discovery\"', 0, 0, 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let got = store.managed(&SessionId::new("legacy")).unwrap().unwrap();
+        assert_eq!(got.agent, AgentKind::ClaudeCode);
     }
 
     #[test]

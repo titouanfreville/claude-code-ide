@@ -35,9 +35,13 @@ pub struct SpaceTab {
     pub id: SpaceId,
     pub label: String,
     pub active: bool,
-    /// Worst needs-operator status color among this space's sessions
-    /// (Errored > WaitingInput), or `None` when the space is calm.
+    /// Worst "broke / stuck" status color among this space's sessions
+    /// (Errored/Incomplete > Stuck), or `None` when none. Shown as a steady dot.
     pub attention: Option<Hsla>,
+    /// Any session in this space is awaiting the operator (`NeedsInput`). Shown as the
+    /// blinking amber caret — kept separate from `attention` so it is never hidden
+    /// behind a higher-severity error dot.
+    pub needs_input: bool,
 }
 
 /// Render the top space-tab bar: `⊞ Overview │ <space tabs> │ ＋ Session ＋ Space`.
@@ -72,7 +76,8 @@ pub fn space_tab_bar(
             let close_id = tab.id.clone();
             let group: SharedString = format!("space-grp-{i}").into();
             let mut shell = tab_shell(("space-tab", i), group.clone(), tab.active);
-            // Attention dot — a session in this space is Waiting/Errored.
+            // Steady attention dot — a session in this space broke / is stuck
+            // (Errored/Incomplete/Stuck). NeedsInput is NOT here — it gets the caret.
             if let Some(color) = tab.attention {
                 shell = shell.child(
                     div()
@@ -83,6 +88,10 @@ pub fn space_tab_bar(
                         .bg(color)
                         .shadow(theme::glow(color)),
                 );
+            }
+            // Blinking amber caret — a session here is waiting for the operator to type.
+            if tab.needs_input {
+                shell = shell.child(super::needs_input_caret(("space-tab-caret", i)));
             }
             shell
                 .child(

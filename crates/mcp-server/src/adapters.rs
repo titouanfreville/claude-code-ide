@@ -197,6 +197,7 @@ mod tests {
             title: None,
             mode: Mode::Auto,
             phase,
+            agent: moonlight_domain::AgentKind::ClaudeCode,
             adopted: true,
             paused: false,
             phase_pinned: false,

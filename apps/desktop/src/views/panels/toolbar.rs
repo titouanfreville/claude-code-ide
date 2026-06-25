@@ -81,6 +81,9 @@ pub struct ToolbarSnapshot {
     pub run_running: bool,
     /// Detected run targets for the run dropdown (only filled while it's open).
     pub run_configs: Vec<RunRow>,
+    /// Auto-phasing opt-in is on — lights the ⟳ toggle (the agent may move its own
+    /// workflow phase without a cockpit approval).
+    pub auto_phase: bool,
 }
 
 /// Build the main toolbar inside a styled [`TitleBar`]. The single child is a
@@ -119,6 +122,7 @@ pub fn main_toolbar(snap: ToolbarSnapshot, cx: &mut Context<Workspace>) -> Title
                         .gap_1()
                         .child(run_widget(&snap, cx))
                         .child(new_session_btn(cx))
+                        .child(auto_phase_toggle(snap.auto_phase, cx))
                         .child(explorer_toggle(snap.left_open, cx)),
                 ),
         )
@@ -325,6 +329,29 @@ fn new_session_btn(cx: &mut Context<Workspace>) -> impl IntoElement {
         .child("＋")
         .child("Session")
         .on_click(cx.listener(|this, _ev, _w, cx| this.new_session(cx)))
+}
+
+/// The auto-phasing toggle (⟳ + label): lit when the agent may move its own workflow
+/// phase without a cockpit approval. Flips the shared `auto_phase` flag the actor reads.
+fn auto_phase_toggle(lit: bool, cx: &mut Context<Workspace>) -> impl IntoElement {
+    let color = if lit { theme::accent() } else { theme::text_muted() };
+    div()
+        .id("tb-autophase")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(3.))
+        .h(px(24.))
+        .px_2()
+        .rounded(theme::radius_sm())
+        .text_color(color)
+        .text_size(theme::text_2xs())
+        .when(lit, |d| d.bg(theme::tint(theme::accent(), 0.10)))
+        .when(!lit, |d| d.hover(|d| d.bg(theme::row_hover())))
+        .cursor_pointer()
+        .child("⟳")
+        .child("auto-phase")
+        .on_click(cx.listener(|this, _ev, _w, cx| this.toggle_auto_phase(cx)))
 }
 
 fn explorer_toggle(lit: bool, cx: &mut Context<Workspace>) -> impl IntoElement {

@@ -66,6 +66,11 @@ pub enum EngineEvent {
     ApprovalRequested {
         session: SessionId,
         what: String,
+        /// For an **external MCP tool** held by a frozen phase, the full
+        /// `mcp__server__tool` name — the cockpit uses it to offer "always allow this
+        /// tool" / "always allow this server" alongside allow-once / refuse. `None` for
+        /// plan and danger-zone holds (plain approve / deny).
+        authorize_tool: Option<String>,
     },
     AuditAppended {
         session: SessionId,
@@ -182,5 +187,14 @@ pub enum Command {
     FlagSession {
         session: SessionId,
         alert: Option<AttentionKind>,
+    },
+    /// Operator clicked "always allow" on a held external-MCP authorization: vouch
+    /// `pattern` (an exact tool name, or a `mcp__server__*` glob) as read-only for the
+    /// rest of the session **and** persist it to the user config, then let the held call
+    /// proceed. Consumed by the composition-root command router (it owns the runtime
+    /// overlay + config path); never reaches the supervisor.
+    AuthorizeAlwaysTool {
+        session: SessionId,
+        pattern: String,
     },
 }

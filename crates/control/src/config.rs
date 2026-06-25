@@ -124,6 +124,51 @@ pub fn user_config_path(home: impl AsRef<Path>) -> PathBuf {
     home.as_ref().join(MOONLIGHT_DIR).join(CONFIG_FILE)
 }
 
+/// Append `pattern` to the `safe_tools` array of the JSON config at `path` (the durable
+/// half of an operator "always allow" decision). Operates on raw JSON so **all other
+/// keys are preserved** (the file may carry unrelated settings like `lsp_servers`), and
+/// creates the file + parent dir when absent. Returns `Ok(true)` when it wrote a new
+/// entry, `Ok(false)` when `pattern` was already present (no write). Refuses to clobber
+/// a non-empty, unparseable file (returns `InvalidData`) so a hand-edit typo is never
+/// silently overwritten.
+pub fn append_safe_tool(path: &Path, pattern: &str) -> std::io::Result<bool> {
+    use serde_json::{Map, Value};
+
+    let mut root = match std::fs::read(path) {
+        Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => Value::Object(Map::new()),
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
+        Err(e) => return Err(e),
+    };
+    if !root.is_object() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "config root is not a JSON object",
+        ));
+    }
+    let obj = root.as_object_mut().expect("checked object");
+    let arr = obj
+        .entry("safe_tools")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !arr.is_array() {
+        *arr = Value::Array(Vec::new());
+    }
+    let list = arr.as_array_mut().expect("checked array");
+    if list.iter().any(|v| v.as_str() == Some(pattern)) {
+        return Ok(false);
+    }
+    list.push(Value::String(pattern.to_string()));
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(&root).unwrap_or_default();
+    bytes.push(b'\n');
+    std::fs::write(path, bytes)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +256,59 @@ mod tests {
     #[test]
     fn missing_file_is_none() {
         assert!(load_config(Path::new("/no/such/.moonlight/config.json")).is_none());
+    }
+
+    #[test]
+    fn append_safe_tool_creates_file_when_absent() {
+        let root = temp_root("persist-new");
+        // Use a fresh nested path that doesn't exist yet (parent created on write).
+        let path = root.join("sub").join(MOONLIGHT_DIR).join(CONFIG_FILE);
+        assert!(append_safe_tool(&path, "mcp__phoenix__*").unwrap());
+        let cfg = load_config(&path).expect("written config parses");
+        assert_eq!(cfg.safe_tools, vec!["mcp__phoenix__*".to_string()]);
+    }
+
+    #[test]
+    fn append_safe_tool_appends_and_dedupes() {
+        let root = temp_root("persist-append");
+        let path = root.join(MOONLIGHT_DIR).join(CONFIG_FILE);
+        assert!(append_safe_tool(&path, "mcp__phoenix__*").unwrap());
+        assert!(append_safe_tool(&path, "mcp__db__run_select").unwrap());
+        // Re-adding an existing entry is a no-op write.
+        assert!(!append_safe_tool(&path, "mcp__phoenix__*").unwrap());
+        let cfg = load_config(&path).unwrap();
+        assert_eq!(
+            cfg.safe_tools,
+            vec!["mcp__phoenix__*".to_string(), "mcp__db__run_select".to_string()]
+        );
+    }
+
+    #[test]
+    fn append_safe_tool_preserves_unrelated_keys() {
+        let root = temp_root("persist-preserve");
+        write_config(
+            &root,
+            r#"{ "ai_workspace_roots": ["docs"], "lsp_servers": { "rust": "rust-analyzer" } }"#,
+        );
+        let path = root.join(MOONLIGHT_DIR).join(CONFIG_FILE);
+        append_safe_tool(&path, "mcp__phoenix__*").unwrap();
+        // The new key is added without dropping the pre-existing ones.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("lsp_servers"), "{raw}");
+        assert!(raw.contains("rust-analyzer"), "{raw}");
+        let cfg = load_config(&path).unwrap();
+        assert_eq!(cfg.safe_tools, vec!["mcp__phoenix__*".to_string()]);
+        assert_eq!(cfg.ai_workspace_roots, Some(vec!["docs".to_string()]));
+    }
+
+    #[test]
+    fn append_safe_tool_refuses_to_clobber_malformed_file() {
+        let root = temp_root("persist-bad");
+        write_config(&root, "{ this is not json");
+        let path = root.join(MOONLIGHT_DIR).join(CONFIG_FILE);
+        let err = append_safe_tool(&path, "mcp__phoenix__*").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // The original (malformed) content is untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ this is not json");
     }
 }

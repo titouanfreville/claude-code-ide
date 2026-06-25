@@ -32,6 +32,7 @@ use moonlight_domain::session::SessionStatus;
 use moonlight_domain::trust::McpVerb;
 
 use crate::docker;
+use crate::views::center_requests::OpenRequest;
 use crate::views::chrome_requests::ChromeRequest;
 use crate::views::theme;
 use crate::views::workspace::ShellDeps;
@@ -300,6 +301,7 @@ fn verb_label(v: McpVerb) -> &'static str {
         McpVerb::RunListTargets => "run_list_targets",
         McpVerb::RequestPhase => "request_phase",
         McpVerb::ReportBlocked => "report_blocked",
+        McpVerb::PhaseStatus => "phase_status",
     }
 }
 
@@ -617,7 +619,27 @@ impl ServicesPanel {
             }),
         )
         .when(open, |d| {
-            d.when(snap.http_calls.is_empty(), |d| {
+            d.child(
+                row(1)
+                    .id("svc-http-open")
+                    .rounded(theme::radius_sm())
+                    .hover(|d| d.bg(theme::row_hover()))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|_this, _ev, _w, cx| {
+                        if let Some(deps) = cx.try_global::<ShellDeps>() {
+                            let center = deps.center.clone();
+                            center.update(cx, |_, cx| cx.emit(OpenRequest::Http));
+                        }
+                    }))
+                    .child(div().w(px(SLOT_W)).flex_none())
+                    .child(
+                        div()
+                            .text_size(theme::text_xs())
+                            .text_color(theme::accent())
+                            .child("↗ open the request builder"),
+                    ),
+            )
+            .when(snap.http_calls.is_empty(), |d| {
                 d.child(hint_row(1, "no requests yet — http_request calls land here"))
             })
             .children(snap.http_calls.iter().map(|c| http_row(c, now)))

@@ -26,6 +26,14 @@ use crate::pending::{ApprovalNotifier, Decision, PendingApprovals};
 /// engine events; the server only ever reads it.
 pub type GateView = Arc<RwLock<HashMap<SessionId, GateState>>>;
 
+/// Operator "always allow" decisions made at runtime: tool-name patterns (exact, or a
+/// trailing-`*` server glob like `mcp__phoenix__*`) vouched as read-only for the rest of
+/// the process. Shared between the control server (which reads it to vouch a held tool)
+/// and the cockpit command router (which appends to it when the operator clicks "always
+/// allow"). Gives an "always" decision **immediate** effect — the persisted
+/// `~/.moonlight/config.json` entry only takes effect on the next app start.
+pub type RuntimeSafeTools = Arc<RwLock<std::collections::HashSet<String>>>;
+
 /// How long the server holds a connection waiting for an operator decision before
 /// denying. Must stay under Claude Code's per-hook timeout (≈60s) so the *server*
 /// resolves the hold (a clean deny) rather than the client giving up and failing
@@ -36,7 +44,14 @@ pub const DEFAULT_HOLD: Duration = Duration::from_secs(45);
 /// degraded standalone server). Held actions then simply time out into a deny.
 struct NoopNotifier;
 impl ApprovalNotifier for NoopNotifier {
-    fn approval_requested(&self, _session: &SessionId, _what: &str, _plan: Option<&str>) {}
+    fn approval_requested(
+        &self,
+        _session: &SessionId,
+        _what: &str,
+        _plan: Option<&str>,
+        _mcp_tool: Option<&str>,
+    ) {
+    }
 }
 
 /// Serves hook verdicts from the gate read-model + PDP, holding approval-required
@@ -58,6 +73,9 @@ pub struct ControlServer {
     /// still allowing AI-scratch writes. Defaults to the built-in allowlist for every
     /// cwd; wire config via [`ControlServer::with_ai_resolver`].
     ai: AiWorkspaceResolver,
+    /// Runtime "always allow" tool patterns (operator decisions), consulted in addition
+    /// to the config `safe_tools`. Empty unless wired via [`ControlServer::with_runtime_safe`].
+    runtime_safe: RuntimeSafeTools,
 }
 
 impl ControlServer {
@@ -71,7 +89,15 @@ impl ControlServer {
             notifier: Arc::new(NoopNotifier),
             hold_timeout: Some(DEFAULT_HOLD),
             ai: AiWorkspaceResolver::default(),
+            runtime_safe: RuntimeSafeTools::default(),
         }
+    }
+
+    /// Share the runtime "always allow" set so operator decisions take effect without a
+    /// restart (the cockpit appends to the same `Arc`; the server reads it per request).
+    pub fn with_runtime_safe(mut self, runtime_safe: RuntimeSafeTools) -> Self {
+        self.runtime_safe = runtime_safe;
+        self
     }
 
     /// Pin a single AI-workspace allowlist for every cwd (ignores `.moonlight/config.json`).
@@ -107,6 +133,7 @@ impl ControlServer {
             notifier,
             hold_timeout,
             ai: AiWorkspaceResolver::default(),
+            runtime_safe: RuntimeSafeTools::default(),
         }
     }
 
@@ -164,9 +191,10 @@ impl ControlServer {
         // files only. The allowlist is the user + workspace config for this session.
         let ai = self.ai.for_cwd(&req.cwd);
         let write_scope = classify_write_scope(&req.tool_name, &req.tool_input, &req.cwd, &ai);
-        // The operator's `safe_tools` config vouches a tool as read-only — it then
-        // classifies Safe (survives frozen phases) instead of the heuristic default.
-        let vouched_safe = ai.is_safe_tool(&req.tool_name);
+        // The operator's `safe_tools` config (or a runtime "always allow" decision)
+        // vouches a tool as read-only — it then classifies Safe (survives frozen phases)
+        // instead of the heuristic default.
+        let vouched_safe = ai.is_safe_tool(&req.tool_name) || self.runtime_vouched(&req.tool_name);
         let decision = {
             let gates = self.gates.read().unwrap_or_else(|p| p.into_inner());
             evaluate(
@@ -187,15 +215,27 @@ impl ControlServer {
         }
     }
 
+    /// Whether `tool_name` matches a runtime "always allow" pattern the operator set
+    /// this session (exact or trailing-`*` server glob).
+    fn runtime_vouched(&self, tool_name: &str) -> bool {
+        let set = self.runtime_safe.read().unwrap_or_else(|p| p.into_inner());
+        set.iter()
+            .any(|p| crate::paths::safe_tool_matches(p, tool_name))
+    }
+
     /// Pause the session on a held action: surface it to the operator, then await
     /// their decision. The hook stays blocked (CC waits) until this returns, so the
     /// session does not act until the operator approves.
     async fn hold(&self, session: SessionId, kind: HoldKind) -> HookResponse {
-        let (what, plan) = match &kind {
-            HoldKind::Plan { plan } => ("approve plan", plan.as_deref()),
-            HoldKind::Danger { reason } => (reason.as_str(), None),
+        let (what, plan, mcp_tool) = match &kind {
+            HoldKind::Plan { plan } => ("approve plan", plan.as_deref(), None),
+            HoldKind::Danger { reason } => (reason.as_str(), None, None),
+            HoldKind::McpAuthorize { reason, tool_name } => {
+                (reason.as_str(), None, Some(tool_name.as_str()))
+            }
         };
-        self.notifier.approval_requested(&session, what, plan);
+        self.notifier
+            .approval_requested(&session, what, plan, mcp_tool);
 
         let rx = self.pending.register(session.clone());
         // Bounded (`Some`) → race the budget; unbounded (`None`) → await the operator
@@ -439,6 +479,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_always_allow_vouches_external_mcp_in_frozen_phase() {
+        // The operator's "always allow" decision (runtime overlay) makes a frozen-phase
+        // external MCP tool pass immediately — no restart, no config reload. A trailing
+        // glob vouches the whole server.
+        let runtime: RuntimeSafeTools = Default::default();
+        runtime
+            .write()
+            .unwrap()
+            .insert("mcp__phoenix__*".to_string());
+        let plan_gate = GateState {
+            adopted: true,
+            phase: Phase::Plan,
+            ..Default::default()
+        };
+        let server = Arc::new(
+            ControlServer::new(gates_with("s1", plan_gate), Arc::new(TestPdp))
+                .with_runtime_safe(runtime.clone()),
+        );
+        let resp = roundtrip(server, &req("s1", "mcp__phoenix__run_select_query")).await;
+        assert_eq!(resp, HookResponse::Allow);
+    }
+
+    #[tokio::test]
+    async fn unvouched_external_mcp_does_not_pass_via_overlay() {
+        // Sanity: a server tool NOT covered by the overlay glob is not vouched (it falls
+        // to the normal gate path).
+        let runtime: RuntimeSafeTools = Default::default();
+        runtime
+            .write()
+            .unwrap()
+            .insert("mcp__phoenix__*".to_string());
+        let plan_gate = GateState {
+            adopted: true,
+            phase: Phase::Plan,
+            ..Default::default()
+        };
+        let server = Arc::new(
+            ControlServer::new(gates_with("s2", plan_gate), Arc::new(TestPdp))
+                .with_runtime_safe(runtime),
+        );
+        let resp = roundtrip(server, &req("s2", "mcp__other__run_query")).await;
+        assert!(matches!(resp, HookResponse::Deny { .. }));
+    }
+
+    #[tokio::test]
     async fn unknown_session_is_allowed_over_socket() {
         let gates: GateView = Arc::new(RwLock::new(HashMap::new()));
         let server = Arc::new(ControlServer::new(gates, Arc::new(TestPdp)));
@@ -481,11 +566,19 @@ mod tests {
     struct RecordingNotifier {
         notified: AtomicBool,
         had_plan: AtomicBool,
+        had_mcp_tool: AtomicBool,
     }
     impl ApprovalNotifier for RecordingNotifier {
-        fn approval_requested(&self, _session: &SessionId, _what: &str, plan: Option<&str>) {
+        fn approval_requested(
+            &self,
+            _session: &SessionId,
+            _what: &str,
+            plan: Option<&str>,
+            mcp_tool: Option<&str>,
+        ) {
             self.notified.store(true, Ordering::SeqCst);
             self.had_plan.store(plan.is_some(), Ordering::SeqCst);
+            self.had_mcp_tool.store(mcp_tool.is_some(), Ordering::SeqCst);
         }
     }
 
@@ -496,6 +589,48 @@ mod tests {
             trust: moonlight_domain::trust::TrustTier::Standard,
             ..Default::default()
         }
+    }
+
+    /// A PDP that always wants approval — to exercise the hold/notify path deterministically.
+    struct PromptAllPdp;
+    impl PolicyDecisionPoint for PromptAllPdp {
+        fn decide(&self, _req: &PermissionRequest) -> Result<PermissionOutcome, TrustError> {
+            Ok(PermissionOutcome::Prompt {
+                reason: "authorize".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_authorize_hold_forwards_the_tool_name_to_the_notifier() {
+        // A held external MCP tool surfaces its name to the cockpit (so it can offer
+        // per-tool / per-server "always"); a plan/danger hold carries no tool name.
+        let pending = Arc::new(PendingApprovals::new());
+        let notifier = Arc::new(RecordingNotifier::default());
+        let server = Arc::new(ControlServer::with_approvals(
+            gates_with("s1", adopted_auto()),
+            Arc::new(PromptAllPdp),
+            pending,
+            notifier.clone(),
+            Some(Duration::from_millis(20)),
+        ));
+        let bytes = serde_json::to_vec(&HookRequest {
+            event: "PreToolUse".into(),
+            session_id: "s1".into(),
+            tool_name: "mcp__phoenix__run_select_query".into(),
+            tool_input: json!({}),
+            cwd: "/repo".into(),
+        })
+        .unwrap();
+        // The hold times out into a deny, but the notifier was already called.
+        let resp = server.decide(&bytes).await;
+        assert!(matches!(resp, HookResponse::Deny { .. }));
+        assert!(notifier.notified.load(Ordering::SeqCst));
+        assert!(
+            notifier.had_mcp_tool.load(Ordering::SeqCst),
+            "external MCP tool name should be forwarded"
+        );
+        assert!(!notifier.had_plan.load(Ordering::SeqCst));
     }
 
     fn exit_plan_bytes(session: &str) -> Vec<u8> {
