@@ -91,7 +91,10 @@ impl HttpVerbExecutor {
 
         // Compact agent-facing summary (the actor compacts further if needed).
         let head = match (outcome.status, &outcome.error) {
-            (Some(code), _) => format!("{method} {url} → {code} · {}ms · {}B", outcome.ms, outcome.bytes),
+            (Some(code), _) => format!(
+                "{method} {url} → {code} · {}ms · {}B",
+                outcome.ms, outcome.bytes
+            ),
             (None, Some(err)) => format!("{method} {url} → error · {}ms · {err}", outcome.ms),
             (None, None) => format!("{method} {url} → (no response) · {}ms", outcome.ms),
         };
@@ -142,11 +145,7 @@ mod tests {
         HttpVerbExecutor::new(HttpHistory::new(), Arc::new(EchoInner))
     }
 
-    fn run(
-        ex: &HttpVerbExecutor,
-        verb: McpVerb,
-        payload: &str,
-    ) -> Result<String, ControlError> {
+    fn run(ex: &HttpVerbExecutor, verb: McpVerb, payload: &str) -> Result<String, ControlError> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -166,9 +165,18 @@ mod tests {
         // No manifest (root None) → empty env → local-only. A public host is refused
         // by the host-scope gate without recording a call.
         let ex = exec();
-        let err = run(&ex, McpVerb::HttpRequest, "https://api.stripe.com/v1/charges").unwrap_err();
+        let err = run(
+            &ex,
+            McpVerb::HttpRequest,
+            "https://api.stripe.com/v1/charges",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("host not allowed"), "{err}");
-        assert_eq!(ex.history.len(), 0, "a refused request must not hit history");
+        assert_eq!(
+            ex.history.len(),
+            0,
+            "a refused request must not hit history"
+        );
     }
 
     #[test]

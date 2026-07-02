@@ -111,7 +111,9 @@ pub fn main_toolbar(snap: ToolbarSnapshot, cx: &mut Context<Workspace>) -> Title
                         .items_center()
                         .gap_1()
                         .child(project_selector(&snap, cx))
-                        .when(snap.branch.is_some(), |d| d.child(branch_selector(&snap, cx))),
+                        .when(snap.branch.is_some(), |d| {
+                            d.child(branch_selector(&snap, cx))
+                        }),
                 )
                 // ── Right: run widget + session + explorer ────────────────────────
                 .child(
@@ -134,9 +136,8 @@ pub fn main_toolbar(snap: ToolbarSnapshot, cx: &mut Context<Workspace>) -> Title
 
 fn project_selector(snap: &ToolbarSnapshot, cx: &mut Context<Workspace>) -> impl IntoElement {
     let open = snap.space_menu_open;
-    let chip = chip("tb-project", "⌹", &snap.project, open, true).on_click(
-        cx.listener(|this, _ev, _w, cx| this.toggle_space_menu(cx)),
-    );
+    let chip = chip("tb-project", "⌹", &snap.project, open, true)
+        .on_click(cx.listener(|this, _ev, _w, cx| this.toggle_space_menu(cx)));
     div()
         .relative()
         .child(chip)
@@ -148,23 +149,32 @@ fn project_menu(spaces: &[SpaceRow], cx: &mut Context<Workspace>) -> impl IntoEl
     for s in spaces {
         let id = s.id.clone();
         list = list.child(
-            menu_row(SharedString::from(format!("tb-space-{}", s.id.as_str())), s.active)
-                .child(div().w(px(12.)).text_color(theme::accent()).child(if s.active {
-                    "✓"
-                } else {
-                    ""
-                }))
-                .child(div().flex_1().child(s.label.clone()))
-                .on_click(cx.listener(move |this, _ev, _w, cx| {
-                    this.select_space(id.clone(), cx);
-                    this.close_toolbar_menus(cx);
-                })),
+            menu_row(
+                SharedString::from(format!("tb-space-{}", s.id.as_str())),
+                s.active,
+            )
+            .child(
+                div()
+                    .w(px(12.))
+                    .text_color(theme::accent())
+                    .child(if s.active { "✓" } else { "" }),
+            )
+            .child(div().flex_1().child(s.label.clone()))
+            .on_click(cx.listener(move |this, _ev, _w, cx| {
+                this.select_space(id.clone(), cx);
+                this.close_toolbar_menus(cx);
+            })),
         );
     }
     list = list.child(menu_divider()).child(
         menu_row("tb-open-project", false)
             .child(div().w(px(12.)).text_color(theme::text_muted()).child("＋"))
-            .child(div().flex_1().text_color(theme::text_secondary()).child("Open Project…"))
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(theme::text_secondary())
+                    .child("Open Project…"),
+            )
             .on_click(cx.listener(|this, _ev, _w, cx| {
                 this.close_toolbar_menus(cx);
                 this.new_space(cx);
@@ -180,16 +190,19 @@ fn project_menu(spaces: &[SpaceRow], cx: &mut Context<Workspace>) -> impl IntoEl
 fn branch_selector(snap: &ToolbarSnapshot, cx: &mut Context<Workspace>) -> impl IntoElement {
     let open = snap.branch_menu_open;
     let branch = snap.branch.clone().unwrap_or_default();
-    let chip = chip("tb-branch", "⎇", &branch, open, true).on_click(
-        cx.listener(|this, _ev, _w, cx| this.toggle_branch_menu(cx)),
-    );
+    let chip = chip("tb-branch", "⎇", &branch, open, true)
+        .on_click(cx.listener(|this, _ev, _w, cx| this.toggle_branch_menu(cx)));
     div()
         .relative()
         .child(chip)
         .when(open, |d| d.child(branch_menu(&branch, &snap.branches, cx)))
 }
 
-fn branch_menu(current: &str, branches: &[String], cx: &mut Context<Workspace>) -> impl IntoElement {
+fn branch_menu(
+    current: &str,
+    branches: &[String],
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
     let mut list = menu_panel();
     if branches.is_empty() {
         list = list.child(
@@ -205,11 +218,12 @@ fn branch_menu(current: &str, branches: &[String], cx: &mut Context<Workspace>) 
         let name = b.clone();
         list = list.child(
             menu_row(SharedString::from(format!("tb-branch-{b}")), is_current)
-                .child(div().w(px(12.)).text_color(theme::accent()).child(if is_current {
-                    "✓"
-                } else {
-                    ""
-                }))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .text_color(theme::accent())
+                        .child(if is_current { "✓" } else { "" }),
+                )
                 .child(div().flex_1().child(b.clone()))
                 .on_click(cx.listener(move |this, _ev, _w, cx| {
                     this.close_toolbar_menus(cx);
@@ -227,7 +241,10 @@ fn branch_menu(current: &str, branches: &[String], cx: &mut Context<Workspace>) 
 fn run_widget(snap: &ToolbarSnapshot, cx: &mut Context<Workspace>) -> impl IntoElement {
     let open = snap.run_menu_open;
     let has_config = snap.run_label.is_some();
-    let label = snap.run_label.clone().unwrap_or_else(|| "No run config".to_string());
+    let label = snap
+        .run_label
+        .clone()
+        .unwrap_or_else(|| "No run config".to_string());
     let glyph = snap.run_glyph;
 
     // The action button: ▶ launches the active target; while a run is live it is
@@ -271,9 +288,8 @@ fn run_widget(snap: &ToolbarSnapshot, cx: &mut Context<Workspace>) -> impl IntoE
     };
 
     // target chip — kind glyph + label + ▾, opens the target menu.
-    let target = chip("tb-run-target", glyph, &label, open, has_config).on_click(
-        cx.listener(|this, _ev, _w, cx| this.toggle_run_menu(cx)),
-    );
+    let target = chip("tb-run-target", glyph, &label, open, has_config)
+        .on_click(cx.listener(|this, _ev, _w, cx| this.toggle_run_menu(cx)));
 
     div()
         .relative()
@@ -292,11 +308,12 @@ fn run_menu(configs: &[RunRow], cx: &mut Context<Workspace>) -> impl IntoElement
         let id = c.id.clone();
         list = list.child(
             menu_row(SharedString::from(format!("tb-run-{}", c.id)), c.active)
-                .child(div().w(px(12.)).text_color(theme::accent()).child(if c.active {
-                    "✓"
-                } else {
-                    ""
-                }))
+                .child(
+                    div()
+                        .w(px(12.))
+                        .text_color(theme::accent())
+                        .child(if c.active { "✓" } else { "" }),
+                )
                 .child(div().text_color(theme::text_muted()).child(c.glyph))
                 .child(div().flex_1().child(c.label.clone()))
                 .on_click(cx.listener(move |this, _ev, _w, cx| {
@@ -305,6 +322,20 @@ fn run_menu(configs: &[RunRow], cx: &mut Context<Workspace>) -> impl IntoElement
                 })),
         );
     }
+    list = list.child(menu_divider()).child(
+        menu_row("tb-add-run-config", false)
+            .child(div().w(px(12.)).text_color(theme::text_muted()).child("＋"))
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(theme::text_secondary())
+                    .child("Add Configuration…"),
+            )
+            .on_click(cx.listener(|this, _ev, window, cx| {
+                this.close_toolbar_menus(cx);
+                this.open_create_run_config_modal(window, cx);
+            })),
+    );
     dropdown(list)
 }
 
@@ -334,7 +365,11 @@ fn new_session_btn(cx: &mut Context<Workspace>) -> impl IntoElement {
 /// The auto-phasing toggle (⟳ + label): lit when the agent may move its own workflow
 /// phase without a cockpit approval. Flips the shared `auto_phase` flag the actor reads.
 fn auto_phase_toggle(lit: bool, cx: &mut Context<Workspace>) -> impl IntoElement {
-    let color = if lit { theme::accent() } else { theme::text_muted() };
+    let color = if lit {
+        theme::accent()
+    } else {
+        theme::text_muted()
+    };
     div()
         .id("tb-autophase")
         .flex()
@@ -355,7 +390,11 @@ fn auto_phase_toggle(lit: bool, cx: &mut Context<Workspace>) -> impl IntoElement
 }
 
 fn explorer_toggle(lit: bool, cx: &mut Context<Workspace>) -> impl IntoElement {
-    let color = if lit { theme::accent() } else { theme::text_muted() };
+    let color = if lit {
+        theme::accent()
+    } else {
+        theme::text_muted()
+    };
     div()
         .id("tb-explorer")
         .flex()
@@ -401,8 +440,17 @@ fn chip(
         .h(px(24.))
         .rounded(theme::radius_sm())
         .text_color(fg)
-        .child(div().text_color(theme::tint(theme::accent(), 0.7)).child(icon))
-        .child(div().max_w(px(180.)).overflow_hidden().child(text.to_string()));
+        .child(
+            div()
+                .text_color(theme::tint(theme::accent(), 0.7))
+                .child(icon),
+        )
+        .child(
+            div()
+                .max_w(px(180.))
+                .overflow_hidden()
+                .child(text.to_string()),
+        );
     if enabled {
         c = c.cursor_pointer().child(
             div()
@@ -412,7 +460,9 @@ fn chip(
         );
     }
     if open {
-        c = c.bg(theme::tint(theme::accent(), 0.12)).text_color(theme::text_primary());
+        c = c
+            .bg(theme::tint(theme::accent(), 0.12))
+            .text_color(theme::text_primary());
     } else if enabled {
         c = c.hover(|d| d.bg(theme::row_hover()));
     }

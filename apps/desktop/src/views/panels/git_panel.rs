@@ -46,9 +46,7 @@ impl GitPanel {
             if alive.is_err() {
                 break; // panel dropped
             }
-            cx.background_executor()
-                .timer(Duration::from_secs(3))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(3)).await;
         })
         .detach();
         Self {
@@ -66,7 +64,10 @@ impl GitPanel {
         let mut dirty = false;
 
         let root = self.focus.as_ref().map(|f| f.read(cx).root());
-        let next = root.as_ref().and_then(|r| load_log(r, 50)).unwrap_or_default();
+        let next = root
+            .as_ref()
+            .and_then(|r| load_log(r, 50))
+            .unwrap_or_default();
         if next != self.log || root != self.loaded_root {
             self.log = next;
             self.loaded_root = root;
@@ -154,10 +155,11 @@ fn view_chip(
         chip.text_color(theme::text_muted())
             .hover(|d| d.bg(theme::row_hover()).text_color(theme::text_secondary()))
     };
-    chip.child(label).on_click(cx.listener(move |this, _ev, _w, cx| {
-        this.view = target;
-        cx.notify();
-    }))
+    chip.child(label)
+        .on_click(cx.listener(move |this, _ev, _w, cx| {
+            this.view = target;
+            cx.notify();
+        }))
 }
 
 /// The Log view: one row per commit.
@@ -240,9 +242,12 @@ fn console_body(ops: &[GitOp]) -> impl IntoElement {
         .flex()
         .flex_col();
     if ops.is_empty() {
-        return body.child(div().p_4().text_color(theme::text_muted()).child(
-            "no operations yet — toolbar checkouts and Commit-tool actions land here",
-        ));
+        return body.child(
+            div()
+                .p_4()
+                .text_color(theme::text_muted())
+                .child("no operations yet — toolbar checkouts and Commit-tool actions land here"),
+        );
     }
     body.children(ops.iter().map(|op| {
         let (glyph, color) = if op.ok {

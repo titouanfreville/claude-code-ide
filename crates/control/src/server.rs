@@ -301,6 +301,7 @@ mod tests {
             let is_write = !matches!(req.danger, DangerClass::Safe);
             if is_write {
                 let permitted = match req.write_scope.unwrap_or(WriteScope::Project) {
+                    WriteScope::Ephemeral => true,
                     WriteScope::AiWorkspace => req.phase.allows_ai_workspace_writes(),
                     WriteScope::Project => req.phase.allows_writes(),
                 };
@@ -443,7 +444,10 @@ mod tests {
             ),
         );
         let vouched = req("explore-vouched", "mcp__x__ast_grep_search");
-        assert_eq!(roundtrip(vouched_server, &vouched).await, HookResponse::Allow);
+        assert_eq!(
+            roundtrip(vouched_server, &vouched).await,
+            HookResponse::Allow
+        );
 
         // (4) A plan-file write under ~/.claude/plans (home-anchored AI root).
         let home = std::env::var("HOME").expect("HOME set in tests");
@@ -453,7 +457,10 @@ mod tests {
         ));
         let mut plan_write = req("plan-write", "Write");
         plan_write.tool_input = json!({ "file_path": format!("{home}/.claude/plans/p.md") });
-        assert_eq!(roundtrip(plans_server, &plan_write).await, HookResponse::Allow);
+        assert_eq!(
+            roundtrip(plans_server, &plan_write).await,
+            HookResponse::Allow
+        );
 
         // (5) Project writes stay frozen: a project Edit and a mutating Bash.
         let deny_server = Arc::new(ControlServer::new(
@@ -578,7 +585,8 @@ mod tests {
         ) {
             self.notified.store(true, Ordering::SeqCst);
             self.had_plan.store(plan.is_some(), Ordering::SeqCst);
-            self.had_mcp_tool.store(mcp_tool.is_some(), Ordering::SeqCst);
+            self.had_mcp_tool
+                .store(mcp_tool.is_some(), Ordering::SeqCst);
         }
     }
 

@@ -107,6 +107,11 @@ pub struct StatusSnapshot {
     pub quota: QuotaView,
     /// Per-session obs for the selected session, or `None` when none is frontmost.
     pub obs: Option<ObsView>,
+    /// Whether the frontmost session's backend feeds the Claude-observability cluster
+    /// (model + account quota + ctx). `false` for an Antigravity (`agy`) session — those
+    /// stats are Claude-specific and would be misleading, so the bar shows an "AGY"
+    /// marker instead.
+    pub obs_native: bool,
 }
 
 /// Map a notification kind to its glyph + color. All glyphs are monochrome text
@@ -128,6 +133,15 @@ pub fn kind_style(kind: NotificationKind) -> (&'static str, Hsla) {
 /// Render the bottom status bar from `snap`. `cx` is the workspace context so the
 /// notifications button can toggle workspace state.
 pub fn status_bar(snap: StatusSnapshot, cx: &mut Context<Workspace>) -> impl IntoElement {
+    // Right cluster: the full Claude-observability cluster (account quota + model + ctx)
+    // for a Claude / no-session bar; for an AGY session we render a custom agy_zone containing
+    // the Gemini model, active session duration (computed from the transcript), and a subtle,
+    // glowing "AGY" token marker to differentiate it from Claude sessions.
+    let right_cluster = if snap.obs_native {
+        obs_zone(snap.quota, snap.obs).into_any_element()
+    } else {
+        agy_zone(snap.obs).into_any_element()
+    };
     div()
         .id("status-bar")
         .relative()
@@ -152,10 +166,15 @@ pub fn status_bar(snap: StatusSnapshot, cx: &mut Context<Workspace>) -> impl Int
         .child(meta_item("⬡", theme::text_muted(), snap.project))
         .child(meta_item("☾", theme::accent(), snap.theme_name.to_string()))
         .child(sep())
-        // RIGHT — the Claude-observability cluster (account quota + selected session).
-        .child(obs_zone(snap.quota, snap.obs))
+        // RIGHT — Claude obs cluster for a Claude/no session; AGY's model marker otherwise.
+        .child(right_cluster)
         // FAR RIGHT — notifications.
-        .child(bell(snap.unread, snap.notifications_open, snap.notifications, cx))
+        .child(bell(
+            snap.unread,
+            snap.notifications_open,
+            snap.notifications,
+            cx,
+        ))
 }
 
 /// The 1px top hairline: transparent at the edges, moonlight at the center —
@@ -281,6 +300,50 @@ fn obs_zone(quota: QuotaView, obs_view: Option<ObsView>) -> gpui::Div {
             .child(gauge("ctx", o.ctx_pct)),
         None => row.child(obs("⌬", "—")).child(gauge("ctx", None)),
     };
+    row
+}
+
+/// A custom, gorgeous observability cluster for Google Antigravity (Gemini) sessions.
+/// Displays the active model, session duration, and a glowing AGY brand badge.
+fn agy_zone(obs_view: Option<ObsView>) -> gpui::Div {
+    let mut row = div().flex().flex_row().items_center().gap_3();
+
+    // A subtle glowing "AGY" marker to show it's powered by Google Antigravity
+    row = row.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1_5()
+            .child(
+                div()
+                    .w(px(6.))
+                    .h(px(6.))
+                    .rounded_full()
+                    .bg(theme::accent())
+                    .shadow(theme::glow(theme::accent())),
+            )
+            .child(
+                div()
+                    .text_size(theme::text_xs())
+                    .text_color(theme::text_muted())
+                    .child("AGY"),
+            ),
+    );
+
+    row = row.child(sep());
+
+    row = match obs_view {
+        Some(o) => {
+            let mut r = row.child(obs("⌬", o.model));
+            if o.time != "0s" && !o.time.is_empty() && o.time != "—" {
+                r = r.child(obs("◷", o.time));
+            }
+            r
+        }
+        None => row.child(obs("⌬", "—")),
+    };
+
     row
 }
 
@@ -418,7 +481,11 @@ fn notif_popover(rows: Vec<NotifRow>, cx: &mut Context<Workspace>) -> gpui::Div 
                 .items_center()
                 .gap_2()
                 .text_color(theme::text_muted())
-                .child(div().text_color(theme::tint(theme::accent(), 0.6)).child("☾"))
+                .child(
+                    div()
+                        .text_color(theme::tint(theme::accent(), 0.6))
+                        .child("☾"),
+                )
                 .child("All quiet"),
         );
     } else {
@@ -449,7 +516,14 @@ fn notif_popover(rows: Vec<NotifRow>, cx: &mut Context<Workspace>) -> gpui::Div 
                     .hover(|d| d.bg(theme::row_hover()))
                     // The phosphor tick — lit in the kind color while unread,
                     // fully transparent (but space-keeping) once read.
-                    .child(div().w(px(2.)).h(px(12.)).flex_none().rounded_full().bg(tick_color))
+                    .child(
+                        div()
+                            .w(px(2.))
+                            .h(px(12.))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(tick_color),
+                    )
                     .child(div().text_color(r.color).child(r.icon))
                     .child(div().flex_1().text_color(text_color).child(r.text))
                     .on_click(cx.listener(move |this, _ev, _w, cx| {
@@ -471,19 +545,23 @@ fn notif_popover(rows: Vec<NotifRow>, cx: &mut Context<Workspace>) -> gpui::Div 
         .shadow(theme::overlay_shadow())
         .text_size(theme::text_sm())
         // The popover carries its own moonrise hairline along the top edge.
-        .child(div().w_full().h(px(1.)).flex().flex_row().child(
-            div().flex_1().h_full().bg(linear_gradient(
-                90.,
-                linear_color_stop(theme::tint(theme::accent(), 0.0), 0.),
-                linear_color_stop(theme::tint(theme::accent(), 0.45), 1.),
-            )),
-        ).child(
-            div().flex_1().h_full().bg(linear_gradient(
-                90.,
-                linear_color_stop(theme::tint(theme::accent(), 0.45), 0.),
-                linear_color_stop(theme::tint(theme::accent(), 0.0), 1.),
-            )),
-        ))
+        .child(
+            div()
+                .w_full()
+                .h(px(1.))
+                .flex()
+                .flex_row()
+                .child(div().flex_1().h_full().bg(linear_gradient(
+                    90.,
+                    linear_color_stop(theme::tint(theme::accent(), 0.0), 0.),
+                    linear_color_stop(theme::tint(theme::accent(), 0.45), 1.),
+                )))
+                .child(div().flex_1().h_full().bg(linear_gradient(
+                    90.,
+                    linear_color_stop(theme::tint(theme::accent(), 0.45), 0.),
+                    linear_color_stop(theme::tint(theme::accent(), 0.0), 1.),
+                ))),
+        )
         .child(
             div()
                 .flex()
@@ -523,9 +601,9 @@ fn notif_popover(rows: Vec<NotifRow>, cx: &mut Context<Workspace>) -> gpui::Div 
                                 .text_color(theme::text_muted())
                                 .hover(|d| d.text_color(theme::accent()))
                                 .child("Clear")
-                                .on_click(cx.listener(|this, _ev, _w, cx| {
-                                    this.clear_notifications(cx)
-                                })),
+                                .on_click(
+                                    cx.listener(|this, _ev, _w, cx| this.clear_notifications(cx)),
+                                ),
                         ),
                 ),
         )
@@ -585,7 +663,11 @@ fn obs(icon: &str, value: impl Into<String>) -> gpui::Div {
         .flex_row()
         .items_center()
         .gap_1()
-        .child(div().text_color(theme::text_muted()).child(icon.to_string()))
+        .child(
+            div()
+                .text_color(theme::text_muted())
+                .child(icon.to_string()),
+        )
         .child(
             div()
                 .font_family(theme::mono_font())

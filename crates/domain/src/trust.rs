@@ -52,6 +52,14 @@ pub enum McpVerb {
     /// whether to [`RequestPhase`](McpVerb::RequestPhase). The fix for phase *mismatch*:
     /// the agent never has to guess its phase.
     PhaseStatus,
+    /// **Plan surface:** the agent presents a plan (markdown) for operator review in the
+    /// plan-review panel — the auto-mode / backend-agnostic equivalent of Claude's native
+    /// `ExitPlanMode`. The PreToolUse hook gate *holds* the call on the proposed plan (so the
+    /// operator Approves / Refines / Rejects, same path as `ExitPlanMode`); the verb itself
+    /// only acknowledges once approved. Lets a session in **any** mode (not just Claude
+    /// plan-mode) and **any** backend (incl. Gemini/AGY) open the plan review. No project
+    /// side effect — a pure review surface.
+    PresentPlan,
 }
 
 impl McpVerb {
@@ -75,6 +83,9 @@ impl McpVerb {
             McpVerb::ReportBlocked => TrustTier::Observed,
             // Orientation must never be gated — any session, any tier, can ask where it is.
             McpVerb::PhaseStatus => TrustTier::Observed,
+            // Presenting a plan is gated by the hook *hold* (operator review), not the tier —
+            // any session, any tier, may surface a plan for review.
+            McpVerb::PresentPlan => TrustTier::Observed,
         }
     }
 
@@ -103,6 +114,10 @@ impl McpVerb {
                 | McpVerb::ReportBlocked
                 // A pure read of the session's own phase — passes the frozen-phase gate.
                 | McpVerb::PhaseStatus
+                // Presenting a plan has no project side effect (it opens a review surface);
+                // must pass the frozen-phase gate so a session can propose a plan while in the
+                // Plan phase too. The hook hold — not this flag — gates the operator review.
+                | McpVerb::PresentPlan
         )
     }
 }
@@ -121,9 +136,15 @@ pub enum DangerClass {
 /// session can't change the product while looking around or planning. They still let
 /// the agent write its own **AI-workspace** scratch (plan docs, BMad entries,
 /// handoffs), because that never alters project state. The Commit gate is the one
-/// exception: it freezes *everything* (see [`crate::phase::Phase::allows_ai_workspace_writes`]).
+/// exception: it freezes *everything* (see [`crate::phase::Phase::allows_ai_workspace_writes`])
+/// — everything except [`WriteScope::Ephemeral`], which is outside the tree entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteScope {
+    /// OS temp / scratch outside the working tree (e.g. `/tmp`, `$TMPDIR`). Never part
+    /// of the project or a deliverable, so it is writable in **every** phase — including
+    /// the Commit gate: an agent must always have somewhere to drop a report or scratch
+    /// file, and a temp write can't change what gets committed.
+    Ephemeral,
     /// AI-owned scratch/planning area (e.g. `.ai/`, `.bmad-output/`). Writable in
     /// every phase except the final Commit gate.
     AiWorkspace,

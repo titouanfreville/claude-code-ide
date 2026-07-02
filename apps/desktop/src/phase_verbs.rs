@@ -148,7 +148,11 @@ impl PhaseVerbExecutor {
                 "Phase change approved: {} → {} (now active). Project-file edits are {} in {}.",
                 from.label(),
                 to.label(),
-                if to.allows_writes() { "allowed" } else { "denied" },
+                if to.allows_writes() {
+                    "allowed"
+                } else {
+                    "denied"
+                },
                 to.label(),
             ),
             (None, Some(to)) => format!("Phase change approved: now in the {} phase.", to.label()),
@@ -234,6 +238,13 @@ impl VerbExecutor for PhaseVerbExecutor {
                 .map(|m| self.with_footer(session, m)),
             // phase_status *is* the phase report — no footer (it would duplicate).
             McpVerb::PhaseStatus => self.phase_status(session),
+            // present_plan's real work is the PreToolUse hook *hold* (it opens the plan
+            // panel and blocks on the operator's verdict). By the time execution reaches
+            // here the operator has already approved — so this is just a post-approval ack.
+            McpVerb::PresentPlan => Ok(self.with_footer(
+                session,
+                "Plan presented and approved by the operator.".to_string(),
+            )),
             other => self
                 .inner
                 .execute(session, root, other, payload)
@@ -287,11 +298,7 @@ mod tests {
         }
     }
 
-    fn run(
-        ex: &PhaseVerbExecutor,
-        verb: McpVerb,
-        payload: &str,
-    ) -> Result<String, ControlError> {
+    fn run(ex: &PhaseVerbExecutor, verb: McpVerb, payload: &str) -> Result<String, ControlError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -312,7 +319,10 @@ mod tests {
         ));
 
         run(&ex, McpVerb::RequestPhase, "NEXT").unwrap();
-        assert!(matches!(rx.try_recv().unwrap(), Command::AdvancePhase { .. }));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::AdvancePhase { .. }
+        ));
     }
 
     #[test]
@@ -388,7 +398,10 @@ mod tests {
         let out = run(&ex, McpVerb::RequestPhase, "next").unwrap();
         assert!(out.contains("Plan"), "{out}");
         assert!(out.contains("Auto"), "{out}");
-        assert!(matches!(rx.try_recv().unwrap(), Command::AdvancePhase { .. }));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Command::AdvancePhase { .. }
+        ));
 
         // Asking to jump straight to the phase it's already in is reported as no-op.
         let out = run(&ex, McpVerb::RequestPhase, "plan").unwrap();

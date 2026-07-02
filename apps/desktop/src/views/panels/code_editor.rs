@@ -157,7 +157,10 @@ impl CodeEditorPanel {
 
         // Status-bar metadata commands (e.g. an EOL click) targeted at the active
         // editor — only the frontmost tab acts (the dock keeps one active per panel).
-        if let Some(ec) = cx.try_global::<ShellDeps>().map(|d| d.editor_commands.clone()) {
+        if let Some(ec) = cx
+            .try_global::<ShellDeps>()
+            .map(|d| d.editor_commands.clone())
+        {
             subs.push(cx.subscribe(&ec, |this, _ec, cmd: &EditorCommand, cx| {
                 if !this.active {
                     return;
@@ -334,7 +337,10 @@ impl CodeEditorPanel {
         let line = pos.line as usize + 1;
         let column = pos.character as usize + 1;
         self.last_caret = Some((line, column));
-        let Some(ac) = cx.try_global::<ShellDeps>().map(|d| d.active_context.clone()) else {
+        let Some(ac) = cx
+            .try_global::<ShellDeps>()
+            .map(|d| d.active_context.clone())
+        else {
             return;
         };
         let ctx = ActiveContext::File {
@@ -373,7 +379,10 @@ impl CodeEditorPanel {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let Some(ae) = cx.try_global::<ShellDeps>().map(|d| d.active_editor.clone()) else {
+        let Some(ae) = cx
+            .try_global::<ShellDeps>()
+            .map(|d| d.active_editor.clone())
+        else {
             return;
         };
         let text = state.read(cx).value();
@@ -585,7 +594,8 @@ impl Panel for CodeEditorPanel {
         // Announce to the Structure panel (ActiveEditor) so it outlines this file.
         if let (Some(state), Some(ae)) = (
             self.state.clone(),
-            cx.try_global::<ShellDeps>().map(|d| d.active_editor.clone()),
+            cx.try_global::<ShellDeps>()
+                .map(|d| d.active_editor.clone()),
         ) {
             let path = self.path.clone();
             let text = state.read(cx).value();
@@ -663,7 +673,11 @@ impl Render for CodeEditorPanel {
                         }),
                 )
             })
-            .children(super::tab_menu_overlay(self.tab_menu.as_ref(), dismiss, window))
+            .children(super::tab_menu_overlay(
+                self.tab_menu.as_ref(),
+                dismiss,
+                window,
+            ))
     }
 }
 

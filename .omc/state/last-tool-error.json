@@ -1,7 +1,0 @@
-{
-  "tool_name": "Read",
-  "tool_input_preview": "{\"file_path\":\"/Users/titouan/perso/claude-code-ide/crates/domain/src/ports.rs\"}",
-  "error": "File does not exist. Note: your current working directory is /Users/titouan/perso/claude-code-ide. Did you mean ports?",
-  "timestamp": "2026-06-25T09:21:41.393Z",
-  "retry_count": 1
-}

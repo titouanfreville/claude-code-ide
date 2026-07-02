@@ -105,7 +105,10 @@ mod tests {
 
     #[test]
     fn default_servers_cover_priority_languages() {
-        assert_eq!(default_server(OutlineLang::Rust).unwrap().command, "rust-analyzer");
+        assert_eq!(
+            default_server(OutlineLang::Rust).unwrap().command,
+            "rust-analyzer"
+        );
         assert_eq!(default_server(OutlineLang::Go).unwrap().command, "gopls");
         assert_eq!(default_server(OutlineLang::Cpp).unwrap().command, "clangd");
         assert!(default_server(OutlineLang::Other).is_none());

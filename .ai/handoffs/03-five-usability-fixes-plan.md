@@ -11,9 +11,17 @@
   launch; monitor applies the tier on first sighting; the Trust selector persists back.
   **Needs an operator open-a-new-project test (the prompt is GUI).**
 - **#2** done — `Space.auto_resume` persisted + a per-project toggle pill in the session
-  header; on `SessionAlert(Incomplete)` for an opted-in project the monitor injects a
-  continue-prompt into the live terminal. **Needs a real-stall test.** PTY-exit trigger
-  still a follow-up (memory: PTY-exit detection unimplemented).
+  header. Two triggers, both gated on the project opt-in:
+  - **stall on restart** — a *restored* session (armed via `arm_restore_resume`) that
+    detection flags `Incomplete` gets a one-shot continue-prompt into its live terminal
+    (`maybe_auto_resume`). Deliberately NOT fired for live mid-session stalls.
+  - **process exit (follow-up, done 2026-06-25)** — a managed session whose CC process
+    fully exits (PTY closed) is relaunched in place via `claude --resume` + continue
+    prompt, for live sessions too. Poll-driven (`check_terminal_exit` every 1.5s on
+    `TerminalPanel::has_exited`), capped at `MAX_EXIT_RESUMES = 3` so a CC that dies on
+    launch can't loop. **Needs a real-exit test.**
+
+## STATUS (2026-06-25): PTY-exit follow-up landed. `cargo test` (workspace) = 423 pass, clippy clean (new code).
 
 Original plan below.
 

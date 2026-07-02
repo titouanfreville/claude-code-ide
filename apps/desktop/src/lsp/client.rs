@@ -187,24 +187,26 @@ impl LspClient {
 
     /// Send a request and return its `result`, replying to any server→client requests
     /// and skipping notifications until our response arrives (or we time out).
-    fn request(&mut self, method: &str, params: Value, timeout: Duration) -> std::io::Result<Value> {
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> std::io::Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         self.send(&request(id, method, params))?;
 
         let deadline = timeout;
         loop {
-            let msg = self
-                .incoming
-                .recv_timeout(deadline)
-                .map_err(|e| match e {
-                    RecvTimeoutError::Timeout => {
-                        std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{method} timed out"))
-                    }
-                    RecvTimeoutError::Disconnected => {
-                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "server closed")
-                    }
-                })?;
+            let msg = self.incoming.recv_timeout(deadline).map_err(|e| match e {
+                RecvTimeoutError::Timeout => {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, format!("{method} timed out"))
+                }
+                RecvTimeoutError::Disconnected => {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "server closed")
+                }
+            })?;
 
             // Our response?
             if msg.get("id").and_then(Value::as_i64) == Some(id) {
@@ -295,7 +297,9 @@ mod tests {
         std::fs::write(&file, src).unwrap();
 
         let mut client = LspClient::start(&spec, &dir).unwrap();
-        let syms = client.document_symbols(&file, src, OutlineLang::Rust).unwrap();
+        let syms = client
+            .document_symbols(&file, src, OutlineLang::Rust)
+            .unwrap();
         let names: Vec<_> = syms.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"Foo"), "got {names:?}");
 

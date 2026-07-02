@@ -107,8 +107,14 @@ mod tests {
         assert_eq!(AgentKind::from_token("claude"), Some(AgentKind::ClaudeCode));
         assert_eq!(AgentKind::from_token("  CC "), Some(AgentKind::ClaudeCode));
         assert_eq!(AgentKind::from_token("agy"), Some(AgentKind::Antigravity));
-        assert_eq!(AgentKind::from_token("Antigravity"), Some(AgentKind::Antigravity));
-        assert_eq!(AgentKind::from_token("gemini"), Some(AgentKind::Antigravity));
+        assert_eq!(
+            AgentKind::from_token("Antigravity"),
+            Some(AgentKind::Antigravity)
+        );
+        assert_eq!(
+            AgentKind::from_token("gemini"),
+            Some(AgentKind::Antigravity)
+        );
         assert_eq!(AgentKind::from_token("nonsense"), None);
     }
 
@@ -122,6 +128,9 @@ mod tests {
         // MCP via a config file.
         assert!(!AgentKind::Antigravity.supports_forced_session_id());
         assert!(!AgentKind::Antigravity.supports_statusline_injection());
-        assert_eq!(AgentKind::Antigravity.mcp_injection(), McpInjection::ConfigFile);
+        assert_eq!(
+            AgentKind::Antigravity.mcp_injection(),
+            McpInjection::ConfigFile
+        );
     }
 }

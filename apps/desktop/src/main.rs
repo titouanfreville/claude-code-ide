@@ -11,6 +11,7 @@
 mod agent_backend;
 mod agy_hook;
 mod agy_setup;
+mod assets;
 mod docker;
 mod git;
 mod hook_install;
@@ -18,6 +19,7 @@ mod http;
 mod http_verbs;
 mod icon;
 mod lsp;
+mod mcp_activity;
 mod obs;
 mod phase_verbs;
 mod run;
@@ -41,28 +43,32 @@ use moonlight_control::{
     ApprovalNotifier, ControlServer, Decision, GateView, HookRequest, HookResponse,
     KeystoneApprovalGate, ObserveOnlyControl, PendingApprovals, RuntimeSafeTools, SteerControl,
 };
-use moonlight_detection::{AntigravityDetectionSource, CompositeDetectionSource, JsonlDetectionSource};
+use moonlight_detection::{
+    AntigravityDetectionSource, CompositeDetectionSource, JsonlDetectionSource,
+};
 use moonlight_domain::ids::SessionId;
 use moonlight_domain::phase::Phase;
+use moonlight_domain::ports::mcp::McpActor;
 use moonlight_domain::ports::{
     ControlPort, DetectionSource, ManagedSessionStore, PermissionRequest, PolicyDecisionPoint,
 };
 use moonlight_domain::review::Feedback;
 use moonlight_domain::session::SessionStatus;
 use moonlight_domain::trust::{DangerClass, McpVerb, TrustTier};
-use moonlight_domain::ports::mcp::McpActor;
 use moonlight_engine::{Command, EngineEvent, EventBus, SessionSupervisor};
-use moonlight_mcp_server::{ActorService, BusPolicyView, McpHost, ShellVerbExecutor, StoreAuditSink};
+use moonlight_mcp_server::{
+    ActorService, BusPolicyView, McpHost, ShellVerbExecutor, StoreAuditSink,
+};
 use moonlight_persistence::Store;
 use moonlight_trust::DefaultPdp;
 use tokio::sync::{broadcast, mpsc};
 
 use views::active_context::ActiveContext;
 use views::active_editor::ActiveEditor;
-use views::mcp_host::McpHostHandle;
 use views::center_requests::CenterRequests;
 use views::edit_gate::EditGate;
 use views::editor_commands::EditorCommands;
+use views::mcp_host::McpHostHandle;
 use views::notifications::Notifications;
 use views::obs_store::ObsStore;
 use views::project_space::ProjectSpace;
@@ -107,7 +113,9 @@ fn main() {
 
     startup_self_check();
 
-    gpui_platform::application().run(|cx| {
+    gpui_platform::application()
+        .with_assets(assets::Assets)
+        .run(|cx| {
         // Brand the macOS Dock with our app icon (runtime call; works for the bare
         // `cargo run` binary that has no `.app` bundle). Main thread, no-op elsewhere.
         icon::set_app_icon();
@@ -229,29 +237,32 @@ fn main() {
         // Executor stack (outer → inner): phase verb (request_phase) → http_request →
         // run verbs → the shell-backed run_with_coverage. Each layer handles its own
         // verbs and delegates the rest.
-        let actor: Arc<dyn McpActor> = Arc::new(ActorService::new(
-            Arc::new(DefaultPdp),
-            mcp_policy.clone(),
-            Arc::new(phase_verbs::PhaseVerbExecutor::new(
-                commands.clone(),
+        let actor: Arc<dyn McpActor> = Arc::new(
+            ActorService::new(
+                Arc::new(DefaultPdp),
                 mcp_policy.clone(),
-                Arc::new(http_verbs::HttpVerbExecutor::new(
-                    http_history.clone(),
-                    Arc::new(run_verbs::RunVerbExecutor::new(
-                        run_registry.clone(),
-                        Arc::new(ShellVerbExecutor::new(mcp_test_command())),
+                Arc::new(phase_verbs::PhaseVerbExecutor::new(
+                    commands.clone(),
+                    mcp_policy.clone(),
+                    Arc::new(http_verbs::HttpVerbExecutor::new(
+                        http_history.clone(),
+                        Arc::new(run_verbs::RunVerbExecutor::new(
+                            run_registry.clone(),
+                            Arc::new(ShellVerbExecutor::new(mcp_test_command())),
+                        )),
                     )),
                 )),
-            )),
-            Arc::new(StoreAuditSink::new(store.clone())),
-            // `None` = hold MCP-verb approvals until the operator decides (no auto-deny
-            // — a human approval must not be rushed; see KeystoneApprovalGate).
-            Arc::new(KeystoneApprovalGate::new(
-                pending.clone(),
-                notifier.clone(),
-                None,
-            )),
-        ).with_auto_phase(auto_phase.clone()));
+                Arc::new(StoreAuditSink::new(store.clone())),
+                // `None` = hold MCP-verb approvals until the operator decides (no auto-deny
+                // — a human approval must not be rushed; see KeystoneApprovalGate).
+                Arc::new(KeystoneApprovalGate::new(
+                    pending.clone(),
+                    notifier.clone(),
+                    None,
+                )),
+            )
+            .with_auto_phase(auto_phase.clone()),
+        );
         let mcp_host = McpHostHandle::build(McpHost::new(actor, mcp_policy));
 
         // Clones the engine loop owns: it resolves held approvals against `pending`
@@ -791,7 +802,20 @@ fn run_hook_agy() {
 
     match response {
         HookResponse::Deny { reason } => {
-            println!("{}", serde_json::json!({ "decision": "deny", "systemMessage": reason }));
+            // AGY's hook block schema is Claude's **classic** PreToolUse form:
+            // `{"decision":"block","reason":…}`. NOT `{"decision":"deny",…}` — AGY does
+            // not recognize "deny" and falls through to allow, so the tool would run.
+            // `decision:"block"` is the load-bearing field; we carry the message in BOTH
+            // `reason` (the binary's struct tag) and `systemMessage` (what OMA's hooks
+            // emit) so it surfaces whichever AGY reads — extra keys are ignored.
+            println!(
+                "{}",
+                serde_json::json!({
+                    "decision": "block",
+                    "reason": &reason,
+                    "systemMessage": &reason,
+                })
+            );
         }
         HookResponse::Allow => emit_agy_allow(),
     }
@@ -800,7 +824,7 @@ fn run_hook_agy() {
 /// AGY's allow verdict. Emitted explicitly (AGY's own hooks do too) on the allow path
 /// and on every fail-open error, so a broken or absent MoonlightCode never blocks `agy`.
 fn emit_agy_allow() {
-    println!("{}", serde_json::json!({ "decision": "allow", "systemMessage": "" }));
+    println!("{}", serde_json::json!({ "decision": "allow" }));
 }
 
 /// CC's `statusLine` command for an app-launched session: read the statusline JSON
@@ -969,9 +993,6 @@ mod tests {
         // …the held call is approved…
         assert_eq!(hook_rx.try_recv().unwrap(), Decision::Approve);
         // …and the pattern is vouched in the runtime overlay for the rest of the session.
-        assert!(runtime_safe
-            .read()
-            .unwrap()
-            .contains("mcp__phoenix__*"));
+        assert!(runtime_safe.read().unwrap().contains("mcp__phoenix__*"));
     }
 }

@@ -29,6 +29,8 @@ use crate::{file_age, read_tail};
 
 const DEFAULT_LIVENESS_WINDOW: Duration = Duration::from_secs(20);
 const DEFAULT_STALL_WINDOW: Duration = Duration::from_secs(180);
+/// See [`crate::DEFAULT_DONE_WINDOW`] — a finished turn quiet this long cools to `Idle`.
+const DEFAULT_DONE_WINDOW: Duration = Duration::from_secs(120);
 
 /// Per-conversation tail state (a lean cousin of the Claude `FileState`).
 #[derive(Default)]
@@ -56,7 +58,10 @@ pub fn title_for_agy_line(line: &str) -> Option<String> {
     }
     let content = raw.get("content").and_then(|v| v.as_str())?;
     // Pull the text between the request tags; fall back to the raw content if unwrapped.
-    let request = match (content.find("<USER_REQUEST>"), content.find("</USER_REQUEST>")) {
+    let request = match (
+        content.find("<USER_REQUEST>"),
+        content.find("</USER_REQUEST>"),
+    ) {
         (Some(s), Some(e)) if e > s => &content[s + "<USER_REQUEST>".len()..e],
         _ => content,
     };
@@ -97,6 +102,7 @@ pub struct AntigravityDetectionSource {
     active_window: Duration,
     liveness_window: Duration,
     stall_window: Duration,
+    done_window: Duration,
     state: Mutex<HashMap<String, AgyState>>,
 }
 
@@ -107,12 +113,18 @@ impl AntigravityDetectionSource {
             active_window,
             liveness_window: DEFAULT_LIVENESS_WINDOW,
             stall_window: DEFAULT_STALL_WINDOW,
+            done_window: DEFAULT_DONE_WINDOW,
             state: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn with_liveness_window(mut self, window: Duration) -> Self {
         self.liveness_window = window;
+        self
+    }
+
+    pub fn with_done_window(mut self, window: Duration) -> Self {
+        self.done_window = window;
         self
     }
 
@@ -123,7 +135,9 @@ impl AntigravityDetectionSource {
 
     /// The transcript path for a conversation directory.
     fn transcript_of(dir: &Path) -> PathBuf {
-        dir.join(".system_generated").join("logs").join("transcript.jsonl")
+        dir.join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl")
     }
 
     /// `(conversationId, transcript_path)` for every conversation whose transcript was
@@ -200,7 +214,9 @@ impl DetectionSource for AntigravityDetectionSource {
             let id = SessionId::new(sid.clone());
             if !entry.discovered {
                 entry.discovered = true;
-                out.push(DetectionEvent::Discovered { session: id.clone() });
+                out.push(DetectionEvent::Discovered {
+                    session: id.clone(),
+                });
             }
 
             for line in text.lines() {
@@ -221,7 +237,7 @@ impl DetectionSource for AntigravityDetectionSource {
 
             // Recompute live status every poll against the file's recency.
             let age = file_age(path);
-            let desired = status_for(entry.last_turn, age, self.liveness_window);
+            let desired = status_for(entry.last_turn, age, self.liveness_window, self.done_window);
             if entry.status != Some(desired) {
                 entry.status = Some(desired);
                 out.push(DetectionEvent::StatusChanged {
@@ -234,8 +250,7 @@ impl DetectionSource for AntigravityDetectionSource {
             // we use the **conservative** rule: only a handed `User` turn that then goes
             // silent past the stall window counts (an `Assistant` quiet period is a
             // normal end-of-turn — flagging it would false-positive). Edge-emitted.
-            let stalled =
-                matches!(entry.last_turn, Some(Turn::User)) && age >= self.stall_window;
+            let stalled = matches!(entry.last_turn, Some(Turn::User)) && age >= self.stall_window;
             if stalled && !entry.alerted {
                 entry.alerted = true;
                 out.push(DetectionEvent::Alert {
@@ -291,9 +306,18 @@ mod tests {
 
     #[test]
     fn turn_mapping_covers_the_agy_vocabulary() {
-        assert_eq!(turn_for_agy_line(r#"{"type":"USER_INPUT","source":"USER_EXPLICIT"}"#), Some(Turn::User));
-        assert_eq!(turn_for_agy_line(r#"{"type":"PLANNER_RESPONSE","source":"MODEL"}"#), Some(Turn::Assistant));
-        assert_eq!(turn_for_agy_line(r#"{"type":"RUN_COMMAND"}"#), Some(Turn::Assistant));
+        assert_eq!(
+            turn_for_agy_line(r#"{"type":"USER_INPUT","source":"USER_EXPLICIT"}"#),
+            Some(Turn::User)
+        );
+        assert_eq!(
+            turn_for_agy_line(r#"{"type":"PLANNER_RESPONSE","source":"MODEL"}"#),
+            Some(Turn::Assistant)
+        );
+        assert_eq!(
+            turn_for_agy_line(r#"{"type":"RUN_COMMAND"}"#),
+            Some(Turn::Assistant)
+        );
         // Bookkeeping / errors carry no turn.
         assert_eq!(turn_for_agy_line(r#"{"type":"CHECKPOINT"}"#), None);
         assert_eq!(turn_for_agy_line(r#"{"type":"ERROR_MESSAGE"}"#), None);
@@ -304,13 +328,22 @@ mod tests {
     #[test]
     fn title_comes_from_the_first_user_request() {
         let line = r#"{"type":"USER_INPUT","content":"<USER_REQUEST>\nRefactor the auth module\n</USER_REQUEST>\n<ADDITIONAL_METADATA>noise</ADDITIONAL_METADATA>"}"#;
-        assert_eq!(title_for_agy_line(line).as_deref(), Some("Refactor the auth module"));
+        assert_eq!(
+            title_for_agy_line(line).as_deref(),
+            Some("Refactor the auth module")
+        );
         // Non-user records carry no title.
         assert_eq!(title_for_agy_line(r#"{"type":"PLANNER_RESPONSE"}"#), None);
         // Over-long requests are truncated to a tile label.
-        let long = format!("{{\"type\":\"USER_INPUT\",\"content\":\"{}\"}}", "word ".repeat(40));
+        let long = format!(
+            "{{\"type\":\"USER_INPUT\",\"content\":\"{}\"}}",
+            "word ".repeat(40)
+        );
         let t = title_for_agy_line(&long).unwrap();
-        assert!(t.chars().count() <= MAX_TITLE + 1 && t.ends_with('…'), "{t}");
+        assert!(
+            t.chars().count() <= MAX_TITLE + 1 && t.ends_with('…'),
+            "{t}"
+        );
     }
 
     #[tokio::test]
@@ -324,10 +357,13 @@ mod tests {
         let head = "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\nBuild the thing\\n</USER_REQUEST>\"}\n";
         write_transcript(&root, "conv-t", head);
         let events = source.poll().await.unwrap();
-        assert!(events.contains(&DetectionEvent::TitleObserved {
-            session: id.clone(),
-            title: "Build the thing".into(),
-        }), "{events:?}");
+        assert!(
+            events.contains(&DetectionEvent::TitleObserved {
+                session: id.clone(),
+                title: "Build the thing".into(),
+            }),
+            "{events:?}"
+        );
 
         // A second user request does NOT re-title (first request is the stable label).
         write_transcript(
@@ -336,7 +372,12 @@ mod tests {
             &format!("{head}{}", "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\nAnother\\n</USER_REQUEST>\"}\n"),
         );
         let delta = source.poll().await.unwrap();
-        assert!(!delta.iter().any(|e| matches!(e, DetectionEvent::TitleObserved { .. })), "{delta:?}");
+        assert!(
+            !delta
+                .iter()
+                .any(|e| matches!(e, DetectionEvent::TitleObserved { .. })),
+            "{delta:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -354,11 +395,16 @@ mod tests {
         let head = "{\"type\":\"USER_INPUT\",\"source\":\"USER_EXPLICIT\"}\n";
         write_transcript(&root, "conv-1", head);
         let events = source.poll().await.unwrap();
-        assert!(events.contains(&DetectionEvent::Discovered { session: id.clone() }));
-        assert!(events.contains(&DetectionEvent::StatusChanged {
-            session: id.clone(),
-            status: SessionStatus::Running,
-        }), "{events:?}");
+        assert!(events.contains(&DetectionEvent::Discovered {
+            session: id.clone()
+        }));
+        assert!(
+            events.contains(&DetectionEvent::StatusChanged {
+                session: id.clone(),
+                status: SessionStatus::Running,
+            }),
+            "{events:?}"
+        );
 
         // No new bytes ⇒ nothing emitted.
         assert!(source.poll().await.unwrap().is_empty());
@@ -367,7 +413,10 @@ mod tests {
         write_transcript(
             &root,
             "conv-1",
-            &format!("{head}{}", "{\"type\":\"PLANNER_RESPONSE\",\"source\":\"MODEL\"}\n"),
+            &format!(
+                "{head}{}",
+                "{\"type\":\"PLANNER_RESPONSE\",\"source\":\"MODEL\"}\n"
+            ),
         );
         let delta = source.poll().await.unwrap();
         assert_eq!(
@@ -392,10 +441,13 @@ mod tests {
 
         write_transcript(&root, "conv-stall", "{\"type\":\"USER_INPUT\"}\n");
         let events = source.poll().await.unwrap();
-        assert!(events.contains(&DetectionEvent::Alert {
-            session: id.clone(),
-            alert: Some(AttentionKind::Incomplete),
-        }), "{events:?}");
+        assert!(
+            events.contains(&DetectionEvent::Alert {
+                session: id.clone(),
+                alert: Some(AttentionKind::Incomplete),
+            }),
+            "{events:?}"
+        );
 
         // Edge-emitted: still stalled, no repeat.
         assert!(!source
@@ -412,7 +464,13 @@ mod tests {
             "{\"type\":\"USER_INPUT\"}\n{\"type\":\"PLANNER_RESPONSE\"}\n",
         );
         let delta = source.poll().await.unwrap();
-        assert!(delta.contains(&DetectionEvent::Alert { session: id, alert: None }), "{delta:?}");
+        assert!(
+            delta.contains(&DetectionEvent::Alert {
+                session: id,
+                alert: None
+            }),
+            "{delta:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

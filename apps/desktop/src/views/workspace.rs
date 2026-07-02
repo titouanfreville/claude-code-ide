@@ -24,9 +24,9 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use gpui::prelude::*;
 use gpui::{
-    div, px, App, Context, CursorStyle, Edges, Entity, Global, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, PromptLevel,
-    SharedString, WeakEntity, Window,
+    div, px, App, Context, CursorStyle, Edges, Entity, Focusable, FontWeight, Global, KeyBinding,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
+    PromptLevel, SharedString, WeakEntity, Window,
 };
 use gpui_component::dock::{
     register_panel, DockArea, DockAreaState, DockItem, DockPlacement, PanelInfo, PanelState,
@@ -48,13 +48,13 @@ use super::active_context::{ActiveContext, Eol};
 use super::active_editor::ActiveEditor;
 use super::center_requests::{CenterRequests, OpenRequest};
 use super::chrome_requests::{ChromeRequest, ChromeRequests};
+use super::edit_gate::EditGate;
 use super::editor_commands::{EditorCommand, EditorCommands};
+use super::grid_home::GridHome;
+use super::mcp_host::McpHostHandle;
 use super::notifications::{NotificationKind, Notifications};
 use super::obs_store::ObsStore;
 use super::open_tabs::{self, OpenTabsState, SpaceTabs};
-use super::edit_gate::EditGate;
-use super::grid_home::GridHome;
-use super::mcp_host::McpHostHandle;
 use super::panels::activity_rail::{activity_rail, RailSnapshot};
 use super::panels::code_editor::{CodeEditorPanel, FormatDocument, SaveFile};
 use super::panels::code_review::CodeReviewPanel;
@@ -63,19 +63,22 @@ use super::panels::db_grid::DbGridPanel;
 use super::panels::db_observer::DbObserverPanel;
 use super::panels::db_source::DataSource;
 use super::panels::file_tree::FileTreePanel;
-use super::panels::mcp_authorize::McpAuthorizePanel;
 use super::panels::plan_review::PlanReviewPanel;
 use super::panels::session_monitor::{attach_command, SessionMonitor};
 use super::panels::spaces::{space_tab_bar, SpaceTab};
-use super::panels::toolbar;
-use super::panels::status_bar::{self, LeftZone, NotifRow, ObsView, QuotaView, StatusSnapshot};
+use super::panels::status_bar::{
+    self, LeftZone, NotifRow, ObsView, QuotaView, StatusSnapshot,
+};
 use super::panels::structure::StructurePanel;
 use super::panels::terminal::TerminalPanel;
+use super::panels::toolbar;
 use super::project_space::{expand_home, ProjectSpace, SpaceId};
 use super::session_io::SessionIo;
 use super::session_meta::SessionMetaCache;
-use super::theme;
 use super::space_sessions::SpaceSession;
+use super::theme;
+use crate::views::run_config::{RunConfig, RunKind};
+use gpui_component::input::{Input, InputState};
 
 const DOCK_ID: &str = "moonlight-main";
 /// Bump when the default layout shape changes incompatibly; a persisted layout
@@ -126,6 +129,12 @@ pub struct ShellDeps {
     /// terminal (the Plan-review tab) can drive the session's CC TUI — e.g. send
     /// Enter to accept a plan's continuation (option 1 / auto). See [`SessionIo`].
     pub session_io: SessionIo,
+    /// UI-side registry of outstanding operator approvals (held MCP tool / phase change /
+    /// danger-zone command), keyed by session. Folded from the bus by the [`Workspace`]
+    /// so a [`SessionMonitor`](super::panels::session_monitor) opened *after* the one-shot
+    /// `ApprovalRequested` (e.g. via the bell notification) can rebuild its popup. See
+    /// [`Approvals`](super::approvals::Approvals).
+    pub approvals: super::approvals::Approvals,
     /// Observable cache of per-session display metadata (custom name + color). The
     /// focus view writes through it; the fleet grid observes it so a rename/recolor
     /// shows on tiles live without a per-render disk read. See [`SessionMetaCache`].
@@ -196,6 +205,7 @@ pub fn init_shell(
         obs_store,
         store,
         session_io: SessionIo::default(),
+        approvals: super::approvals::Approvals::default(),
         session_meta,
         mcp_host,
         run_registry,
@@ -277,7 +287,9 @@ pub fn init_shell(
             // Not managed: rehydrate as before — with a repo, offer resume (gated to
             // idle/done) once status arrives; without one, the read-only transcript.
             None => match info_root {
-                Some(root) => SessionMonitor::new_observed(id, None, root, deps.bus.subscribe(), cx),
+                Some(root) => {
+                    SessionMonitor::new_observed(id, None, root, deps.bus.subscribe(), cx)
+                }
                 None => SessionMonitor::new(id, None, deps.bus.subscribe(), cx),
             },
         });
@@ -401,8 +413,14 @@ pub struct Workspace {
     /// The bottom dock — composed at the **workspace level** rather than via
     /// gpui-component's `DockArea` (which renders the side docks *outside* the bottom
     /// one), so it spans the **full width** beneath the left dock: the priority surface
-    /// for the terminal today, run logs / services to come. Holds the terminal panel.
-    terminal: Entity<TerminalPanel>,
+    /// for the terminal today, run logs / services to come.
+    ///
+    /// The terminal is **per space**: each space owns its own pinned terminal (shells
+    /// rooted at that space), so switching spaces shows that space's shells instead of
+    /// `cd`-ing one shared shell — which used to let spaces stomp on each other.
+    /// Keyed by the active space (`None` = Overview); lazily created on first render of
+    /// a space and pruned when its space is closed. See [`Self::ensure_space_terminal`].
+    space_terminals: HashMap<Option<SpaceId>, Entity<TerminalPanel>>,
     /// Whether the bottom dock is open, and its operator-resizable height (px).
     bottom_open: bool,
     bottom_height: f32,
@@ -441,6 +459,14 @@ pub struct Workspace {
     /// The operator-selected run target (the run config's command id). `None` →
     /// the active space's first detected target is the default. See [`run_config`].
     run_target: Option<String>,
+    /// Whether the Create Run Configuration modal is open.
+    show_create_run_config: bool,
+    /// Input state for the Run Config modal's custom label.
+    run_config_label_input: Option<Entity<InputState>>,
+    /// Input state for the Run Config modal's custom command.
+    run_config_command_input: Option<Entity<InputState>>,
+    /// Selected run kind for the custom run config.
+    run_config_kind: RunKind,
     /// Per-session root + status, folded from the engine bus. Drives the space
     /// tabs' attention dots: a space lights up when a session under its root is
     /// Waiting/Errored. (The fleet grid keeps its own richer model; this is just
@@ -491,9 +517,7 @@ impl Workspace {
             (
                 cx.new(|cx| FileTreePanel::new(Some(deps.focus.clone()), cx)),
                 cx.new(|cx| StructurePanel::new(Some(deps.active_editor.clone()), cx)),
-                cx.new(|cx| {
-                    super::panels::commit::CommitPanel::new(Some(deps.focus.clone()), cx)
-                }),
+                cx.new(|cx| super::panels::commit::CommitPanel::new(Some(deps.focus.clone()), cx)),
             )
         };
         // The DB overview tool window is workspace-owned too, so file-tree opens and the
@@ -606,6 +630,9 @@ impl Workspace {
         {
             let center = center.clone();
             let notifications = cx.global::<ShellDeps>().notifications.clone();
+            // Retain outstanding approval holds so a monitor opened after the one-shot
+            // `ApprovalRequested` can rebuild its popup (see `approvals` module).
+            let approvals = cx.global::<ShellDeps>().approvals.clone();
             let mut rx = cx.global::<ShellDeps>().bus.subscribe();
             cx.spawn(async move |this, cx| {
                 let mut roots: HashMap<SessionId, Option<PathBuf>> = HashMap::new();
@@ -624,6 +651,13 @@ impl Workspace {
                         Ok(EngineEvent::SessionUpserted { session }) => {
                             let id = session.id.clone();
                             let label = session.label().to_string();
+                            // A full row that no longer shows the session blocked means
+                            // any held approval was resolved elsewhere — drop the retained
+                            // hold so a reopened monitor doesn't rebuild a stale popup
+                            // (mirrors `SessionMonitor::apply_event`).
+                            if session.status != SessionStatus::WaitingInput {
+                                approvals.clear(&id);
+                            }
                             labels.insert(id.clone(), label.clone());
                             roots.insert(
                                 id.clone(),
@@ -668,14 +702,19 @@ impl Workspace {
                             }
                         }
                         Ok(EngineEvent::PlanProposed { session, plan }) => {
-                            let text = format!("Plan proposed · {}", notif_label(&labels, &session));
+                            let text =
+                                format!("Plan proposed · {}", notif_label(&labels, &session));
                             notifications.update(cx, |n, cx| {
                                 n.push(NotificationKind::Approval, text, Some(session.clone()));
                                 cx.notify();
                             });
                             let root = roots.get(&session).cloned().flatten();
                             center.update(cx, |_center, cx| {
-                                cx.emit(OpenRequest::PlanReview { session, plan, root });
+                                cx.emit(OpenRequest::PlanReview {
+                                    session,
+                                    plan,
+                                    root,
+                                });
                             });
                         }
                         Ok(EngineEvent::SummaryObserved { session, summary }) => {
@@ -698,7 +737,11 @@ impl Workspace {
                                 });
                             });
                         }
-                        Ok(EngineEvent::ApprovalRequested { session, what, authorize_tool }) => {
+                        Ok(EngineEvent::ApprovalRequested {
+                            session,
+                            what,
+                            authorize_tool,
+                        }) => {
                             let text = match &authorize_tool {
                                 Some(tool) => {
                                     format!("Authorize {tool} · {}", notif_label(&labels, &session))
@@ -709,24 +752,38 @@ impl Workspace {
                                 n.push(NotificationKind::Approval, text, Some(session.clone()));
                                 cx.notify();
                             });
-                            // An external-MCP authorization opens the dedicated once/always/
-                            // refuse panel in the requesting session's space.
-                            if let Some(tool) = authorize_tool {
-                                let root = roots.get(&session).cloned().flatten();
-                                center.update(cx, |_center, cx| {
-                                    cx.emit(OpenRequest::McpAuthorize { session, tool, root });
-                                });
-                            }
+                            // Retain the hold so a monitor opened later (via the bell
+                            // notification / a space switch) can rebuild the popup — the
+                            // one-shot event below reaches only monitors mounted right now.
+                            approvals.set(
+                                session.clone(),
+                                crate::views::approvals::ApprovalHold {
+                                    what: what.clone(),
+                                    tool: authorize_tool.clone(),
+                                },
+                            );
+                            // The verdict UI (external-MCP tool + sensitive phase change)
+                            // is the session's own bottom-right authorization popup,
+                            // driven by its `SessionMonitor` bus subscription — no center
+                            // tab is opened here. See `SessionMonitor::authorize_popup`.
                         }
                         Ok(EngineEvent::PhaseAdvanceRequested { session, to }) => {
-                            let text =
-                                format!("Advance to {} · {}", to.label(), notif_label(&labels, &session));
+                            let text = format!(
+                                "Advance to {} · {}",
+                                to.label(),
+                                notif_label(&labels, &session)
+                            );
                             notifications.update(cx, |n, cx| {
                                 n.push(NotificationKind::Advance, text, Some(session));
                                 cx.notify();
                             });
                         }
                         Ok(EngineEvent::SessionStateChanged { session, status }) => {
+                            // A resume (any status but WaitingInput) means an outstanding
+                            // authorization hold was resolved — drop the retained copy.
+                            if status != SessionStatus::WaitingInput {
+                                approvals.clear(&session);
+                            }
                             // Keep the attention slice live on thin status updates
                             // (root from the last full upsert, if one was seen).
                             let root = roots.get(&session).cloned().flatten();
@@ -759,11 +816,14 @@ impl Workspace {
                             }
                         }
                         Ok(EngineEvent::PhaseTransitioned { session, phase }) => {
+                            // A phase move resolves a pending phase-change approval.
+                            approvals.clear(&session);
                             // Thin phase update (some engine paths use this instead of a
                             // full SessionUpserted). Dedupes against the same map.
                             if let Some(prev) = phases.insert(session.clone(), phase) {
                                 let label = notif_label(&labels, &session);
-                                if let Some((kind, text)) = phase_notification(prev, phase, &label) {
+                                if let Some((kind, text)) = phase_notification(prev, phase, &label)
+                                {
                                     notifications.update(cx, |n, cx| {
                                         n.push(kind, text, Some(session));
                                         cx.notify();
@@ -772,6 +832,8 @@ impl Workspace {
                             }
                         }
                         Ok(EngineEvent::SessionRemoved { session }) => {
+                            // Forgotten session: drop any retained approval hold too.
+                            approvals.clear(&session);
                             // Forgotten session: drop its attention entry so a stale
                             // dot doesn't keep a space lit.
                             let _ = this.update(cx, |ws, cx| {
@@ -787,7 +849,8 @@ impl Workspace {
                             let _ = this.update(cx, |ws, cx| {
                                 let changed = match alert {
                                     Some(kind) => {
-                                        ws.session_alerts.insert(session.clone(), kind) != Some(kind)
+                                        ws.session_alerts.insert(session.clone(), kind)
+                                            != Some(kind)
                                     }
                                     None => ws.session_alerts.remove(&session).is_some(),
                                 };
@@ -828,7 +891,8 @@ impl Workspace {
         cx.observe(&active_context, |this, ac, cx| {
             if let crate::views::active_context::ActiveContext::Session { id, .. } = ac.read(cx) {
                 let key = format!("session:{}", id.as_str());
-                this.space_active_tab.insert(this.current_space.clone(), key);
+                this.space_active_tab
+                    .insert(this.current_space.clone(), key);
             }
             cx.notify();
         })
@@ -913,6 +977,9 @@ impl Workspace {
         // Poll the statusline-fed Claude-obs directory into the read-model on a slow
         // timer (off the engine path); re-render the bar when it changes.
         let obs_store = cx.global::<ShellDeps>().obs_store.clone();
+        // Managed-session store, for resolving each AGY session's model from its own
+        // transcript (keyed by our managed id via a root→conversationId bridge).
+        let managed_store = cx.global::<ShellDeps>().store.clone();
         cx.observe(&obs_store, |_this, _o, cx| cx.notify()).detach();
         let mut tick: u64 = 0;
         cx.spawn(async move |this, cx| loop {
@@ -925,11 +992,25 @@ impl Workspace {
             // (self-fetched from Anthropic), so refresh it on the first tick and every
             // ~2 min thereafter.
             let do_quota = tick % 100 == 0;
+            // Managed AGY sessions `(managed_id, root)` — the bridge input for resolving
+            // each one's model from AGY's own transcript (see `obs::agy_models`).
+            let managed_agy: Vec<(String, String)> = managed_store
+                .all_managed()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| m.agent == moonlight_domain::AgentKind::Antigravity)
+                .filter_map(|m| m.root.map(|r| (m.id.as_str().to_string(), r)))
+                .collect();
             let (loaded, quota) = cx
                 .background_executor()
                 .spawn(async move {
                     let q = do_quota.then(crate::obs::quota).flatten();
-                    (crate::obs::load_all(), q)
+                    // Claude obs (statusline JSON) + AGY models (from AGY's own transcript,
+                    // keyed by our managed id) into the one read-model, so the bar shows
+                    // each session's backend-correct model. No third-party cache.
+                    let mut loaded = crate::obs::load_all();
+                    loaded.extend(crate::obs::agy_models(&managed_agy));
+                    (loaded, q)
                 })
                 .await;
             obs_store.update(cx, |s, cx| {
@@ -952,8 +1033,6 @@ impl Workspace {
         // The bottom dock's tools are owned here (not by the DockArea) so the dock can
         // span the full width beneath the left dock: the terminal + the Run console
         // (the latter polling the shared run registry).
-        let focus = cx.global::<ShellDeps>().focus.clone();
-        let terminal = cx.new(|cx| TerminalPanel::new(Some(focus), cx));
         let registry = cx.global::<ShellDeps>().run_registry.clone();
         let run_console =
             cx.new(|cx| super::panels::run_console::RunConsolePanel::new(registry, window, cx));
@@ -969,8 +1048,7 @@ impl Workspace {
         // The Problems view (fourth bottom tool): diagnostics off the shared LSP
         // pool. Observed so its stripe lamp (chrome) updates when counts change.
         let lsp_pool = cx.global::<ShellDeps>().lsp_pool.clone();
-        let problems =
-            cx.new(|cx| super::panels::problems::ProblemsPanel::new(lsp_pool, cx));
+        let problems = cx.new(|cx| super::panels::problems::ProblemsPanel::new(lsp_pool, cx));
         cx.observe(&problems, |_, _, cx| cx.notify()).detach();
         // The Git view (fifth bottom tool): repo log + the IDE's git-op console.
         let git_focus = cx.global::<ShellDeps>().focus.clone();
@@ -985,7 +1063,7 @@ impl Workspace {
             session_attention: HashMap::new(),
             session_alerts: HashMap::new(),
             pending_space_tabs: HashMap::new(),
-            terminal,
+            space_terminals: HashMap::new(),
             bottom_open: true,
             bottom_height: 240.,
             resize_anchor: None,
@@ -1004,6 +1082,10 @@ impl Workspace {
             branch_menu_open: false,
             run_menu_open: false,
             run_target: None,
+            show_create_run_config: false,
+            run_config_label_input: None,
+            run_config_command_input: None,
+            run_config_kind: RunKind::Run,
             last_saved_tabs: None,
             restore_done: false,
         };
@@ -1056,7 +1138,9 @@ impl Workspace {
             tracing::warn!(
                 "previous restore did not finish — skipping eager tab restore (safe mode)"
             );
-            if let Some(notifications) = cx.try_global::<ShellDeps>().map(|d| d.notifications.clone())
+            if let Some(notifications) = cx
+                .try_global::<ShellDeps>()
+                .map(|d| d.notifications.clone())
             {
                 notifications.update(cx, |n, cx| {
                     n.push(
@@ -1308,7 +1392,35 @@ impl Workspace {
     /// its *own* tab bar — the terminal its shell tabs, the Run window its per-run
     /// onglets — so the dock adds no header of its own; switching tools happens on
     /// the activity rail (stripe buttons), JetBrains-style.
-    fn bottom_dock(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The dock terminal for the **current space**, creating it (pinned to that space's
+    /// root, `None` = Overview → cwd) on first use. Each space keeps its own terminal so
+    /// switching spaces reveals that space's own shells instead of re-`cd`-ing a single
+    /// shared shell. The entity is retained in `space_terminals`, so a space's shells
+    /// keep running while another space is shown, until the space is closed (pruned in
+    /// [`Self::prune_closed_spaces`]).
+    fn ensure_space_terminal(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
+        let key = self.current_space.clone();
+        if let Some(term) = self.space_terminals.get(&key) {
+            return term.clone();
+        }
+        let focus = cx.global::<ShellDeps>().focus.clone();
+        let cwd = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let root = match &key {
+            Some(id) => focus
+                .read(cx)
+                .spaces()
+                .iter()
+                .find(|s| &s.id == id)
+                .map(|s| s.root.clone())
+                .unwrap_or_else(cwd),
+            None => cwd(),
+        };
+        let term = cx.new(|cx| TerminalPanel::new_pinned(root, cx));
+        self.space_terminals.insert(key, term.clone());
+        term
+    }
+
+    fn bottom_dock(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex_none()
             .flex()
@@ -1329,7 +1441,8 @@ impl Workspace {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                            this.resize_anchor = Some((f32::from(ev.position.y), this.bottom_height));
+                            this.resize_anchor =
+                                Some((f32::from(ev.position.y), this.bottom_height));
                             cx.notify();
                         }),
                     ),
@@ -1337,7 +1450,7 @@ impl Workspace {
             // Frontmost tool window's body. Both entities stay alive; only the
             // frontmost renders (the terminal's PTY keeps running regardless).
             .child(div().flex_1().min_h_0().child(match self.bottom_tool {
-                BottomTool::Terminal => self.terminal.clone().into_any_element(),
+                BottomTool::Terminal => self.ensure_space_terminal(cx).into_any_element(),
                 BottomTool::Run => self.run_console.clone().into_any_element(),
                 BottomTool::Problems => self.problems.clone().into_any_element(),
                 BottomTool::Git => self.git.clone().into_any_element(),
@@ -1415,6 +1528,8 @@ impl Workspace {
         self.space_panels.retain(|k, _| live.contains(k));
         self.pending_space_tabs.retain(|k, _| live.contains(k));
         self.space_active_tab.retain(|k, _| live.contains(k));
+        // Drop a closed space's terminal too, shutting its shell(s) down.
+        self.space_terminals.retain(|k, _| live.contains(k));
     }
 
     /// Snapshot the open center tabs (per space) for the shutdown sidecar. For the
@@ -1543,7 +1658,12 @@ impl Workspace {
     /// Realize a space's lazily-restored tabs the first time it is switched to: rebuild
     /// each panel (resuming its terminal) into `space_panels` so the caller's mount step
     /// picks it up. A no-op once the space has no pending tabs.
-    fn realize_pending(&mut self, space: &Option<SpaceId>, window: &mut Window, cx: &mut Context<Self>) {
+    fn realize_pending(
+        &mut self,
+        space: &Option<SpaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(keys) = self.pending_space_tabs.remove(space) else {
             return;
         };
@@ -1748,10 +1868,13 @@ impl Workspace {
         // not typed into the operator's interactive Terminal tab.
         let registry = cx.global::<ShellDeps>().run_registry.clone();
         if let Err(err) = registry.start(&config.label, &config.command, root) {
-            cx.global::<ShellDeps>().notifications.clone().update(cx, |n, cx| {
-                n.push(NotificationKind::Error, format!("Run failed: {err}"), None);
-                cx.notify();
-            });
+            cx.global::<ShellDeps>()
+                .notifications
+                .clone()
+                .update(cx, |n, cx| {
+                    n.push(NotificationKind::Error, format!("Run failed: {err}"), None);
+                    cx.notify();
+                });
         }
         self.select_bottom_tool(BottomTool::Run, cx);
     }
@@ -1772,6 +1895,107 @@ impl Workspace {
         if let Some(id) = registry.find_by_command(&command) {
             registry.stop(id);
         }
+        cx.notify();
+    }
+
+    pub(crate) fn open_create_run_config_modal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_create_run_config = true;
+        let label_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Run Production"));
+        let command_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("e.g. cargo run --release"));
+
+        // Focus the name/label input immediately
+        label_input.focus_handle(cx).focus(window, cx);
+
+        self.run_config_label_input = Some(label_input);
+        self.run_config_command_input = Some(command_input);
+        self.run_config_kind = RunKind::Run;
+        cx.notify();
+    }
+
+    pub(crate) fn close_create_run_config_modal(&mut self, cx: &mut Context<Self>) {
+        self.show_create_run_config = false;
+        self.run_config_label_input = None;
+        self.run_config_command_input = None;
+        cx.notify();
+    }
+
+    pub(crate) fn save_create_run_config(&mut self, cx: &mut Context<Self>) {
+        let label = self
+            .run_config_label_input
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        let command = self
+            .run_config_command_input
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        let kind = self.run_config_kind;
+
+        if label.is_empty() || command.is_empty() {
+            cx.global::<ShellDeps>()
+                .notifications
+                .clone()
+                .update(cx, |n, cx| {
+                    n.push(
+                        NotificationKind::Error,
+                        "Name and Command cannot be empty".to_string(),
+                        None,
+                    );
+                    cx.notify();
+                });
+            return;
+        }
+
+        let root = self.project_space(cx).read(cx).root();
+        let mut custom_configs = crate::views::run_config::load_custom(&root);
+
+        // Add or replace the custom configuration by label
+        let new_config = RunConfig::new(&label, kind, &command);
+        custom_configs.retain(|c| c.label != label);
+        custom_configs.push(new_config);
+
+        if let Err(err) = crate::views::run_config::save_custom(&root, &custom_configs) {
+            cx.global::<ShellDeps>()
+                .notifications
+                .clone()
+                .update(cx, |n, cx| {
+                    n.push(
+                        NotificationKind::Error,
+                        format!("Failed to save run configs: {err}"),
+                        None,
+                    );
+                    cx.notify();
+                });
+            return;
+        }
+
+        // Set the saved config as the active target
+        self.run_target = Some(command);
+
+        cx.global::<ShellDeps>()
+            .notifications
+            .clone()
+            .update(cx, |n, cx| {
+                n.push(
+                    NotificationKind::Phase,
+                    format!("Saved configuration '{label}'"),
+                    None,
+                );
+                cx.notify();
+            });
+
+        self.close_create_run_config_modal(cx);
+    }
+
+    pub(crate) fn set_run_config_kind(&mut self, kind: RunKind, cx: &mut Context<Self>) {
+        self.run_config_kind = kind;
         cx.notify();
     }
 
@@ -1960,18 +2184,6 @@ impl Workspace {
             } => Arc::new(cx.new(|cx| {
                 CodeReviewPanel::new(session, root, summary, Some(deps.commands.clone()), cx)
             })),
-            OpenRequest::McpAuthorize { session, tool, .. } => Arc::new(cx.new(|cx| {
-                // Live hold: the session is paused on the external tool call, so open
-                // with the once/always/refuse buttons armed.
-                McpAuthorizePanel::new(
-                    session,
-                    tool,
-                    true,
-                    Some(deps.commands.clone()),
-                    deps.bus.subscribe(),
-                    cx,
-                )
-            })),
             OpenRequest::NewManagedSession { id, phase, agent } => {
                 // Launch the agent in the phase's permission mode: Plan ⇒ `--permission-mode
                 // plan`, everything else ⇒ `auto` (Discovery's no-edit posture is our
@@ -2103,7 +2315,10 @@ impl Workspace {
         dock.update(cx, |area, cx| {
             area.add_panel(panel.clone(), DockPlacement::Center, None, window, cx);
         });
-        self.space_panels.entry(space).or_default().insert(key, panel);
+        self.space_panels
+            .entry(space)
+            .or_default()
+            .insert(key, panel);
         // Persist immediately so a crash right after opening a tab still restores it
         // (the periodic saver would otherwise be the only writer until on-quit).
         self.persist_open_tabs_if_changed(cx);
@@ -2196,9 +2411,9 @@ fn build_center_panel(
                     Some(root) => Arc::new(cx.new(|cx| {
                         SessionMonitor::new_observed(id, None, root, deps.bus.subscribe(), cx)
                     })),
-                    None => {
-                        Arc::new(cx.new(|cx| SessionMonitor::new(id, None, deps.bus.subscribe(), cx)))
-                    }
+                    None => Arc::new(
+                        cx.new(|cx| SessionMonitor::new(id, None, deps.bus.subscribe(), cx)),
+                    ),
                 },
             }
         }
@@ -2230,7 +2445,6 @@ fn build_center_panel(
     Some(panel)
 }
 
-
 /// An empty string rendered as an em-dash (status-bar obs placeholder).
 fn blank_dash(s: &str) -> String {
     if s.is_empty() {
@@ -2255,12 +2469,14 @@ fn phase_notification(prev: Phase, new: Phase, label: &str) -> Option<(Notificat
 /// session errored. Other statuses (running/idle/done/paused) don't notify here.
 fn status_notification(status: SessionStatus, label: &str) -> Option<(NotificationKind, String)> {
     match status {
-        SessionStatus::WaitingInput => {
-            Some((NotificationKind::Input, format!("Needs your input · {label}")))
-        }
-        SessionStatus::Errored => {
-            Some((NotificationKind::Error, format!("Session errored · {label}")))
-        }
+        SessionStatus::WaitingInput => Some((
+            NotificationKind::Input,
+            format!("Needs your input · {label}"),
+        )),
+        SessionStatus::Errored => Some((
+            NotificationKind::Error,
+            format!("Session errored · {label}"),
+        )),
         _ => None,
     }
 }
@@ -2563,9 +2779,7 @@ impl Render for Workspace {
             left_tool: self.left_tool,
             // Structure is "on" when it's actually visible: dock open, Project
             // fronted, outline shown.
-            structure_open: left_open
-                && self.left_tool == LeftTool::Project
-                && self.structure_open,
+            structure_open: left_open && self.left_tool == LeftTool::Project && self.structure_open,
             bottom_open,
             bottom_tool: self.bottom_tool,
             // The Run stripe button's lamp: live blue while anything runs, then the
@@ -2643,7 +2857,11 @@ impl Render for Workspace {
                 run_label,
                 run_glyph,
                 run_running: active_cfg
-                    .map(|c| cx.global::<ShellDeps>().run_registry.command_running(c.id()))
+                    .map(|c| {
+                        cx.global::<ShellDeps>()
+                            .run_registry
+                            .command_running(c.id())
+                    })
                     .unwrap_or(false),
                 run_configs,
                 auto_phase: cx
@@ -2669,6 +2887,15 @@ impl Render for Workspace {
                 ActiveContext::Session { id, .. } => Some(id.clone()),
                 _ => None,
             };
+            // The Claude-observability cluster (model/quota/ctx) only applies to a Claude
+            // session. An AGY session (looked up from the managed store) doesn't feed it,
+            // so the bar shows an "AGY" marker instead of misleading Claude stats. No
+            // session / unknown ⇒ keep the cluster (account quota still relevant).
+            let obs_native = active_session
+                .as_ref()
+                .and_then(|id| cx.global::<ShellDeps>().store.managed(id).ok().flatten())
+                .map(|m| m.agent != moonlight_domain::AgentKind::Antigravity)
+                .unwrap_or(true);
             let left = match ac {
                 ActiveContext::None => LeftZone::Empty,
                 ActiveContext::File {
@@ -2746,6 +2973,7 @@ impl Render for Workspace {
                 unread,
                 quota,
                 obs,
+                obs_native,
             }
         };
 
@@ -2802,8 +3030,241 @@ impl Render for Workspace {
             )
             // Bottom: the JetBrains-style status bar.
             .child(status_bar::status_bar(status, cx))
+            .when(self.show_create_run_config, |d| {
+                if let Some(modal) = self.render_create_run_config_modal(window, cx) {
+                    d.child(modal)
+                } else {
+                    d
+                }
+            })
             .children(sheet_layer)
             .children(dialog_layer)
             .children(notification_layer)
+    }
+}
+
+impl Workspace {
+    fn render_create_run_config_modal(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<impl IntoElement> {
+        if !self.show_create_run_config {
+            return None;
+        }
+
+        let label_input = self.run_config_label_input.as_ref()?;
+        let command_input = self.run_config_command_input.as_ref()?;
+        let active_kind = self.run_config_kind;
+
+        // Render the backdrop spanning the entire window, catching clicks to close
+        let backdrop = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(theme::tint(theme::surface_void(), 0.65))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                // The centered modal box
+                div()
+                    .w(px(460.))
+                    .p_5()
+                    .rounded(theme::radius_md())
+                    .bg(theme::surface_overlay())
+                    .border_1()
+                    .border_color(theme::border_strong())
+                    .shadow(theme::overlay_shadow())
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    // Modal Title
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(theme::text_lg())
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme::text_primary())
+                                    .child("Create Run Configuration"),
+                            )
+                            .child(
+                                // Close "X" button
+                                div()
+                                    .id("close-run-config-modal")
+                                    .cursor_pointer()
+                                    .text_size(theme::text_sm())
+                                    .text_color(theme::text_muted())
+                                    .hover(|d| d.text_color(theme::text_primary()))
+                                    .child("✕")
+                                    .on_click(cx.listener(|this, _ev, _w, cx| {
+                                        this.close_create_run_config_modal(cx);
+                                    })),
+                            ),
+                    )
+                    // Config Name Input
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(theme::text_xs())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::text_secondary())
+                                    .child("Configuration Name"),
+                            )
+                            .child(Input::new(label_input)),
+                    )
+                    // Config Command Input
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(theme::text_xs())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::text_secondary())
+                                    .child("Shell Command"),
+                            )
+                            .child(Input::new(command_input)),
+                    )
+                    // Run Kind Selector
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1_5()
+                            .child(
+                                div()
+                                    .text_size(theme::text_xs())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::text_secondary())
+                                    .child("Configuration Type"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .gap_2()
+                                    .child(self.render_kind_btn(
+                                        RunKind::Run,
+                                        "▶ Run",
+                                        active_kind == RunKind::Run,
+                                        cx,
+                                    ))
+                                    .child(self.render_kind_btn(
+                                        RunKind::Build,
+                                        "⚒ Build",
+                                        active_kind == RunKind::Build,
+                                        cx,
+                                    ))
+                                    .child(self.render_kind_btn(
+                                        RunKind::Test,
+                                        "✓ Test",
+                                        active_kind == RunKind::Test,
+                                        cx,
+                                    )),
+                            ),
+                    )
+                    // Dialog Footer / Actions (Save, Cancel)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                // Cancel Button
+                                div()
+                                    .id("btn-cancel-run-config")
+                                    .cursor_pointer()
+                                    .px_3()
+                                    .py_1_5()
+                                    .rounded(theme::radius_sm())
+                                    .text_size(theme::text_sm())
+                                    .text_color(theme::text_secondary())
+                                    .hover(|d| d.bg(theme::row_hover()))
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _ev, _w, cx| {
+                                        this.close_create_run_config_modal(cx);
+                                    })),
+                            )
+                            .child(
+                                // Save Button (Accent Highlight)
+                                div()
+                                    .id("btn-save-run-config")
+                                    .cursor_pointer()
+                                    .px_4()
+                                    .py_1_5()
+                                    .rounded(theme::radius_sm())
+                                    .bg(theme::accent())
+                                    .hover(|d| d.bg(theme::accent_hover()))
+                                    .text_size(theme::text_sm())
+                                    .text_color(theme::on_accent())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child("Save Configuration")
+                                    .on_click(cx.listener(|this, _ev, _w, cx| {
+                                        this.save_create_run_config(cx);
+                                    })),
+                            ),
+                    ),
+            );
+
+        Some(backdrop)
+    }
+
+    fn render_kind_btn(
+        &self,
+        kind: RunKind,
+        label: &'static str,
+        active: bool,
+        cx: &mut Context<Workspace>,
+    ) -> impl IntoElement {
+        let bg = if active {
+            theme::tint(theme::accent(), 0.14)
+        } else {
+            theme::surface_raised()
+        };
+        let border_color = if active {
+            theme::accent()
+        } else {
+            theme::border_subtle()
+        };
+        let text_color = if active {
+            theme::accent()
+        } else {
+            theme::text_secondary()
+        };
+
+        div()
+            .id(SharedString::from(format!("kind-btn-{}", label)))
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_1()
+            .py_2()
+            .rounded(theme::radius_sm())
+            .border_1()
+            .border_color(border_color)
+            .bg(bg)
+            .text_color(text_color)
+            .text_size(theme::text_sm())
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .hover(|d| if !active { d.bg(theme::row_hover()) } else { d })
+            .on_click(cx.listener(move |this, _ev, _w, cx| {
+                this.set_run_config_kind(kind, cx);
+            }))
+            .child(label)
     }
 }

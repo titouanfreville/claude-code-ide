@@ -156,8 +156,7 @@ pub fn load_manifest(root: &Path) -> HttpManifest {
 pub fn save_manifest(root: &Path, manifest: &HttpManifest) -> std::io::Result<()> {
     let dir = http_dir(root);
     std::fs::create_dir_all(&dir)?;
-    let text = serde_json::to_string_pretty(manifest)
-        .map_err(std::io::Error::other)?;
+    let text = serde_json::to_string_pretty(manifest).map_err(std::io::Error::other)?;
     std::fs::write(dir.join("environments.json"), text)
 }
 
@@ -194,8 +193,7 @@ pub fn load_requests(root: &Path) -> HttpRequests {
 pub fn save_requests(root: &Path, reqs: &HttpRequests) -> std::io::Result<()> {
     let dir = http_dir(root);
     std::fs::create_dir_all(&dir)?;
-    let text = serde_json::to_string_pretty(reqs)
-        .map_err(std::io::Error::other)?;
+    let text = serde_json::to_string_pretty(reqs).map_err(std::io::Error::other)?;
     std::fs::write(dir.join("requests.json"), text)
 }
 
@@ -236,7 +234,9 @@ fn form_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -455,13 +455,19 @@ mod tests {
             "http://localhost:8080/users/42"
         );
         // Unknown var stays literal so it's visible in the request.
-        assert_eq!(interpolate("{{base_url}}/{{missing}}", &v), "http://localhost:8080/{{missing}}");
+        assert_eq!(
+            interpolate("{{base_url}}/{{missing}}", &v),
+            "http://localhost:8080/{{missing}}"
+        );
     }
 
     #[test]
     fn host_of_extracts_authority() {
         assert_eq!(host_of("http://localhost:8080/x?y=1"), "localhost");
-        assert_eq!(host_of("https://user:pw@Api.Example.com/v1"), "api.example.com");
+        assert_eq!(
+            host_of("https://user:pw@Api.Example.com/v1"),
+            "api.example.com"
+        );
         assert_eq!(host_of("http://10.0.0.5"), "10.0.0.5");
     }
 
@@ -488,8 +494,10 @@ mod tests {
 
     #[test]
     fn parse_payload_accepts_json_and_bare_url() {
-        let j = parse_payload(r#"{"method":"post","url":"{{base}}/login","headers":{"X-A":"1"},"body":"hi"}"#)
-            .unwrap();
+        let j = parse_payload(
+            r#"{"method":"post","url":"{{base}}/login","headers":{"X-A":"1"},"body":"hi"}"#,
+        )
+        .unwrap();
         assert_eq!(j.method, "POST");
         assert_eq!(j.url, "{{base}}/login");
         assert_eq!(j.headers, vec![("X-A".to_string(), "1".to_string())]);
@@ -544,8 +552,14 @@ mod tests {
         assert_eq!(h.len(), HISTORY_CAP); // capped
         let recent = h.recent(3);
         // Newest first; the oldest 5 were dropped.
-        assert_eq!(recent[0].url, format!("http://localhost/{}", HISTORY_CAP + 4));
-        assert_eq!(recent[2].url, format!("http://localhost/{}", HISTORY_CAP + 2));
+        assert_eq!(
+            recent[0].url,
+            format!("http://localhost/{}", HISTORY_CAP + 4)
+        );
+        assert_eq!(
+            recent[2].url,
+            format!("http://localhost/{}", HISTORY_CAP + 2)
+        );
     }
 
     #[test]
@@ -602,7 +616,10 @@ mod tests {
         // Save + reload manifest (active env persists).
         let mut envs = BTreeMap::new();
         envs.insert("local".to_string(), HttpEnv::default());
-        let manifest = HttpManifest { active: "local".into(), environments: envs };
+        let manifest = HttpManifest {
+            active: "local".into(),
+            environments: envs,
+        };
         save_manifest(&root, &manifest).unwrap();
         let m = load_manifest(&root);
         assert_eq!(m.active_name().as_deref(), Some("local"));

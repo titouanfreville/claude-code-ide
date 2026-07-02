@@ -102,7 +102,9 @@ impl AiWorkspace {
     /// is either an exact tool name or a trailing-`*` glob vouching a whole server's
     /// tools (`mcp__phoenix__*` matches `mcp__phoenix__run_select_query`).
     pub fn is_safe_tool(&self, tool_name: &str) -> bool {
-        self.safe_tools.iter().any(|t| safe_tool_matches(t, tool_name))
+        self.safe_tools
+            .iter()
+            .any(|t| safe_tool_matches(t, tool_name))
     }
 
     /// Layer `user` then `workspace` config over the built-in [`DEFAULT_AI_ROOTS`].
@@ -139,6 +141,17 @@ impl AiWorkspace {
     pub fn scope_of(&self, path: &str, cwd: &str) -> WriteScope {
         let rel = repo_relative(path, cwd);
         let abs = absolutize(path, cwd);
+        // OS temp dirs sit outside the working tree — a write there can never change
+        // project state or a deliverable, so it stays writable in *every* phase
+        // (including the Commit gate). Checked first, and never subject to config: an
+        // agent must always have somewhere to drop a report / scratch file. Guarded on
+        // "outside the repo" so a repo that itself lives under /tmp (throwaway clones,
+        // CI) keeps its normal project freeze — only writes *outside* cwd are ephemeral.
+        let cwd_trimmed = cwd.trim_end_matches('/');
+        let inside_repo = !cwd_trimmed.is_empty() && is_under(&abs, cwd_trimmed);
+        if !inside_repo && temp_roots().iter().any(|root| is_under(&abs, root)) {
+            return WriteScope::Ephemeral;
+        }
         let hit = self.roots.iter().any(|root| match absolute_root(root) {
             Some(abs_root) => is_under(&abs, &abs_root),
             None => is_under(&rel, root),
@@ -149,6 +162,22 @@ impl AiWorkspace {
             WriteScope::Project
         }
     }
+}
+
+/// Absolute OS temp roots that stay writable in every phase. `/tmp` and its macOS
+/// canonical `/private/tmp` (a `/tmp` symlink; tool inputs and the harness scratchpad
+/// both surface as `/private/tmp/...`), plus `$TMPDIR` when set (macOS per-user temp,
+/// `/var/folders/...`). Always present — not replaceable by `.moonlight/config.json`,
+/// so the freeze can never take away the agent's scratch space.
+fn temp_roots() -> Vec<String> {
+    let mut roots = vec!["/tmp".to_string(), "/private/tmp".to_string()];
+    if let Ok(tmp) = std::env::var("TMPDIR") {
+        let tmp = tmp.trim_end_matches('/');
+        if !tmp.is_empty() && tmp != "/" {
+            roots.push(tmp.to_string());
+        }
+    }
+    roots
 }
 
 /// Expand a `~/`-anchored or absolute root to its absolute form; `None` for a
@@ -265,7 +294,10 @@ mod tests {
     #[test]
     fn relative_paths_and_dot_slash_resolve() {
         let ai = ai();
-        assert_eq!(ai.scope_of(".ai/notes.md", "/repo"), WriteScope::AiWorkspace);
+        assert_eq!(
+            ai.scope_of(".ai/notes.md", "/repo"),
+            WriteScope::AiWorkspace
+        );
         assert_eq!(ai.scope_of("./docs/x.md", "/repo"), WriteScope::AiWorkspace);
         assert_eq!(ai.scope_of("src/main.rs", "/repo"), WriteScope::Project);
     }
@@ -274,15 +306,55 @@ mod tests {
     fn prefix_lookalikes_are_not_workspace() {
         let ai = ai();
         // `.airtight` / `docsource` must not match `.ai` / `docs` as a dir prefix.
-        assert_eq!(ai.scope_of("/repo/.airtight/x", "/repo"), WriteScope::Project);
-        assert_eq!(ai.scope_of("/repo/docsource/x", "/repo"), WriteScope::Project);
+        assert_eq!(
+            ai.scope_of("/repo/.airtight/x", "/repo"),
+            WriteScope::Project
+        );
+        assert_eq!(
+            ai.scope_of("/repo/docsource/x", "/repo"),
+            WriteScope::Project
+        );
     }
 
     #[test]
     fn path_outside_repo_is_project() {
         let ai = ai();
         assert_eq!(ai.scope_of("/etc/hosts", "/repo"), WriteScope::Project);
-        assert_eq!(ai.scope_of("/tmp/.ai/x", "/repo"), WriteScope::Project);
+    }
+
+    #[test]
+    fn os_temp_dirs_are_ephemeral_in_every_phase() {
+        let ai = ai();
+        // OS temp is scratch outside the tree — always writable, never Project/AiWorkspace.
+        for p in [
+            "/tmp/report.md",
+            "/tmp/.ai/x",
+            "/private/tmp/claude-503/scratch/notes.md",
+        ] {
+            assert_eq!(ai.scope_of(p, "/repo"), WriteScope::Ephemeral, "{p}");
+        }
+        // A `/tmp`-lookalike dir is NOT temp (dir-prefix match, not substring).
+        assert_eq!(ai.scope_of("/tmpfoo/x", "/repo"), WriteScope::Project);
+    }
+
+    #[test]
+    fn repo_under_tmp_keeps_its_project_freeze() {
+        // If the working repo itself lives under /tmp, its own files must NOT become
+        // ephemeral (that would bypass the freeze) — only writes *outside* cwd are.
+        let ai = ai();
+        assert_eq!(
+            ai.scope_of("/tmp/myrepo/src/main.rs", "/tmp/myrepo"),
+            WriteScope::Project
+        );
+        assert_eq!(
+            ai.scope_of("/tmp/myrepo/.ai/notes.md", "/tmp/myrepo"),
+            WriteScope::AiWorkspace
+        );
+        // A temp write outside that repo is still ephemeral.
+        assert_eq!(
+            ai.scope_of("/tmp/other/scratch.md", "/tmp/myrepo"),
+            WriteScope::Ephemeral
+        );
     }
 
     #[test]
@@ -312,8 +384,14 @@ mod tests {
     #[test]
     fn absolute_roots_match_absolutely() {
         let ai = AiWorkspace::new(["/var/ai-scratch".to_string(), ".ai".to_string()]);
-        assert_eq!(ai.scope_of("/var/ai-scratch/x.md", "/repo"), WriteScope::AiWorkspace);
-        assert_eq!(ai.scope_of("/var/ai-scratchier/x", "/repo"), WriteScope::Project);
+        assert_eq!(
+            ai.scope_of("/var/ai-scratch/x.md", "/repo"),
+            WriteScope::AiWorkspace
+        );
+        assert_eq!(
+            ai.scope_of("/var/ai-scratchier/x", "/repo"),
+            WriteScope::Project
+        );
         // Repo-relative roots still work alongside.
         assert_eq!(ai.scope_of("/repo/.ai/x", "/repo"), WriteScope::AiWorkspace);
     }
@@ -340,8 +418,10 @@ mod tests {
     fn safe_tools_support_a_trailing_server_glob() {
         // `mcp__phoenix__*` vouches every tool the phoenix server exposes (the "always
         // allow this server" affordance), while exact entries match only themselves.
-        let ai = AiWorkspace::default()
-            .with_safe_tools(["mcp__phoenix__*".to_string(), "mcp__db__run_select".to_string()]);
+        let ai = AiWorkspace::default().with_safe_tools([
+            "mcp__phoenix__*".to_string(),
+            "mcp__db__run_select".to_string(),
+        ]);
         assert!(ai.is_safe_tool("mcp__phoenix__run_select_query"));
         assert!(ai.is_safe_tool("mcp__phoenix__open_snowflake_request"));
         assert!(ai.is_safe_tool("mcp__db__run_select"));
@@ -359,7 +439,10 @@ mod tests {
     fn empty_roots_are_dropped() {
         // A stray empty root must not turn every path into AI-workspace.
         let ai = AiWorkspace::new(["".to_string(), ".ai".to_string()]);
-        assert_eq!(ai.scope_of("/repo/src/main.rs", "/repo"), WriteScope::Project);
+        assert_eq!(
+            ai.scope_of("/repo/src/main.rs", "/repo"),
+            WriteScope::Project
+        );
         assert_eq!(ai.scope_of("/repo/.ai/x", "/repo"), WriteScope::AiWorkspace);
     }
 
@@ -383,7 +466,12 @@ mod tests {
         );
         // Non-file-write tools (Bash, reads) have no attributable path.
         assert_eq!(
-            classify_write_scope("Bash", &json!({ "command": "echo hi > .ai/x" }), "/repo", &ai),
+            classify_write_scope(
+                "Bash",
+                &json!({ "command": "echo hi > .ai/x" }),
+                "/repo",
+                &ai
+            ),
             None
         );
         assert_eq!(classify_write_scope("Read", &json!({}), "/repo", &ai), None);
@@ -425,8 +513,14 @@ mod tests {
         let workspace = cfg(None, &["ws-scratch"]);
         let ai = AiWorkspace::resolve(Some(&user), Some(&workspace));
         assert_eq!(ai.scope_of("/r/.ai/x", "/r"), WriteScope::AiWorkspace); // default kept
-        assert_eq!(ai.scope_of("/r/user-notes/x", "/r"), WriteScope::AiWorkspace);
-        assert_eq!(ai.scope_of("/r/ws-scratch/x", "/r"), WriteScope::AiWorkspace);
+        assert_eq!(
+            ai.scope_of("/r/user-notes/x", "/r"),
+            WriteScope::AiWorkspace
+        );
+        assert_eq!(
+            ai.scope_of("/r/ws-scratch/x", "/r"),
+            WriteScope::AiWorkspace
+        );
         assert_eq!(ai.scope_of("/r/src/x", "/r"), WriteScope::Project);
     }
 

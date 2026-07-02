@@ -70,19 +70,9 @@ pub enum OpenRequest {
         table: TableMeta,
     },
     /// Open a SQL console center tab bound to a data source (from the DB overview tree).
-    DbConsole {
-        source: DataSource,
-    },
+    DbConsole { source: DataSource },
     /// Open the HTTP request builder (Postman-style center tab; one shared tab).
     Http,
-    /// Authorize an **external MCP tool** a frozen phase blocked (once / always / refuse).
-    /// `tool` is the full `mcp__server__tool` name; `root` scopes the tab to the
-    /// requesting session's space.
-    McpAuthorize {
-        session: SessionId,
-        tool: String,
-        root: Option<PathBuf>,
-    },
 }
 
 impl OpenRequest {
@@ -106,8 +96,6 @@ impl OpenRequest {
                 super::panels::db_console::DbConsolePanel::tab_key(source)
             }
             OpenRequest::Http => super::panels::http_panel::HttpPanel::tab_key().to_string(),
-            // One authorization tab per session (a later tool re-arms the same tab).
-            OpenRequest::McpAuthorize { session, .. } => format!("mcpauth:{}", session.as_str()),
         }
     }
 
@@ -119,7 +107,6 @@ impl OpenRequest {
             OpenRequest::PlanReview { root, .. } => root.clone(),
             OpenRequest::CodeReview { root, .. } => root.clone(),
             OpenRequest::SessionById { root, .. } => root.clone(),
-            OpenRequest::McpAuthorize { root, .. } => root.clone(),
             _ => None,
         }
     }

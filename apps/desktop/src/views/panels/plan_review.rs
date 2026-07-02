@@ -32,8 +32,8 @@ use moonlight_engine::{Command, EngineEvent};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::views::theme;
 use crate::views::center_requests::OpenRequest;
+use crate::views::theme;
 use crate::views::workspace::ShellDeps;
 
 /// Default rejection feedback when the operator rejects without typing a reason.
@@ -187,7 +187,10 @@ impl PlanReviewPanel {
                 if let Some(deps) = cx.try_global::<ShellDeps>() {
                     let center = deps.center.clone();
                     center.update(cx, |_, cx| {
-                        cx.emit(OpenRequest::SessionById { id: session, root: None });
+                        cx.emit(OpenRequest::SessionById {
+                            id: session,
+                            root: None,
+                        });
                     });
                 }
                 if let Some(tp) = tab_panel.as_ref().and_then(|w| w.upgrade()) {
@@ -255,6 +258,14 @@ impl PlanReviewPanel {
                 matched,
                 "plan: driving CC continuation menu"
             );
+            // Only inject when CC's continuation menu is actually on screen. A plan that
+            // did NOT come from native `ExitPlanMode` — the `present_plan` verb (auto mode),
+            // or a Gemini/AGY session — never renders that menu, so injecting the digit
+            // blind would type a stray `1`/`3` as a spurious user turn. If the menu never
+            // appears we simply resolved the held hook (approve = allow) and stop.
+            if !matched {
+                return;
+            }
             let _ = term.update(cx, |t, _| t.send_text(&format!("{option}\r")));
         })
         .detach();
@@ -326,7 +337,9 @@ mod tests {
             "Would you like to proceed?\n 1. Yes, and auto-accept edits\n 3. No, keep planning"
         ));
         // Matches on the keep-planning option alone too.
-        assert!(is_continuation_menu(" 2. Yes, and manually approve\n 3. No, keep planning"));
+        assert!(is_continuation_menu(
+            " 2. Yes, and manually approve\n 3. No, keep planning"
+        ));
         // Plain plan markdown (numbered steps) must NOT look like the menu.
         assert!(!is_continuation_menu(
             "## Plan\n1. Refactor the parser\n2. Add tests\n3. Update docs"
@@ -448,7 +461,15 @@ impl PlanReviewPanel {
                 .flex_col()
                 .gap_2()
                 .child(Input::new(input))
-                .child(div().flex().flex_row().items_center().gap_2().child(send).child(cancel))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(send)
+                        .child(cancel),
+                )
                 .into_any_element();
         }
 
@@ -541,7 +562,9 @@ impl Render for PlanReviewPanel {
             )
             .child(
                 // The plan, rendered as real markdown (headings/lists/code/bold)
-                // via gpui-component's `TextView` so it reads as a document.
+                // via gpui-component's `TextView` so it reads as a document. The
+                // body is a sunken "well" so fenced code blocks (drawn on the
+                // `muted`/raised surface) read as insets that stand out from it.
                 div()
                     .id("plan-body")
                     .flex_1()
@@ -549,12 +572,19 @@ impl Render for PlanReviewPanel {
                     .rounded(theme::radius_md())
                     .border_1()
                     .border_color(theme::border_subtle())
-                    .bg(theme::surface_raised())
-                    .px_4()
-                    .py_3()
-                    .child(TextView::markdown("plan-body-md", self.plan.clone())),
+                    .bg(theme::surface_sunken())
+                    .px_5()
+                    .py_4()
+                    .child(
+                        TextView::markdown("plan-body-md", self.plan.clone())
+                            .style(theme::markdown_style()),
+                    ),
             )
             .child(self.footer(cx))
-            .children(super::tab_menu_overlay(self.tab_menu.as_ref(), dismiss, window))
+            .children(super::tab_menu_overlay(
+                self.tab_menu.as_ref(),
+                dismiss,
+                window,
+            ))
     }
 }

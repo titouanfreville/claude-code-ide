@@ -410,7 +410,11 @@ mod tests {
         assert!(got.paused);
         assert!(got.phase_pinned, "pin persisted through update");
         assert!(got.hidden, "hidden persisted through update");
-        assert_eq!(got.title.as_deref(), Some("Renamed in CC"), "title persisted");
+        assert_eq!(
+            got.title.as_deref(),
+            Some("Renamed in CC"),
+            "title persisted"
+        );
         assert_eq!(got.created_at.as_millis(), 10, "created_at untouched");
     }
 

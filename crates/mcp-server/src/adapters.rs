@@ -46,11 +46,12 @@ impl BusPolicyView {
     pub fn seed_from_managed(&self, records: &[ManagedSession]) {
         let mut map = self.snapshots.write().unwrap_or_else(|p| p.into_inner());
         for m in records {
-            map.entry(m.id.clone()).or_insert_with(|| SessionPolicySnapshot {
-                phase: m.phase,
-                trust_tier: TrustTier::Observed,
-                root: m.root.clone().map(PathBuf::from),
-            });
+            map.entry(m.id.clone())
+                .or_insert_with(|| SessionPolicySnapshot {
+                    phase: m.phase,
+                    trust_tier: TrustTier::Observed,
+                    root: m.root.clone().map(PathBuf::from),
+                });
         }
     }
 
@@ -165,7 +166,12 @@ mod tests {
         assert!(view.snapshot(&SessionId::new("s1")).is_none());
 
         view.apply(&EngineEvent::SessionUpserted {
-            session: session("s1", Phase::AutoImplement, TrustTier::Standard, Some("/repo")),
+            session: session(
+                "s1",
+                Phase::AutoImplement,
+                TrustTier::Standard,
+                Some("/repo"),
+            ),
         });
         let snap = view.snapshot(&SessionId::new("s1")).expect("tracked");
         assert_eq!(snap.phase, Phase::AutoImplement);
@@ -213,7 +219,12 @@ mod tests {
 
         // A live upsert already carries the operator's real (raised) trust tier.
         view.apply(&EngineEvent::SessionUpserted {
-            session: session("live", Phase::AutoImplement, TrustTier::Trusted, Some("/live")),
+            session: session(
+                "live",
+                Phase::AutoImplement,
+                TrustTier::Trusted,
+                Some("/live"),
+            ),
         });
 
         view.seed_from_managed(&[
@@ -263,9 +274,9 @@ mod tests {
         assert_eq!(entries.len(), 2);
         // Newest-first, and the ids are distinct + time-ordered.
         assert!(entries[0].id != entries[1].id);
-        assert!(entries
-            .iter()
-            .any(|e| matches!(&e.action, AuditAction::VerbExecuted { summary, .. }
-                if summary.contains("5 passed"))));
+        assert!(entries.iter().any(
+            |e| matches!(&e.action, AuditAction::VerbExecuted { summary, .. }
+                if summary.contains("5 passed"))
+        ));
     }
 }

@@ -29,7 +29,6 @@ pub mod db_source;
 pub mod file_tree;
 pub mod git_panel;
 pub mod http_panel;
-pub mod mcp_authorize;
 pub mod outline;
 pub mod plan_review;
 pub mod problems;
@@ -48,7 +47,7 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, anchored, deferred, div, px, pulsating_between, AnyElement, Animation, AnimationExt,
+    actions, anchored, deferred, div, pulsating_between, px, Animation, AnimationExt, AnyElement,
     App, Context, DismissEvent, Entity, FocusHandle, Hsla, MouseButton, MouseDownEvent, Pixels,
     Point, SharedString, Subscription, WeakEntity, Window,
 };
@@ -269,12 +268,13 @@ pub fn tool_hide_button(
         .text_color(theme::text_muted())
         .hover(|d| d.text_color(theme::text_primary()))
         .child("✕")
-        .tooltip(|window, cx| {
-            gpui_component::tooltip::Tooltip::new("Hide").build(window, cx)
-        })
+        .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Hide").build(window, cx))
         .on_click(move |_ev, _window, cx| {
             cx.stop_propagation();
-            let chrome = cx.global::<crate::views::workspace::ShellDeps>().chrome.clone();
+            let chrome = cx
+                .global::<crate::views::workspace::ShellDeps>()
+                .chrome
+                .clone();
             chrome.update(cx, |_, cx| cx.emit(request));
         })
         .into_any_element()

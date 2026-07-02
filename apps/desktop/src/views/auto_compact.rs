@@ -72,7 +72,11 @@ pub fn load_config(root: &Path) -> AutoCompactConfig {
 /// fired injection doesn't re-arm off readings that haven't refreshed yet.
 pub fn decide(pct: u8, armed: bool, cfg: &AutoCompactConfig) -> Decision {
     if !cfg.enabled {
-        return if armed { Decision::Disarm } else { Decision::Hold };
+        return if armed {
+            Decision::Disarm
+        } else {
+            Decision::Hold
+        };
     }
     if !armed && pct >= cfg.threshold_pct {
         Decision::Arm
@@ -136,7 +140,10 @@ mod tests {
         assert!(cfg.enabled); // unspecified field keeps its default
 
         // Missing file → defaults.
-        assert_eq!(load_config(Path::new("/no/such/root")), AutoCompactConfig::default());
+        assert_eq!(
+            load_config(Path::new("/no/such/root")),
+            AutoCompactConfig::default()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -116,7 +116,11 @@ fn append_custom_title_at(path: &std::path::Path, session_id: &str, title: &str)
         "customTitle": title,
         "sessionId": session_id,
     });
-    let Ok(mut file) = std::fs::OpenOptions::new().read(true).append(true).open(path) else {
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+    else {
         return false;
     };
     let needs_newline = match file.metadata().map(|m| m.len()) {
@@ -131,7 +135,8 @@ fn append_custom_title_at(path: &std::path::Path, session_id: &str, title: &str)
     };
     let prefix = if needs_newline { "\n" } else { "" };
     // One pre-built buffer → one append write (atomic w.r.t. concurrent appenders).
-    file.write_all(format!("{prefix}{line}\n").as_bytes()).is_ok()
+    file.write_all(format!("{prefix}{line}\n").as_bytes())
+        .is_ok()
 }
 
 /// Load and parse the recent conversation for `session_id`. Empty when the
@@ -315,7 +320,11 @@ mod tests {
 
         // A transcript whose tail lacks a newline (a mid-write append) must not be
         // corrupted — our record goes on its own line.
-        std::fs::write(&path, "{\"type\":\"user\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"Auto\"}").unwrap();
+        std::fs::write(
+            &path,
+            "{\"type\":\"user\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"Auto\"}",
+        )
+        .unwrap();
         assert!(append_custom_title_at(&path, "sess", "Session grid"));
 
         let text = std::fs::read_to_string(&path).unwrap();
@@ -328,7 +337,11 @@ mod tests {
         assert!(text.lines().any(|l| l.contains("\"aiTitle\":\"Auto\"")));
 
         // A missing transcript reports failure (caller stays app-local).
-        assert!(!append_custom_title_at(&dir.join("nope.jsonl"), "x", "Name"));
+        assert!(!append_custom_title_at(
+            &dir.join("nope.jsonl"),
+            "x",
+            "Name"
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

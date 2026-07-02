@@ -261,6 +261,15 @@ field MoonlightCode's hook handler must parse). All test artifacts under the ses
 > 4. **Implication for §4:** the moonlight hook binary must register itself into a **generated AGY plugin's
 >    `hooks.json`** (not `~/.gemini/.../settings.json`), and emit `{"decision":"deny"|"allow","systemMessage"}`.
 
+### Activation + live verification (2026-06-25)
+- **`moonlight hooks install agy` run on the real config** — wrote `~/.gemini/config/plugins/moonlight/`
+  (`hooks.json` → `"<binary>" hook agy-pre-tool-use`, timeout 7d; `gemini-extension.json`; `GEMINI.md`),
+  registered `moonlight` in `import_manifest.json` (backed up). `hooks status agy` → installed: yes.
+- **Hook path LIVE-VERIFIED end-to-end:** piping an AGY `read_file` payload to `moonlight hook agy-pre-tool-use`
+  round-tripped the **running app's control socket** and emitted `{"decision":"allow","systemMessage":""}` — the
+  full chain (stdin parse → `agy_hook::normalize` → socket → PDP → AGY-format verdict) works live. Deny is the
+  same reused PDP (proven for Claude) over the unit-tested write-tool normalization.
+
 ### Remaining follow-up (small)
 - Definitive `decision:"deny"` **abort** proof: re-run to completion with a benign allow-vs-deny A/B (let it finish).
 - Does AGY honor a **project-local** `<root>/.gemini/mcp_config.json` (enables near-per-session host) vs global only?

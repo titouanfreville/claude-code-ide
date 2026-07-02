@@ -93,7 +93,10 @@ mod tests {
             spaces: vec![
                 SpaceTabs {
                     space: Some("/repo/a".to_string()),
-                    tabs: vec!["session:abc".to_string(), "file:/repo/a/main.rs".to_string()],
+                    tabs: vec![
+                        "session:abc".to_string(),
+                        "file:/repo/a/main.rs".to_string(),
+                    ],
                     active_tab: Some("session:abc".to_string()),
                 },
                 SpaceTabs {

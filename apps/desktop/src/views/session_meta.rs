@@ -251,7 +251,13 @@ impl SessionMetaCache {
     }
 
     /// Persist + cache a name change for `id` in the space at `root`.
-    pub fn set_name(&mut self, root: &Path, id: &SessionId, name: Option<String>, source: NameSource) {
+    pub fn set_name(
+        &mut self,
+        root: &Path,
+        id: &SessionId,
+        name: Option<String>,
+        source: NameSource,
+    ) {
         set_name(root, id, name, source);
         self.loaded.insert(root.to_path_buf());
         self.by_id.insert(id.as_str().to_string(), get(root, id));
@@ -361,9 +367,20 @@ mod tests {
         assert_eq!(cache.get(&SessionId::new("zzz")), SessionMeta::default());
 
         // A write through the cache updates the map immediately and persists.
-        cache.set_name(&root, &SessionId::new("a"), Some("Pipeline".into()), NameSource::Local);
-        assert_eq!(cache.get(&SessionId::new("a")).display_name(), Some("Pipeline"));
-        assert_eq!(get(&root, &SessionId::new("a")).display_name(), Some("Pipeline"));
+        cache.set_name(
+            &root,
+            &SessionId::new("a"),
+            Some("Pipeline".into()),
+            NameSource::Local,
+        );
+        assert_eq!(
+            cache.get(&SessionId::new("a")).display_name(),
+            Some("Pipeline")
+        );
+        assert_eq!(
+            get(&root, &SessionId::new("a")).display_name(),
+            Some("Pipeline")
+        );
         // The earlier color survived the name write.
         assert_eq!(
             cache.get(&SessionId::new("a")).palette_color(),

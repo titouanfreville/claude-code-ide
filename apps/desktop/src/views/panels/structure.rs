@@ -114,7 +114,11 @@ impl StructurePanel {
             return; // no LSP server mapping for unknown languages
         }
         let key = (path.clone(), hash);
-        if self.lsp.as_ref().is_some_and(|(p, h, _)| *p == key.0 && *h == key.1) {
+        if self
+            .lsp
+            .as_ref()
+            .is_some_and(|(p, h, _)| *p == key.0 && *h == key.1)
+        {
             return; // already have this outline
         }
         if self.lsp_inflight.as_ref() == Some(&key) {
@@ -208,7 +212,13 @@ impl StructurePanel {
 /// Flatten the symbol tree into render rows, skipping collapsed subtrees. A node's id
 /// is a stable hash of its ancestor-name path, so collapse state survives re-parses and
 /// line shifts.
-fn flatten(syms: &[Symbol], depth: usize, parent_sig: &str, collapsed: &HashSet<u64>, out: &mut Vec<Row>) {
+fn flatten(
+    syms: &[Symbol],
+    depth: usize,
+    parent_sig: &str,
+    collapsed: &HashSet<u64>,
+    out: &mut Vec<Row>,
+) {
     for s in syms {
         let sig = format!("{parent_sig}/{}:{}", s.kind.label(), s.name);
         let id = hash_str(&sig);
@@ -385,7 +395,9 @@ impl Render for StructurePanel {
                             .overflow_hidden()
                             .cursor_pointer()
                             .on_click(
-                                cx.listener(move |this, _ev, window, cx| this.goto(line, window, cx)),
+                                cx.listener(move |this, _ev, window, cx| {
+                                    this.goto(line, window, cx)
+                                }),
                             )
                             .child(
                                 // A small color-coded kind chip (fn/struct/enum/…),

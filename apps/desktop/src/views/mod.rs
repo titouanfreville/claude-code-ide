@@ -10,6 +10,7 @@
 
 pub mod active_context;
 pub mod active_editor;
+pub mod approvals;
 pub mod auto_compact;
 pub mod center_requests;
 pub mod chrome_requests;

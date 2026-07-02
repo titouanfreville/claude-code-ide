@@ -290,7 +290,10 @@ mod tests {
                     @@ -1 +1 @@\n-a\n+b\n@@ -5 +5 @@\n-c\n+d\n";
         let (header, bodies) = split_file_diff(diff);
         assert!(header.contains("--- a/x.rs") && header.contains("+++ b/x.rs"));
-        assert!(!header.contains("@@"), "header must stop before the first hunk");
+        assert!(
+            !header.contains("@@"),
+            "header must stop before the first hunk"
+        );
         assert_eq!(bodies.len(), 2);
         assert!(bodies[0].starts_with("@@ -1 +1 @@"));
         assert!(bodies[1].contains("+d"));
@@ -345,7 +348,10 @@ mod tests {
 
         let staged = git(&["diff", "--cached"]);
         let staged = String::from_utf8_lossy(&staged.stdout);
-        assert!(staged.contains("+L1"), "first hunk should be staged:\n{staged}");
+        assert!(
+            staged.contains("+L1"),
+            "first hunk should be staged:\n{staged}"
+        );
         assert!(
             !staged.contains("+L9"),
             "second (unaccepted) hunk must NOT be staged:\n{staged}"

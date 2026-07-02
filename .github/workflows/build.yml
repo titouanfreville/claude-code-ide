@@ -1,0 +1,157 @@
+# Reusable build+package workflow. Called by release.yml (tags) and nightly.yml
+# (push to main). Builds the `moonlight` binary on 3 targets, packages it, and
+# uploads the artifacts for the caller's publish job to attach to a Release.
+#
+# macOS is packaged as MoonlightCode.app inside a .dmg. Signing + notarization
+# run ONLY when the signing secrets are present (see the "Sign & notarize" step);
+# otherwise the build is unsigned and still published.
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version string used in artifact names (e.g. 0.1.0 or nightly-abc1234)
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    # Route caller-supplied values through env vars so they are never interpolated
+    # directly into run: scripts (avoids shell-injection via a crafted version/tag).
+    env:
+      VERSION: ${{ inputs.version }}
+      TGT: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14        # Apple Silicon runner
+            kind: macos
+          - target: x86_64-apple-darwin
+            os: macos-13        # Intel runner
+            kind: macos
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            kind: linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # GPUI/blade (Vulkan) + alacritty terminal core need these to build on Linux.
+      - name: Install Linux system dependencies
+        if: matrix.kind == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake clang pkg-config mold \
+            libasound2-dev libfontconfig-dev \
+            libwayland-dev libxkbcommon-x11-dev \
+            libssl-dev libzstd-dev \
+            libvulkan-dev libgl1-mesa-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Build release binary
+        run: cargo build --release -p moonlight-desktop --target "$TGT"
+
+      # ---------- Linux packaging: tar.gz of the self-contained binary ----------
+      - name: Package (Linux tarball)
+        if: matrix.kind == 'linux'
+        run: |
+          set -euo pipefail
+          name="moonlight-${VERSION}-${TGT}"
+          mkdir -p "dist/$name"
+          cp "target/${TGT}/release/moonlight" "dist/$name/"
+          cp README.md "dist/$name/" 2>/dev/null || true
+          cp LICENSE* "dist/$name/" 2>/dev/null || true
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
+
+      # ---------- macOS packaging: cargo-bundle .app -> (sign) -> .dmg ----------
+      - name: Install cargo-bundle
+        if: matrix.kind == 'macos'
+        run: cargo install cargo-bundle --locked
+
+      - name: Bundle .app
+        if: matrix.kind == 'macos'
+        run: cargo bundle --release -p moonlight-desktop --target "$TGT"
+
+      - name: Sign & notarize (only if signing secrets are set)
+        if: matrix.kind == 'macos'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APP="target/${TGT}/release/bundle/osx/MoonlightCode.app"
+          if [ -z "${MACOS_CERT_P12:-}" ]; then
+            echo "::warning::No signing secrets set — producing an UNSIGNED build."
+            exit 0
+          fi
+          # Import the Developer ID cert into a throwaway keychain.
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PW="$(uuidgen)"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Sign with hardened runtime (required for notarization).
+          codesign --deep --force --options runtime --timestamp \
+            --sign "$MACOS_SIGN_IDENTITY" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+
+      - name: Build .dmg
+        if: matrix.kind == 'macos'
+        run: |
+          set -euo pipefail
+          APP="target/${TGT}/release/bundle/osx/MoonlightCode.app"
+          name="MoonlightCode-${VERSION}-${TGT}"
+          mkdir -p dist dmg-staging
+          cp -R "$APP" dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname "MoonlightCode" -srcfolder dmg-staging \
+            -ov -format UDZO "dist/$name.dmg"
+          echo "ASSET=dist/$name.dmg" >> "$GITHUB_ENV"
+
+      - name: Notarize .dmg (only if signing secrets are set)
+        if: matrix.kind == 'macos'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERT_P12:-}" ]; then exit 0; fi
+          xcrun notarytool submit "$ASSET" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$ASSET"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moonlight-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error

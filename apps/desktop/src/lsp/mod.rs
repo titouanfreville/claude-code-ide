@@ -40,7 +40,12 @@ impl LspPool {
     /// Document symbols for `path` from its language server, or `None` when no server is
     /// configured/installed for the language or the request fails — the caller then
     /// keeps the tree-sitter outline. **Blocking**: run it off the UI thread.
-    pub fn document_symbols(&self, path: &Path, text: &str, lang: OutlineLang) -> Option<Vec<Symbol>> {
+    pub fn document_symbols(
+        &self,
+        path: &Path,
+        text: &str,
+        lang: OutlineLang,
+    ) -> Option<Vec<Symbol>> {
         let root = workspace_root(path);
         let config = load_lsp_config(&root);
         let spec = registry::resolve(lang, &config)?;

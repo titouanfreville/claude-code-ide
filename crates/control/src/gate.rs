@@ -43,6 +43,13 @@ impl Default for GateState {
 /// plan-validation gate: holding it pauses the session on its proposed plan.
 pub const EXIT_PLAN_MODE: &str = "ExitPlanMode";
 
+/// MoonlightCode's own MCP verb an agent calls to present a plan for review **without**
+/// Claude's native plan-mode — the auto-mode / backend-agnostic path (works for Gemini/AGY
+/// too). It is gated identically to [`EXIT_PLAN_MODE`]: the hook holds it on the proposed
+/// plan (`{ "plan": "…" }`) so the operator reviews it. Its `PreToolUse` arrives as the full
+/// `mcp__<server>__<tool>` name.
+pub const PRESENT_PLAN: &str = "mcp__moonlight__present_plan";
+
 /// What kind of operator approval a held action needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HoldKind {
@@ -106,8 +113,11 @@ pub fn evaluate(
     }
 
     // Plan-validation gate: hold the agent on its proposed plan regardless of the
-    // PDP (leaving plan mode is itself the decision the operator must make).
-    if tool_name == EXIT_PLAN_MODE {
+    // PDP (leaving plan mode is itself the decision the operator must make). Both
+    // Claude's native `ExitPlanMode` and MoonlightCode's own `present_plan` verb (the
+    // auto-mode / cross-backend path) carry the plan in `tool_input["plan"]` and hold
+    // identically — the operator reviews the plan before the session proceeds.
+    if tool_name == EXIT_PLAN_MODE || tool_name == PRESENT_PLAN {
         return GateDecision::Hold(HoldKind::Plan {
             plan: extract_plan(tool_input),
         });
@@ -169,7 +179,15 @@ pub fn decide(
     write_scope: Option<WriteScope>,
     pdp: &dyn PolicyDecisionPoint,
 ) -> HookResponse {
-    match evaluate(gate, session, tool_name, tool_input, write_scope, false, pdp) {
+    match evaluate(
+        gate,
+        session,
+        tool_name,
+        tool_input,
+        write_scope,
+        false,
+        pdp,
+    ) {
         GateDecision::Allow => HookResponse::Allow,
         GateDecision::Deny { reason } => HookResponse::Deny { reason },
         GateDecision::Hold(HoldKind::Plan { .. }) => HookResponse::Deny {
@@ -204,6 +222,7 @@ mod tests {
                 // project (or unknown-scope) writes do not.
                 let scope = req.write_scope.unwrap_or(WriteScope::Project);
                 let permitted = match scope {
+                    WriteScope::Ephemeral => true,
                     WriteScope::AiWorkspace => req.phase.allows_ai_workspace_writes(),
                     WriteScope::Project => req.phase.allows_writes(),
                 };
@@ -278,7 +297,14 @@ mod tests {
             phase: Phase::Discovery,
             ..Default::default()
         };
-        let project = decide(Some(&gate), &sid(), "Edit", &edit(), Some(WriteScope::Project), &TestPdp);
+        let project = decide(
+            Some(&gate),
+            &sid(),
+            "Edit",
+            &edit(),
+            Some(WriteScope::Project),
+            &TestPdp,
+        );
         assert!(matches!(project, HookResponse::Deny { .. }));
         let ai = decide(
             Some(&gate),
@@ -356,6 +382,46 @@ mod tests {
                 plan: Some("1. do X\n2. do Y".to_string())
             })
         );
+    }
+
+    #[test]
+    fn present_plan_verb_holds_for_plan_approval_like_exit_plan_mode() {
+        // MoonlightCode's own `present_plan` verb (the auto-mode / cross-backend path)
+        // holds on its plan exactly like native ExitPlanMode.
+        let input = json!({ "plan": "## Plan\n1. a\n2. b" });
+        let out = evaluate(
+            Some(&adopted_auto()),
+            &sid(),
+            PRESENT_PLAN,
+            &input,
+            None,
+            false,
+            &TestPdp,
+        );
+        assert_eq!(
+            out,
+            GateDecision::Hold(HoldKind::Plan {
+                plan: Some("## Plan\n1. a\n2. b".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn present_plan_unadopted_session_just_allows() {
+        let gate = GateState {
+            adopted: false,
+            ..Default::default()
+        };
+        let out = evaluate(
+            Some(&gate),
+            &sid(),
+            PRESENT_PLAN,
+            &json!({}),
+            None,
+            false,
+            &TestPdp,
+        );
+        assert_eq!(out, GateDecision::Allow);
     }
 
     #[test]

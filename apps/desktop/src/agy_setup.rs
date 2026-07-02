@@ -28,7 +28,7 @@ const HOOK_TIMEOUT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// `contextFileName`) — the AGY analogue of Claude's `--append-system-prompt` IDE_CONTEXT.
 /// Teaches the workflow-phase gate + the `moonlight` MCP verbs. Plain prose (a context
 /// file, not shell-parsed), so apostrophes/newlines are fine.
-const GEMINI_MD: &str = "# MoonlightCode\n\nYou are running inside MoonlightCode, an IDE that governs this Antigravity (`agy`) session. Your tools are gated by a workflow phase, one of: Discovery, Plan, Auto, Test, Review, Commit. In Discovery, Plan, and Commit, edits to project files are denied; you can still read, search, run commands, and (except during Commit) write notes under .ai/. In Auto, Test, and Review, file writes are allowed. If you are unsure which phase you are in or what it allows, call the moonlight MCP tool `phase_status` first (read-only, no approval) — never guess. You cannot switch phase on your own; call the moonlight MCP tool `request_phase` (target discovery|plan|auto|test|review|commit|next) and the operator approves or denies it — never assume the phase changed until the tool result confirms it. Prefer the moonlight MCP verbs (run_list_targets, run_start, run_stop, run_status, run_logs, run_with_coverage) over ad-hoc shell when they fit. All verbs are policy-gated and audited; if a tool is denied, read the reason and adapt instead of retrying.\n";
+const GEMINI_MD: &str = "# MoonlightCode\n\nYou are running inside MoonlightCode, an IDE that governs this Antigravity (`agy`) session. Your tools are gated by a workflow phase, one of: Discovery, Plan, Auto, Test, Review, Commit. In Discovery, Plan, and Commit, edits to project files are denied; you can still read, search, run commands, and (except during Commit) write notes under .ai/. In Auto, Test, and Review, file writes are allowed. In **Plan**, do not implement: outline your approach and ask the operator any clarifying questions first — file edits are blocked (the hook will reject them) until the operator moves the session to Auto. If you are unsure which phase you are in or what it allows, call the moonlight MCP tool `phase_status` first (read-only, no approval) — never guess. You cannot switch phase on your own; call the moonlight MCP tool `request_phase` (target discovery|plan|auto|test|review|commit|next) and the operator approves or denies it — never assume the phase changed until the tool result confirms it. Prefer the moonlight MCP verbs (run_list_targets, run_start, run_stop, run_status, run_logs, run_with_coverage) over ad-hoc shell when they fit. All verbs are policy-gated and audited; if a tool is denied, read the reason and adapt instead of retrying.\n";
 
 // ---- paths ---------------------------------------------------------------
 
@@ -82,9 +82,7 @@ fn merge_mcp_server(mut cfg: Value, url: &str) -> Value {
         cfg = json!({});
     }
     let obj = cfg.as_object_mut().expect("object");
-    let servers = obj
-        .entry("mcpServers")
-        .or_insert_with(|| json!({}));
+    let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
     if !servers.is_object() {
         *servers = json!({});
     }
@@ -139,7 +137,9 @@ fn manifest_with_moonlight(mut manifest: Value, imported_at: &str) -> Value {
             imports.as_array_mut().expect("array")
         }
     };
-    let already = arr.iter().any(|e| e.get("name").and_then(Value::as_str) == Some("moonlight"));
+    let already = arr
+        .iter()
+        .any(|e| e.get("name").and_then(Value::as_str) == Some("moonlight"));
     if !already {
         arr.push(json!({
             "name": "moonlight",
@@ -211,6 +211,38 @@ pub fn write_mcp_config(url: &str) -> Result<(), String> {
     write_json(&path, &merged)
 }
 
+/// The AGY CLI settings file (`~/.gemini/antigravity-cli/settings.json`).
+fn agy_settings_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("settings.json"),
+    )
+}
+
+/// Set AGY's `toolPermission` to `always-proceed` so IDE-managed sessions auto-proceed
+/// (the Claude-Auto-mode equivalent) **without** the hook-bypassing
+/// `--dangerously-skip-permissions` flag — the moonlight `PreToolUse` gate still governs.
+/// Idempotent (a no-op when already set); backs the file up on the first change.
+/// Best-effort — called at every AGY launch from `AntigravityBackend::prepare_launch`.
+pub fn ensure_auto_proceed() -> Result<(), String> {
+    let path = agy_settings_path().ok_or("no $HOME — cannot locate ~/.gemini/antigravity-cli")?;
+    let mut settings = load_json_object(&path)?;
+    if settings.get("toolPermission").and_then(Value::as_str) == Some("always-proceed") {
+        return Ok(());
+    }
+    if path.exists() {
+        let _ = backup(&path);
+    }
+    settings
+        .as_object_mut()
+        .ok_or("settings.json is not an object")?
+        .insert("toolPermission".to_string(), json!("always-proceed"));
+    write_json(&path, &settings)
+}
+
 /// Dispatch `moonlight hooks <sub> agy`.
 pub fn run(sub: Option<&str>) {
     match sub {
@@ -230,16 +262,26 @@ fn install() {
     let manifest_file = dir.join("gemini-extension.json");
     let command = hook_command();
 
-    if hooks_path.exists() {
-        if let Ok(v) = load_json_object(&hooks_path) {
-            let existing = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap_or_default();
-            if is_ours(existing) {
-                println!("MoonlightCode AGY hook already installed at {}", dir.display());
-                return;
-            }
-        }
+    let already = hooks_path.exists()
+        && load_json_object(&hooks_path)
+            .ok()
+            .map(|v| {
+                is_ours(
+                    v["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+                        .as_str()
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or(false);
+
+    if already {
+        // Refresh our own files in place (hook command, manifest, GEMINI.md) so a rebuilt
+        // binary or an updated context propagate on re-run — no confirm (it's our content).
+        let _ = write_json(&hooks_path, &hooks_json(&command));
+        let _ = write_json(&manifest_file, &plugin_manifest());
+        let _ = std::fs::write(dir.join("GEMINI.md"), GEMINI_MD);
+        println!("refreshed the MoonlightCode AGY plugin at {}", dir.display());
+        return;
     }
 
     println!("About to install the MoonlightCode plugin for Antigravity:");
@@ -294,7 +336,10 @@ fn uninstall() {
         println!("no MoonlightCode AGY plugin found at {}", dir.display());
         return;
     }
-    if !confirm(&format!("Remove the MoonlightCode AGY plugin at {}?", dir.display())) {
+    if !confirm(&format!(
+        "Remove the MoonlightCode AGY plugin at {}?",
+        dir.display()
+    )) {
         println!("aborted; no changes made");
         return;
     }
@@ -336,8 +381,15 @@ fn status() {
             )
         })
         .unwrap_or(false);
-    let mcp = mcp_config_path().map(|p| p.display().to_string()).unwrap_or_default();
-    println!("AGY plugin dir : {}", plugin_dir().map(|d| d.display().to_string()).unwrap_or_default());
+    let mcp = mcp_config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    println!(
+        "AGY plugin dir : {}",
+        plugin_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default()
+    );
     println!("hook installed : {}", if installed { "yes" } else { "no" });
     println!("mcp config     : {mcp}");
     println!("hook command   : {}", hook_command());
@@ -361,8 +413,14 @@ mod tests {
             "topLevel": 1,
         });
         let merged = merge_mcp_server(existing, "http://127.0.0.1:7777/mcp");
-        assert_eq!(merged["mcpServers"]["moonlight"], json!({ "httpUrl": "http://127.0.0.1:7777/mcp" }));
-        assert_eq!(merged["mcpServers"]["other"]["command"], "x", "other servers kept");
+        assert_eq!(
+            merged["mcpServers"]["moonlight"],
+            json!({ "httpUrl": "http://127.0.0.1:7777/mcp" })
+        );
+        assert_eq!(
+            merged["mcpServers"]["other"]["command"], "x",
+            "other servers kept"
+        );
         assert_eq!(merged["topLevel"], 1, "top-level keys kept");
     }
 
@@ -378,19 +436,31 @@ mod tests {
     #[test]
     fn hooks_json_registers_pretooluse_command() {
         let h = hooks_json("\"/x/moonlight\" hook agy-pre-tool-use");
-        let cmd = h["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap();
+        let cmd = h["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
         assert!(is_ours(cmd));
-        assert_eq!(h["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], json!(HOOK_TIMEOUT_MS));
+        assert_eq!(
+            h["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"],
+            json!(HOOK_TIMEOUT_MS)
+        );
     }
 
     #[test]
     fn manifest_registration_is_idempotent_and_preserves_imports() {
-        let base = json!({ "imports": [ { "name": "oh-my-antigravity", "components": ["hooks"] } ] });
+        let base =
+            json!({ "imports": [ { "name": "oh-my-antigravity", "components": ["hooks"] } ] });
         let once = manifest_with_moonlight(base, "epoch:1");
         let imports = once["imports"].as_array().unwrap();
         assert_eq!(imports.len(), 2);
-        assert!(imports.iter().any(|e| e["name"] == "oh-my-antigravity"), "existing kept");
-        assert!(imports.iter().any(|e| e["name"] == "moonlight"), "ours added");
+        assert!(
+            imports.iter().any(|e| e["name"] == "oh-my-antigravity"),
+            "existing kept"
+        );
+        assert!(
+            imports.iter().any(|e| e["name"] == "moonlight"),
+            "ours added"
+        );
         // Second install must not duplicate.
         let twice = manifest_with_moonlight(once, "epoch:2");
         assert_eq!(twice["imports"].as_array().unwrap().len(), 2);

@@ -141,8 +141,9 @@ impl DbObserverPanel {
 
     /// Emit a center-open request (data editor / SQL console).
     fn emit(&self, req: OpenRequest, cx: &mut Context<Self>) {
-        if let Some(center) =
-            cx.try_global::<crate::views::workspace::ShellDeps>().map(|d| d.center.clone())
+        if let Some(center) = cx
+            .try_global::<crate::views::workspace::ShellDeps>()
+            .map(|d| d.center.clone())
         {
             center.update(cx, |_c, cx| cx.emit(req));
         }
@@ -261,7 +262,11 @@ fn build_tree(
             continue;
         }
         let Some(schema) = schemas.get(&skey) else {
-            let msg = if loading.contains(&skey) { "loading…" } else { "—" };
+            let msg = if loading.contains(&skey) {
+                "loading…"
+            } else {
+                "—"
+            };
             rows.push(note_row(&skey, 1, msg.to_string()));
             continue;
         };
@@ -438,7 +443,10 @@ impl Render for DbObserverPanel {
         // First render: load the persisted source list.
         if self.needs_init {
             self.needs_init = false;
-            self.sources = self.project_root(cx).map(|r| db_source::load_sources(&r)).unwrap_or_default();
+            self.sources = self
+                .project_root(cx)
+                .map(|r| db_source::load_sources(&r))
+                .unwrap_or_default();
         }
         // Lazily fetch schemas for expanded sources we haven't loaded yet.
         let to_load: Vec<DataSource> = self
@@ -500,9 +508,11 @@ impl DbObserverPanel {
                     .flex_row()
                     .items_center()
                     .gap_1()
-                    .child(add_button("db-add-file", "+ File", cx.listener(|this, _e, _w, cx| {
-                        this.pick_sqlite(cx)
-                    })))
+                    .child(add_button(
+                        "db-add-file",
+                        "+ File",
+                        cx.listener(|this, _e, _w, cx| this.pick_sqlite(cx)),
+                    ))
                     .child(add_button(
                         "db-add-conn",
                         "+ Connect",
@@ -523,7 +533,11 @@ impl DbObserverPanel {
             .border_b_1()
             .border_color(theme::border_subtle())
             .bg(theme::surface_base())
-            .child(div().flex_1().children(self.dsn_input.as_ref().map(|i| Input::new(i).small())))
+            .child(
+                div()
+                    .flex_1()
+                    .children(self.dsn_input.as_ref().map(|i| Input::new(i).small())),
+            )
             .child(add_button(
                 "db-do-connect",
                 "Connect",
@@ -531,7 +545,10 @@ impl DbObserverPanel {
                     if let Some(input) = this.dsn_input.clone() {
                         let dsn = input.read(cx).value().trim().to_string();
                         if !dsn.is_empty() {
-                            let cfg = PgConfig { label: db_source::pg_label(&dsn), dsn };
+                            let cfg = PgConfig {
+                                label: db_source::pg_label(&dsn),
+                                dsn,
+                            };
                             this.connect_open = false;
                             this.add_source(DataSource::Postgres(cfg), cx);
                         }
@@ -662,7 +679,10 @@ impl DbObserverPanel {
 
         if let Some((ty, pk, fk)) = col {
             if pk {
-                name = name.child(badge("PK", theme::ansi_base(3).unwrap_or_else(theme::text_muted)));
+                name = name.child(badge(
+                    "PK",
+                    theme::ansi_base(3).unwrap_or_else(theme::text_muted),
+                ));
             }
             if let Some(t) = fk {
                 name = name.child(badge(
@@ -672,14 +692,22 @@ impl DbObserverPanel {
             }
             if !ty.is_empty() {
                 name = name.child(
-                    div().flex_none().text_size(px(10.)).text_color(theme::text_muted()).child(ty),
+                    div()
+                        .flex_none()
+                        .text_size(px(10.))
+                        .text_color(theme::text_muted())
+                        .child(ty),
                 );
             }
         }
 
         if let Some(n) = count {
             name = name.child(
-                div().flex_none().text_size(px(10.)).text_color(theme::tree_glyph()).child(n.to_string()),
+                div()
+                    .flex_none()
+                    .text_size(px(10.))
+                    .text_color(theme::tree_glyph())
+                    .child(n.to_string()),
             );
         }
 
@@ -687,58 +715,63 @@ impl DbObserverPanel {
         match (kind, source.clone(), table.clone()) {
             (NodeKind::Db, Some(src), _) => {
                 let key = src.key();
-                name = name.cursor_pointer().on_click(cx.listener(move |this, _e, _w, cx| {
-                    this.select(key.clone(), cx);
-                    this.toggle(id, cx);
-                }));
+                name = name
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.select(key.clone(), cx);
+                        this.toggle(id, cx);
+                    }));
             }
             (NodeKind::Table | NodeKind::View, Some(src), Some(t)) => {
-                name = name.cursor_pointer().on_click(cx.listener(move |this, _e, _w, cx| {
-                    this.open_table(src.clone(), t.clone(), cx)
-                }));
+                name =
+                    name.cursor_pointer()
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.open_table(src.clone(), t.clone(), cx)
+                        }));
             }
             _ => {}
         }
 
         // DB rows carry inline actions: open a SQL console, remove the source.
-        let actions = (kind == NodeKind::Db).then(|| {
-            let src_console = source.clone().unwrap();
-            let src_remove = source.clone().unwrap();
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .flex_none()
-                .child(
-                    div()
-                        .id(("db-sql", i))
-                        .px(px(4.))
-                        .py(px(1.))
-                        .rounded(px(3.))
-                        .cursor_pointer()
-                        .text_size(px(9.))
-                        .text_color(theme::accent())
-                        .hover(|d| d.bg(theme::tint(theme::accent(), 0.14)))
-                        .child("SQL")
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            this.open_console(src_console.clone(), cx)
-                        })),
-                )
-                .child(
-                    div()
-                        .id(("db-rm", i))
-                        .px(px(3.))
-                        .cursor_pointer()
-                        .text_size(px(11.))
-                        .text_color(theme::text_muted())
-                        .hover(|d| d.text_color(theme::git_deleted()))
-                        .child("✕")
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            this.remove_source(&src_remove, cx)
-                        })),
-                )
-        });
+        let actions =
+            (kind == NodeKind::Db).then(|| {
+                let src_console = source.clone().unwrap();
+                let src_remove = source.clone().unwrap();
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .flex_none()
+                    .child(
+                        div()
+                            .id(("db-sql", i))
+                            .px(px(4.))
+                            .py(px(1.))
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .text_size(px(9.))
+                            .text_color(theme::accent())
+                            .hover(|d| d.bg(theme::tint(theme::accent(), 0.14)))
+                            .child("SQL")
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.open_console(src_console.clone(), cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(("db-rm", i))
+                            .px(px(3.))
+                            .cursor_pointer()
+                            .text_size(px(11.))
+                            .text_color(theme::text_muted())
+                            .hover(|d| d.text_color(theme::git_deleted()))
+                            .child("✕")
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.remove_source(&src_remove, cx)
+                            })),
+                    )
+            });
 
         div()
             .id(("db-row", i))
@@ -851,7 +884,11 @@ mod tests {
         let key = src.key();
         let open = [src_node_id(&key), hash_str(&format!("{key}/Tables"))];
         let rows = tree_for(&src, &open);
-        assert!(rows.iter().any(|r| matches!(r.kind, NodeKind::Group) && r.label == "Tables"));
-        assert!(rows.iter().any(|r| matches!(r.kind, NodeKind::Table) && r.label == "users"));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r.kind, NodeKind::Group) && r.label == "Tables"));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r.kind, NodeKind::Table) && r.label == "users"));
     }
 }

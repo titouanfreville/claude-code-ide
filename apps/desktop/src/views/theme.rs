@@ -16,7 +16,9 @@
 //! popovers) matches the hand-painted panels instead of falling back to its default
 //! light theme.
 
-use gpui::{point, px, rgb, App, BoxShadow, Hsla, Pixels};
+use gpui::{point, px, rems, rgb, App, BoxShadow, Hsla, Pixels};
+use gpui_component::highlighter::HighlightTheme;
+use gpui_component::text::TextViewStyle;
 use moonlight_domain::phase::Phase;
 use moonlight_domain::session::{AttentionKind, SessionStatus};
 
@@ -190,6 +192,32 @@ pub fn ui_font() -> &'static str {
 /// Menlo ships on every macOS, so cells always align.
 pub fn mono_font() -> &'static str {
     "Menlo"
+}
+
+// ── Markdown rendering (plan view, assistant messages) ───────────────────────
+
+/// A **dark** [`TextViewStyle`] for rendering markdown on MoonlightCode surfaces.
+///
+/// `gpui-component`'s default `TextViewStyle` ships a *light* `HighlightTheme`, so
+/// fenced code blocks render with light syntax colors on our dark cards — washed
+/// out and hard to read (this is the long-standing "T14" plan-render bug). This
+/// swaps in the dark highlight theme, marks the style dark, and applies a modest
+/// heading ramp so `TextView::markdown(id, md).style(theme::markdown_style())`
+/// reads as a proper document on the cockpit's dark field. Used by the plan-review
+/// panel and the assistant-message view.
+pub fn markdown_style() -> TextViewStyle {
+    TextViewStyle {
+        is_dark: true,
+        highlight_theme: HighlightTheme::default_dark(),
+        ..Default::default()
+    }
+    .paragraph_gap(rems(0.75))
+    .heading_font_size(|level, base| match level {
+        1 => base * 1.4,
+        2 => base * 1.2,
+        3 => base * 1.05,
+        _ => base,
+    })
 }
 
 // ── List / tree row chrome ───────────────────────────────────────────────────

@@ -205,7 +205,12 @@ impl FleetModel {
     /// (overview) shows the whole fleet; `Some(root)` scopes to sessions whose
     /// `attached_path` resolves to that space's root. Soft-hidden sessions are filtered
     /// out unless `show_hidden`. Stable sort, so arrival order breaks ties within a rank.
-    fn visible(&self, active_root: Option<&Path>, sort: SortMode, show_hidden: bool) -> Vec<&Session> {
+    fn visible(
+        &self,
+        active_root: Option<&Path>,
+        sort: SortMode,
+        show_hidden: bool,
+    ) -> Vec<&Session> {
         let mut ordered: Vec<&Session> = self
             .sessions
             .iter()
@@ -302,9 +307,7 @@ impl GridHome {
 
         // Re-render when session metadata (custom name/color) changes, so a rename or
         // recolor in the focus view reflects on the tiles live.
-        let meta_cache = cx
-            .try_global::<ShellDeps>()
-            .map(|d| d.session_meta.clone());
+        let meta_cache = cx.try_global::<ShellDeps>().map(|d| d.session_meta.clone());
         if let Some(cache) = meta_cache.as_ref() {
             cx.observe(cache, |_grid, _cache, cx| cx.notify()).detach();
         }
@@ -357,7 +360,10 @@ impl GridHome {
     /// `SessionUpserted` flows back through the bus and re-renders the grid.
     fn set_hidden(&self, id: SessionId, hidden: bool) {
         if let Some(tx) = &self.commands {
-            let _ = tx.send(Command::SetHidden { session: id, hidden });
+            let _ = tx.send(Command::SetHidden {
+                session: id,
+                hidden,
+            });
         }
     }
 
@@ -431,7 +437,10 @@ impl Render for GridHome {
         let ordered = self
             .model
             .visible(active_root.as_deref(), self.sort_mode, self.show_hidden);
-        let needs = ordered.iter().filter(|s| s.status.needs_attention()).count();
+        let needs = ordered
+            .iter()
+            .filter(|s| s.status.needs_attention())
+            .count();
         let total = ordered.len();
         let hidden_count = self.model.hidden_count(active_root.as_deref());
 
@@ -444,8 +453,10 @@ impl Render for GridHome {
                 ordered
                     .iter()
                     .map(|s| {
-                        if let Some(root) =
-                            s.attached_path.as_deref().map(super::project_space::expand_home)
+                        if let Some(root) = s
+                            .attached_path
+                            .as_deref()
+                            .map(super::project_space::expand_home)
                         {
                             c.ensure_space(&root);
                         }
@@ -472,7 +483,12 @@ impl Render for GridHome {
                 let meta = metas.get(&s.id).cloned().unwrap_or_default();
                 let attention = self.model.attention(s);
                 let agent = agents.get(&s.id).copied().unwrap_or_default();
-                (s.clone(), s.adopted, s.paused, session_tile(s, &meta, attention, agent))
+                (
+                    s.clone(),
+                    s.adopted,
+                    s.paused,
+                    session_tile(s, &meta, attention, agent),
+                )
             })
             .collect();
 
@@ -495,10 +511,11 @@ impl Render for GridHome {
             } else {
                 s.text_color(theme::text_muted())
             };
-            s.child(text).on_click(cx.listener(move |this, _ev, _w, cx| {
-                this.new_session_phase = phase;
-                cx.notify();
-            }))
+            s.child(text)
+                .on_click(cx.listener(move |this, _ev, _w, cx| {
+                    this.new_session_phase = phase;
+                    cx.notify();
+                }))
         };
         let mode_toggle = div()
             .flex()
@@ -509,7 +526,12 @@ impl Render for GridHome {
             .rounded(theme::radius_sm())
             .bg(theme::surface_raised())
             .child(seg(Phase::Plan, "Plan", "new-phase-plan", _cx))
-            .child(seg(Phase::Discovery, "Discovery", "new-phase-discovery", _cx))
+            .child(seg(
+                Phase::Discovery,
+                "Discovery",
+                "new-phase-discovery",
+                _cx,
+            ))
             .child(seg(Phase::AutoImplement, "Auto", "new-phase-auto", _cx));
 
         // Backend toggle beside the phase toggle: which agent CLI the new session runs
@@ -532,10 +554,11 @@ impl Render for GridHome {
                 } else {
                     s.text_color(theme::text_muted())
                 };
-                s.child(text).on_click(cx.listener(move |this, _ev, _w, cx| {
-                    this.new_session_agent = agent;
-                    cx.notify();
-                }))
+                s.child(text)
+                    .on_click(cx.listener(move |this, _ev, _w, cx| {
+                        this.new_session_agent = agent;
+                        cx.notify();
+                    }))
             };
         let agent_toggle = div()
             .flex()
@@ -545,8 +568,18 @@ impl Render for GridHome {
             .p(px(2.))
             .rounded(theme::radius_sm())
             .bg(theme::surface_raised())
-            .child(agent_seg(AgentKind::ClaudeCode, "Claude", "new-agent-claude", _cx))
-            .child(agent_seg(AgentKind::Antigravity, "AGY", "new-agent-agy", _cx));
+            .child(agent_seg(
+                AgentKind::ClaudeCode,
+                "Claude",
+                "new-agent-claude",
+                _cx,
+            ))
+            .child(agent_seg(
+                AgentKind::Antigravity,
+                "AGY",
+                "new-agent-agy",
+                _cx,
+            ));
 
         // "＋ New session" — the primary action: a solid accent button.
         let new_session_btn = div()
@@ -604,7 +637,8 @@ impl Render for GridHome {
                 // the engine to rehydrate too (re-sync the supervisor fleet + gate for
                 // any session created out-of-band). The pull is what the operator sees.
                 if let Some(store) = this.store.as_ref() {
-                    this.model.seed_missing(&store.all_managed().unwrap_or_default());
+                    this.model
+                        .seed_missing(&store.all_managed().unwrap_or_default());
                     cx.notify();
                 }
                 if let Some(tx) = &this.commands {
@@ -614,26 +648,28 @@ impl Render for GridHome {
 
         // Sort toggle: "Needs you" (triage rank) vs "Recent" (last activity desc).
         let sort_now = self.sort_mode;
-        let sort_seg = |mode: SortMode, text: &'static str, id: &'static str, cx: &mut Context<Self>| {
-            let active = sort_now == mode;
-            let mut s = div()
-                .id(id)
-                .px_2()
-                .py(px(3.))
-                .cursor_pointer()
-                .rounded(theme::radius_sm())
-                .text_size(theme::text_xs());
-            s = if active {
-                s.bg(theme::tint(theme::accent(), 0.18))
-                    .text_color(theme::accent())
-            } else {
-                s.text_color(theme::text_muted())
+        let sort_seg =
+            |mode: SortMode, text: &'static str, id: &'static str, cx: &mut Context<Self>| {
+                let active = sort_now == mode;
+                let mut s = div()
+                    .id(id)
+                    .px_2()
+                    .py(px(3.))
+                    .cursor_pointer()
+                    .rounded(theme::radius_sm())
+                    .text_size(theme::text_xs());
+                s = if active {
+                    s.bg(theme::tint(theme::accent(), 0.18))
+                        .text_color(theme::accent())
+                } else {
+                    s.text_color(theme::text_muted())
+                };
+                s.child(text)
+                    .on_click(cx.listener(move |this, _ev, _w, cx| {
+                        this.sort_mode = mode;
+                        cx.notify();
+                    }))
             };
-            s.child(text).on_click(cx.listener(move |this, _ev, _w, cx| {
-                this.sort_mode = mode;
-                cx.notify();
-            }))
-        };
         let sort_toggle = div()
             .flex()
             .flex_row()
@@ -1170,12 +1206,20 @@ mod tests {
         model.backfill_titles(|_| Some("From transcript".to_string()));
 
         assert_eq!(
-            model.session(&SessionId::new("untitled")).unwrap().title.as_deref(),
+            model
+                .session(&SessionId::new("untitled"))
+                .unwrap()
+                .title
+                .as_deref(),
             Some("From transcript"),
             "missing title backfilled from the transcript lookup"
         );
         assert_eq!(
-            model.session(&SessionId::new("titled")).unwrap().title.as_deref(),
+            model
+                .session(&SessionId::new("titled"))
+                .unwrap()
+                .title
+                .as_deref(),
             Some("Kept name"),
             "an existing title is never overwritten"
         );

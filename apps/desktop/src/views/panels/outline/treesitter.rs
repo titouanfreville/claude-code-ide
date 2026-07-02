@@ -75,7 +75,10 @@ fn collect(node: Node, rules: &[Rule], lang: OutlineLang, src: &[u8]) -> Vec<Sym
                 // A free function nested inside an impl/trait/class/interface is a method.
                 if matches!(
                     rule.sym,
-                    SymbolKind::Impl | SymbolKind::Trait | SymbolKind::Class | SymbolKind::Interface
+                    SymbolKind::Impl
+                        | SymbolKind::Trait
+                        | SymbolKind::Class
+                        | SymbolKind::Interface
                 ) {
                     for c in &mut children {
                         if c.kind == SymbolKind::Function {
@@ -230,7 +233,8 @@ mod tests {
         v
     }
     fn has(v: &[(String, SymbolKind, usize)], name: &str, kind: SymbolKind, depth: usize) -> bool {
-        v.iter().any(|(n, k, d)| n == name && *k == kind && *d == depth)
+        v.iter()
+            .any(|(n, k, d)| n == name && *k == kind && *d == depth)
     }
 
     #[test]

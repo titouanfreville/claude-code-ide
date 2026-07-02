@@ -82,8 +82,7 @@ pub fn activity_rail(snap: RailSnapshot, cx: &mut Context<Workspace>) -> impl In
         ))
         .child(rail_btn(
             "rail-explorer",
-            folder_icon(snap.left_open && snap.left_tool == LeftTool::Project)
-                .into_any_element(),
+            folder_icon(snap.left_open && snap.left_tool == LeftTool::Project).into_any_element(),
             "Project files",
             snap.left_open && snap.left_tool == LeftTool::Project,
             cx.listener(|this, _ev: &ClickEvent, window, cx| {
@@ -92,8 +91,7 @@ pub fn activity_rail(snap: RailSnapshot, cx: &mut Context<Workspace>) -> impl In
         ))
         .child(rail_btn(
             "rail-commit",
-            commit_icon(snap.left_open && snap.left_tool == LeftTool::Commit)
-                .into_any_element(),
+            commit_icon(snap.left_open && snap.left_tool == LeftTool::Commit).into_any_element(),
             "Commit",
             snap.left_open && snap.left_tool == LeftTool::Commit,
             cx.listener(|this, _ev: &ClickEvent, window, cx| {
@@ -150,8 +148,7 @@ pub fn activity_rail(snap: RailSnapshot, cx: &mut Context<Workspace>) -> impl In
         ))
         .child(rail_btn(
             "rail-git",
-            branch_icon(snap.bottom_open && snap.bottom_tool == BottomTool::Git)
-                .into_any_element(),
+            branch_icon(snap.bottom_open && snap.bottom_tool == BottomTool::Git).into_any_element(),
             "Git",
             snap.bottom_open && snap.bottom_tool == BottomTool::Git,
             cx.listener(|this, _ev: &ClickEvent, _w, cx| {
@@ -294,22 +291,28 @@ fn run_icon(lit: bool, lamp: Option<gpui::Hsla>) -> impl IntoElement {
 fn grid_icon(lit: bool) -> impl IntoElement {
     let c = tool_color(lit);
     let cell = move || div().w(px(5.)).h(px(5.)).rounded(px(1.)).bg(c);
-    let row = move || div().flex().flex_row().gap(px(2.)).child(cell()).child(cell());
-    div().flex().flex_col().gap(px(2.)).child(row()).child(row())
+    let row = move || {
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(2.))
+            .child(cell())
+            .child(cell())
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(row())
+        .child(row())
 }
 
 /// **Structure** — an indented outline: three rows, the lower two stepped in
 /// (the symbol tree's silhouette). Echoes the panel's own "≣" empty-state glyph.
 fn structure_icon(lit: bool) -> impl IntoElement {
     let c = tool_color(lit);
-    let bar = move |indent: f32, w: f32| {
-        div()
-            .ml(px(indent))
-            .w(px(w))
-            .h(px(2.))
-            .rounded_full()
-            .bg(c)
-    };
+    let bar =
+        move |indent: f32, w: f32| div().ml(px(indent)).w(px(w)).h(px(2.)).rounded_full().bg(c);
     div()
         .flex()
         .flex_col()
@@ -368,7 +371,15 @@ fn db_icon(lit: bool) -> impl IntoElement {
         .border_color(c)
         .bg(theme::tint(c, 0.15))
         // The lid seam + a mid band suggest the stacked-platters silhouette.
-        .child(div().absolute().top(px(2.)).left_0().right_0().h(px(1.)).bg(c))
+        .child(
+            div()
+                .absolute()
+                .top(px(2.))
+                .left_0()
+                .right_0()
+                .h(px(1.))
+                .bg(c),
+        )
         .child(
             div()
                 .absolute()
@@ -494,8 +505,7 @@ fn edge_hairline(side: EdgeSide) -> gpui::Div {
         EdgeSide::Right => d.right_0(),
         EdgeSide::Left => d.left_0(),
     };
-    d
-        .flex()
+    d.flex()
         .flex_col()
         .child(div().flex_1().w_full().bg(linear_gradient(
             180.,

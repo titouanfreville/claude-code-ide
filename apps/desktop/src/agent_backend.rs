@@ -77,6 +77,12 @@ impl AgentBackend for AntigravityBackend {
         // `permission_mode` and `mcp_url` are intentionally not on the command line for
         // AGY — see the type doc. A fresh launch is bare `agy`; resume targets the
         // AGY-side conversation id.
+        //
+        // NOTE: no `--dangerously-skip-permissions`. That flag *bypasses* AGY's tool
+        // gating (it overrides even the deny-list), which defeats the moonlight
+        // `PreToolUse` hook. The Claude-`--permission-mode auto` equivalent that KEEPS the
+        // hook is `toolPermission: always-proceed`, set in AGY's settings by
+        // [`prepare_launch`] instead — auto-proceed without disabling governance.
         match spec.selector {
             SessionSelector::Fresh(_) => "agy".to_string(),
             SessionSelector::Resume(id) => format!("agy --conversation {}", id.as_str()),
@@ -91,6 +97,12 @@ impl AgentBackend for AntigravityBackend {
                 tracing::warn!(error = %e,
                     "failed to write AGY mcp_config; session launches without moonlight verbs");
             }
+        }
+        // Auto-proceed like Claude's Auto mode, WITHOUT the hook-bypassing skip flag: set
+        // AGY's `toolPermission: always-proceed` so it doesn't prompt per step, while the
+        // moonlight `PreToolUse` hook still gates per phase. Idempotent + best-effort.
+        if let Err(e) = crate::agy_setup::ensure_auto_proceed() {
+            tracing::warn!(error = %e, "failed to set AGY toolPermission; it may prompt per step");
         }
     }
 }
@@ -137,7 +149,10 @@ mod tests {
         });
         assert_eq!(
             cmd,
-            format!("claude --session-id abc123 --permission-mode plan{}", session_launch_flags(url))
+            format!(
+                "claude --session-id abc123 --permission-mode plan{}",
+                session_launch_flags(url)
+            )
         );
     }
 
@@ -165,13 +180,17 @@ mod tests {
         });
         assert_eq!(
             cmd,
-            format!("claude --resume abc123 --permission-mode auto{}", session_launch_flags(url))
+            format!(
+                "claude --resume abc123 --permission-mode auto{}",
+                session_launch_flags(url)
+            )
         );
     }
 
     #[test]
-    fn antigravity_fresh_is_bare_binary() {
-        // No id pin, no mode flag, no mcp flag — those ride out-of-band for AGY.
+    fn antigravity_fresh_auto_proceeds_no_id_pin() {
+        // No id pin, no mode/mcp flag (those ride out-of-band) — but auto-proceed so an
+        // IDE "Auto" session doesn't prompt per step; the hook stays the gate.
         let id = sid();
         let cmd = AntigravityBackend.launch_command(&LaunchSpec {
             selector: SessionSelector::Fresh(&id),
@@ -189,7 +208,10 @@ mod tests {
             permission_mode: None,
             mcp_url: None,
         });
-        assert_eq!(cmd, "agy --conversation abc123");
+        assert_eq!(
+            cmd,
+            "agy --conversation abc123"
+        );
     }
 
     #[test]
@@ -201,7 +223,13 @@ mod tests {
             mcp_url: None,
         };
         // The factory dispatches to the backend whose command shape matches the kind.
-        assert_eq!(backend_for(AgentKind::ClaudeCode).launch_command(&spec()), "claude --resume abc123");
-        assert_eq!(backend_for(AgentKind::Antigravity).launch_command(&spec()), "agy --conversation abc123");
+        assert_eq!(
+            backend_for(AgentKind::ClaudeCode).launch_command(&spec()),
+            "claude --resume abc123"
+        );
+        assert_eq!(
+            backend_for(AgentKind::Antigravity).launch_command(&spec()),
+            "agy --conversation abc123"
+        );
     }
 }

@@ -122,6 +122,10 @@ pub struct TerminalPanel {
     active: usize,
     /// Shared focus, kept so new tabs spawn at the current project root.
     focus: Option<Entity<ProjectSpace>>,
+    /// When this terminal is **pinned** to a single space (no `focus`), the root new
+    /// `＋` tabs should open in. `None` for a focus-following terminal (which reads the
+    /// root off `focus` instead). See [`Self::new_pinned`] and [`Self::spawn_root`].
+    pinned_root: Option<PathBuf>,
     /// Whether to draw the tab strip. Hidden when embedded as another view's
     /// content region (e.g. a managed session's terminal) so it reads as plain
     /// terminal output, not a standalone terminal panel.
@@ -182,6 +186,14 @@ impl TerminalPanel {
         Self::with_first_tab(root, None, Some(command), cx)
     }
 
+    /// Spawn a terminal **pinned** to `root` and **not** following focus — for a
+    /// per-space dock terminal. Each space owns its own pinned terminal so switching
+    /// spaces shows that space's shells (rooted at it) instead of `cd`-ing one shared
+    /// shell, which would let spaces stomp on each other. New `＋` tabs open at `root`.
+    pub fn new_pinned(root: PathBuf, cx: &mut Context<Self>) -> Self {
+        Self::with_first_tab(root, None, None, cx)
+    }
+
     fn with_first_tab(
         root: PathBuf,
         focus: Option<Entity<ProjectSpace>>,
@@ -191,6 +203,10 @@ impl TerminalPanel {
         let label = command
             .map(|_| "claude".to_string())
             .unwrap_or_else(|| "term 1".to_string());
+        // A terminal with no `focus` is pinned to its `root` (per-space dock terminal
+        // or embedded session): remember it so new tabs open there. A focus-following
+        // terminal reads its root off `focus`, so it stays `None`.
+        let pinned_root = focus.is_none().then(|| root.clone());
         let tab = spawn_tab(root, command, label);
 
         // Re-render whenever the *active* tab's grid changes.
@@ -232,6 +248,7 @@ impl TerminalPanel {
             tabs: vec![tab],
             active: 0,
             focus,
+            pinned_root,
             chrome: true,
             focus_handle: cx.focus_handle(),
             grid_bounds: None,
@@ -303,6 +320,17 @@ impl TerminalPanel {
         }
     }
 
+    /// Whether the active tab's child process has exited (the PTY closed). `false` when
+    /// there's no emulator (spawn failed) — an unstarted terminal is not a *stopped*
+    /// session, so callers (e.g. auto-resume) don't treat it as one. Used to detect a
+    /// managed Claude Code session whose process fully ended, vs one merely idle.
+    pub fn has_exited(&self) -> bool {
+        self.active_tab()
+            .and_then(|t| t.emulator.as_ref())
+            .map(Emulator::has_exited)
+            .unwrap_or(false)
+    }
+
     /// The active tab's visible screen text, or empty when there is no live terminal.
     /// Used to detect Claude Code's interactive prompts before injecting a response.
     pub fn visible_text(&self) -> String {
@@ -330,12 +358,16 @@ impl TerminalPanel {
             .is_some_and(Emulator::take_dirty)
     }
 
-    /// The root a new tab should open in: the current project focus, else cwd.
+    /// The root a new tab should open in: the current project focus (follow-focus
+    /// terminals), else this terminal's pinned root (per-space / embedded), else cwd.
     fn spawn_root(&self, cx: &App) -> PathBuf {
-        self.focus
-            .as_ref()
-            .map(|f| f.read(cx).root())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")))
+        if let Some(focus) = self.focus.as_ref() {
+            return focus.read(cx).root();
+        }
+        if let Some(root) = self.pinned_root.as_ref() {
+            return root.clone();
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
     }
 
     /// Open a new shell tab and make it active.
@@ -512,7 +544,9 @@ fn snapshot(emu: &Emulator) -> (Vec<Vec<RCell>>, Vec<LinkSpan>) {
             let cell = indexed.cell;
             let inverse = cell.flags.contains(Flags::INVERSE);
             let is_cursor = indexed.point == cursor_point;
-            let selected = selection.as_ref().is_some_and(|r| r.contains(indexed.point));
+            let selected = selection
+                .as_ref()
+                .is_some_and(|r| r.contains(indexed.point));
 
             let mut fg = ansi_to_hsla(cell.fg, true);
             let mut bg = ansi_to_hsla(cell.bg, false);
@@ -1094,8 +1128,7 @@ impl Render for TerminalPanel {
                         // selection so it can't swallow the next ⌘C. A double/triple
                         // click selected a word/line and is kept.
                         if this.dragging && !this.drag_moved && this.drag_clearable {
-                            if let Some(emu) = this.active_tab().and_then(|t| t.emulator.as_ref())
-                            {
+                            if let Some(emu) = this.active_tab().and_then(|t| t.emulator.as_ref()) {
                                 emu.clear_selection();
                             }
                             cx.notify();
@@ -1211,9 +1244,7 @@ impl Render for TerminalPanel {
                             }
                         }
                         "v" => {
-                            if let Some(text) =
-                                cx.read_from_clipboard().and_then(|i| i.text())
-                            {
+                            if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
                                 let payload = if emu.bracketed_paste() {
                                     format!("\x1b[200~{text}\x1b[201~")
                                 } else {
@@ -1252,16 +1283,9 @@ impl Render for TerminalPanel {
                     if reporting {
                         let button = if lines > 0 { 64 } else { 65 };
                         for _ in 0..lines.unsigned_abs() {
-                            this.report_mouse(
-                                ev.position,
-                                button,
-                                MouseKind::Press,
-                                &ev.modifiers,
-                            );
+                            this.report_mouse(ev.position, button, MouseKind::Press, &ev.modifiers);
                         }
-                    } else if let Some(emu) =
-                        this.active_tab().and_then(|t| t.emulator.as_ref())
-                    {
+                    } else if let Some(emu) = this.active_tab().and_then(|t| t.emulator.as_ref()) {
                         emu.scroll(lines);
                     }
                 }),
@@ -1319,26 +1343,27 @@ fn render_line(cells: Vec<RCell>) -> impl IntoElement {
             cell.bg
         };
         match runs.last_mut() {
-            Some((text, fg, b, link))
-                if *fg == cell.fg && *b == bg && *link == cell.link =>
-            {
+            Some((text, fg, b, link)) if *fg == cell.fg && *b == bg && *link == cell.link => {
                 text.push(cell.ch)
             }
             _ => runs.push((cell.ch.to_string(), cell.fg, bg, cell.link)),
         }
     }
 
-    div().flex().flex_row().children(runs.into_iter().map(|(text, fg, bg, link)| {
-        let run = div().bg(bg);
-        if link.is_some() {
-            run.text_color(theme::terminal_link())
-                .underline()
-                .cursor_pointer()
-                .child(SharedString::from(text))
-        } else {
-            run.text_color(fg).child(SharedString::from(text))
-        }
-    }))
+    div()
+        .flex()
+        .flex_row()
+        .children(runs.into_iter().map(|(text, fg, bg, link)| {
+            let run = div().bg(bg);
+            if link.is_some() {
+                run.text_color(theme::terminal_link())
+                    .underline()
+                    .cursor_pointer()
+                    .child(SharedString::from(text))
+            } else {
+                run.text_color(fg).child(SharedString::from(text))
+            }
+        }))
 }
 
 #[cfg(test)]
@@ -1493,7 +1518,10 @@ mod tests {
             ..Default::default()
         };
         // Alt+Left / Alt+Right → word-back / word-forward (xterm modifier 3).
-        assert_eq!(encode_key(&ks("left", None, alt)), Some(b"\x1b[1;3D".to_vec()));
+        assert_eq!(
+            encode_key(&ks("left", None, alt)),
+            Some(b"\x1b[1;3D".to_vec())
+        );
         assert_eq!(
             encode_key(&ks("right", None, alt)),
             Some(b"\x1b[1;3C".to_vec())
@@ -1511,7 +1539,10 @@ mod tests {
             control: true,
             ..Default::default()
         };
-        assert_eq!(encode_key(&ks("up", None, shift)), Some(b"\x1b[1;2A".to_vec()));
+        assert_eq!(
+            encode_key(&ks("up", None, shift)),
+            Some(b"\x1b[1;2A".to_vec())
+        );
         assert_eq!(
             encode_key(&ks("home", None, ctrl)),
             Some(b"\x1b[1;5H".to_vec())
@@ -1527,8 +1558,14 @@ mod tests {
     fn unmodified_arrows_unchanged() {
         let none = gpui::Modifiers::default();
         // No modifier → the bare sequence (regression guard for the base table).
-        assert_eq!(encode_key(&ks("left", None, none)), Some(b"\x1b[D".to_vec()));
-        assert_eq!(encode_key(&ks("home", None, none)), Some(b"\x1b[H".to_vec()));
+        assert_eq!(
+            encode_key(&ks("left", None, none)),
+            Some(b"\x1b[D".to_vec())
+        );
+        assert_eq!(
+            encode_key(&ks("home", None, none)),
+            Some(b"\x1b[H".to_vec())
+        );
         assert_eq!(
             encode_key(&ks("delete", None, none)),
             Some(b"\x1b[3~".to_vec())

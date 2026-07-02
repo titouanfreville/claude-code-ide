@@ -51,9 +51,7 @@ impl CommitPanel {
             if alive.is_err() {
                 break; // panel dropped
             }
-            cx.background_executor()
-                .timer(Duration::from_secs(2))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(2)).await;
         })
         .detach();
         Self {
@@ -73,7 +71,10 @@ impl CommitPanel {
     /// Reload the entries for the active root; notify on change (or root switch).
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let root = self.root(cx);
-        let next = root.as_ref().and_then(|r| load_entries(r)).unwrap_or_default();
+        let next = root
+            .as_ref()
+            .and_then(|r| load_entries(r))
+            .unwrap_or_default();
         if next != self.entries || root != self.loaded_root {
             self.entries = next;
             self.loaded_root = root;
@@ -103,7 +104,9 @@ impl CommitPanel {
     /// Commit the index with the typed message; clear it on success.
     fn do_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.root(cx) else { return };
-        let Some(input) = self.message.clone() else { return };
+        let Some(input) = self.message.clone() else {
+            return;
+        };
         let msg = input.read(cx).value().trim().to_string();
         if msg.is_empty() || self.staged_count() == 0 {
             return;
@@ -221,7 +224,11 @@ impl Render for CommitPanel {
                     .children(staged.iter().enumerate().map(|(i, (rel, s))| {
                         file_row(("staged", i), rel, *s, RowAction::Unstage, cx)
                     }))
-                    .when(staged.is_empty(), |d| d.child(empty_hint("nothing staged — stage files below, or Accept hunks in a review tab")))
+                    .when(staged.is_empty(), |d| {
+                        d.child(empty_hint(
+                            "nothing staged — stage files below, or Accept hunks in a review tab",
+                        ))
+                    })
                     .child(group_header(format!("Changes ({})", changes.len())))
                     .children(changes.iter().enumerate().map(|(i, (rel, s))| {
                         file_row(("change", i), rel, *s, RowAction::Stage, cx)
@@ -300,9 +307,9 @@ impl Render for CommitPanel {
                                 .bg(theme::tint(theme::accent(), 0.18))
                                 .text_color(theme::accent())
                                 .hover(|d| d.bg(theme::tint(theme::accent(), 0.30)))
-                                .on_click(cx.listener(|this, _ev, window, cx| {
-                                    this.do_commit(window, cx)
-                                }));
+                                .on_click(
+                                    cx.listener(|this, _ev, window, cx| this.do_commit(window, cx)),
+                                );
                         } else {
                             btn = btn
                                 .text_color(theme::text_muted())
@@ -310,15 +317,17 @@ impl Render for CommitPanel {
                         }
                         btn
                     })
-                    .children(self.last_result.as_ref().map(|res| match res {
-                        Ok(summary) => div()
-                            .text_size(theme::text_2xs())
-                            .text_color(theme::git_added())
-                            .child(summary.clone()),
-                        Err(err) => div()
-                            .text_size(theme::text_2xs())
-                            .text_color(theme::git_deleted())
-                            .child(err.clone()),
+                    .children(self.last_result.as_ref().map(|res| {
+                        match res {
+                            Ok(summary) => div()
+                                .text_size(theme::text_2xs())
+                                .text_color(theme::git_added())
+                                .child(summary.clone()),
+                            Err(err) => div()
+                                .text_size(theme::text_2xs())
+                                .text_color(theme::git_deleted())
+                                .child(err.clone()),
+                        }
                     })),
             )
     }

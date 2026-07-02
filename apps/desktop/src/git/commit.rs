@@ -113,9 +113,11 @@ pub fn stage(root: &Path, rel: &Path) -> Result<(), String> {
 pub fn unstage(root: &Path, rel: &Path) -> Result<(), String> {
     match run_git(root, &["restore", "--staged", "--", &rel.to_string_lossy()]) {
         Ok(_) => Ok(()),
-        Err(e) if e.contains("HEAD") => {
-            run_git(root, &["rm", "--cached", "-q", "--", &rel.to_string_lossy()]).map(|_| ())
-        }
+        Err(e) if e.contains("HEAD") => run_git(
+            root,
+            &["rm", "--cached", "-q", "--", &rel.to_string_lossy()],
+        )
+        .map(|_| ()),
         Err(e) => Err(e),
     }
 }
@@ -135,7 +137,8 @@ mod tests {
         // "MM" = staged-modified AND worktree-modified; "M " staged only;
         // " M" worktree only; "??" untracked; "A " staged add;
         // rename "R  to" consumes its "from" token.
-        let out = "MM both.rs\0M  staged.rs\0 M wt.rs\0?? new.txt\0A  added.rs\0R  to.rs\0from.rs\0";
+        let out =
+            "MM both.rs\0M  staged.rs\0 M wt.rs\0?? new.txt\0A  added.rs\0R  to.rs\0from.rs\0";
         let e = parse_entries(out);
         let find = |p: &str| e.iter().find(|c| c.rel == Path::new(p)).unwrap();
 
@@ -153,7 +156,10 @@ mod tests {
         // Source token consumed.
         assert!(e.iter().all(|c| c.rel != Path::new("from.rs")));
         // Sorted by path.
-        let paths: Vec<_> = e.iter().map(|c| c.rel.to_string_lossy().into_owned()).collect();
+        let paths: Vec<_> = e
+            .iter()
+            .map(|c| c.rel.to_string_lossy().into_owned())
+            .collect();
         let mut sorted = paths.clone();
         sorted.sort();
         assert_eq!(paths, sorted);
@@ -187,7 +193,10 @@ mod tests {
 
         stage(&dir, Path::new("a.txt")).unwrap();
         let summary = commit(&dir, "add a").unwrap();
-        assert!(summary.contains("add a") || summary.contains("1 file"), "{summary}");
+        assert!(
+            summary.contains("add a") || summary.contains("1 file"),
+            "{summary}"
+        );
         assert!(load_entries(&dir).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);

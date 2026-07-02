@@ -30,7 +30,10 @@ impl PolicyDecisionPoint for DefaultPdp {
         //     branch is the seam.)
         if req.verb.map(|v| v.is_phase_control()).unwrap_or(false) {
             return Ok(PermissionOutcome::Prompt {
-                reason: format!("phase change requires operator approval: {}", req.description),
+                reason: format!(
+                    "phase change requires operator approval: {}",
+                    req.description
+                ),
             });
         }
 
@@ -46,6 +49,8 @@ impl PolicyDecisionPoint for DefaultPdp {
             // project freeze.
             let scope = req.write_scope.unwrap_or(WriteScope::Project);
             let permitted = match scope {
+                // OS temp is outside the tree — writable in every phase, incl. Commit.
+                WriteScope::Ephemeral => true,
                 WriteScope::AiWorkspace => req.phase.allows_ai_workspace_writes(),
                 WriteScope::Project => req.phase.allows_writes(),
             };
@@ -68,6 +73,12 @@ impl PolicyDecisionPoint for DefaultPdp {
                 // most needs to know how to get unblocked (request a phase change), so
                 // it doesn't just retry the same write.
                 let (what, remedy) = match scope {
+                    // Ephemeral is permitted in every phase, so it never reaches here;
+                    // the arm exists only for match exhaustiveness.
+                    WriteScope::Ephemeral => (
+                        "is fully frozen (commit gate)",
+                        "write scratch to /tmp instead (writable in every phase)",
+                    ),
                     WriteScope::AiWorkspace => (
                         "is fully frozen (commit gate)",
                         "the commit gate freezes every write — ask the operator, or call \
@@ -75,8 +86,11 @@ impl PolicyDecisionPoint for DefaultPdp {
                     ),
                     WriteScope::Project => (
                         "freezes project files",
-                        "call request_phase('auto') to ask the operator for write access \
-                         (or phase_status to confirm where you are)",
+                        "write reports/notes to an AI-workspace dir (.ai/, .bmad/, docs/, \
+                         .claude/) — those stay writable in every phase — or to /tmp for \
+                         throwaway scratch; only call request_phase('auto') if the change \
+                         truly belongs in project files (or phase_status to confirm where \
+                         you are)",
                     ),
                 };
                 return Ok(PermissionOutcome::Deny {
@@ -186,11 +200,21 @@ mod tests {
         let pdp = DefaultPdp;
         // Discovery = look around freely (CC `auto`) but never touch files.
         let deny = pdp
-            .decide(&req(Phase::Discovery, TrustTier::Trusted, None, DangerClass::Risky))
+            .decide(&req(
+                Phase::Discovery,
+                TrustTier::Trusted,
+                None,
+                DangerClass::Risky,
+            ))
             .unwrap();
         assert!(matches!(deny, PermissionOutcome::Deny { .. }));
         let allow = pdp
-            .decide(&req(Phase::Discovery, TrustTier::Trusted, None, DangerClass::Safe))
+            .decide(&req(
+                Phase::Discovery,
+                TrustTier::Trusted,
+                None,
+                DangerClass::Safe,
+            ))
             .unwrap();
         assert_eq!(allow, PermissionOutcome::Allow);
     }
@@ -200,7 +224,12 @@ mod tests {
         let pdp = DefaultPdp;
         // Review now permits edits (e.g. addressing review feedback).
         let out = pdp
-            .decide(&req(Phase::Review, TrustTier::Trusted, None, DangerClass::Risky))
+            .decide(&req(
+                Phase::Review,
+                TrustTier::Trusted,
+                None,
+                DangerClass::Risky,
+            ))
             .unwrap();
         assert_eq!(out, PermissionOutcome::Allow);
     }
@@ -209,7 +238,12 @@ mod tests {
     fn commit_gate_is_read_only() {
         let pdp = DefaultPdp;
         let out = pdp
-            .decide(&req(Phase::Commit, TrustTier::Trusted, None, DangerClass::Risky))
+            .decide(&req(
+                Phase::Commit,
+                TrustTier::Trusted,
+                None,
+                DangerClass::Risky,
+            ))
             .unwrap();
         assert!(matches!(out, PermissionOutcome::Deny { .. }));
     }
@@ -228,7 +262,10 @@ mod tests {
                     Some(WriteScope::Project),
                 ))
                 .unwrap();
-            assert!(matches!(project, PermissionOutcome::Deny { .. }), "{phase:?} project");
+            assert!(
+                matches!(project, PermissionOutcome::Deny { .. }),
+                "{phase:?} project"
+            );
             // ...but still let the agent write its own plans / BMad entries / handoffs.
             let ai = pdp
                 .decide(&req_scoped(
@@ -240,6 +277,25 @@ mod tests {
                 ))
                 .unwrap();
             assert_eq!(ai, PermissionOutcome::Allow, "{phase:?} ai-workspace");
+        }
+    }
+
+    #[test]
+    fn ephemeral_writes_are_allowed_in_every_phase_including_commit() {
+        let pdp = DefaultPdp;
+        // OS temp is outside the tree — writable in every phase, even the fully-frozen
+        // Commit gate (a temp write can't change what gets committed).
+        for phase in Phase::ALL {
+            let out = pdp
+                .decide(&req_scoped(
+                    phase,
+                    TrustTier::Trusted,
+                    None,
+                    DangerClass::Risky,
+                    Some(WriteScope::Ephemeral),
+                ))
+                .unwrap();
+            assert_eq!(out, PermissionOutcome::Allow, "{phase:?} ephemeral");
         }
     }
 

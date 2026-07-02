@@ -118,9 +118,7 @@ pub fn space_tab_bar(
                             this.remove_space(close_id.clone(), cx);
                         })),
                 )
-                .on_click(cx.listener(move |this, _ev, _w, cx| {
-                    this.select_space(id.clone(), cx)
-                }))
+                .on_click(cx.listener(move |this, _ev, _w, cx| this.select_space(id.clone(), cx)))
         }))
         // Spacer keeps the tabs left-aligned. The create actions (＋ Session, Open
         // Project) now live in the main toolbar / its project selector dropdown.

@@ -86,7 +86,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mlc-git-det-{}", std::process::id()));
         let git = dir.join(".git");
         std::fs::create_dir_all(&git).unwrap();
-        std::fs::write(git.join("HEAD"), "0123456789abcdef0123456789abcdef01234567\n").unwrap();
+        std::fs::write(
+            git.join("HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
         assert_eq!(current_branch(&dir).as_deref(), Some("@0123456"));
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseDownEvent,
-    SharedString, WeakEntity, Window,
+    div, px, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    MouseDownEvent, SharedString, WeakEntity, Window,
 };
 use gpui_component::dock::{Panel, PanelEvent, PanelInfo, PanelState, TabPanel};
 use gpui_component::input::{Input, InputState};
@@ -254,7 +254,8 @@ impl HttpPanel {
     }
 
     fn project_root(cx: &App) -> Option<PathBuf> {
-        cx.try_global::<ShellDeps>().map(|d| d.focus.read(cx).root())
+        cx.try_global::<ShellDeps>()
+            .map(|d| d.focus.read(cx).root())
     }
 
     fn manifest(cx: &App) -> http::HttpManifest {
@@ -284,7 +285,10 @@ impl HttpPanel {
     fn toggle_env_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.env_editor_open = !self.env_editor_open;
         if self.env_editor_open {
-            let active = self.env.clone().or_else(|| Self::manifest(cx).active_name());
+            let active = self
+                .env
+                .clone()
+                .or_else(|| Self::manifest(cx).active_name());
             self.load_env_into_editor(active, window, cx);
         }
         cx.notify();
@@ -330,7 +334,9 @@ impl HttpPanel {
         let Some(root) = Self::project_root(cx) else {
             return;
         };
-        let name = Self::input_text(&self.env_name_input, cx).trim().to_string();
+        let name = Self::input_text(&self.env_name_input, cx)
+            .trim()
+            .to_string();
         if name.is_empty() {
             return;
         }
@@ -373,7 +379,12 @@ impl HttpPanel {
         let mut manifest = Self::manifest(cx);
         manifest.environments.remove(&name);
         if manifest.active == name {
-            manifest.active = manifest.environments.keys().next().cloned().unwrap_or_default();
+            manifest.active = manifest
+                .environments
+                .keys()
+                .next()
+                .cloned()
+                .unwrap_or_default();
         }
         let _ = http::save_manifest(&root, &manifest);
         self.env = None;
@@ -434,7 +445,10 @@ impl HttpPanel {
         // Auto Content-Type for the format, unless the operator set one explicitly.
         if body.is_some() {
             if let Some(ct) = self.body_format.content_type() {
-                if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+                if !headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                {
                     headers.push(("Content-Type".to_string(), ct.to_string()));
                 }
             }
@@ -446,9 +460,7 @@ impl HttpPanel {
             body,
         };
         let method = self.method.clone();
-        let history = cx
-            .try_global::<ShellDeps>()
-            .map(|d| d.http_history.clone());
+        let history = cx.try_global::<ShellDeps>().map(|d| d.http_history.clone());
 
         self.loading = true;
         self.error = None;
@@ -655,8 +667,7 @@ impl Render for HttpPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.url_input.is_none() {
             self.url_input = Some(cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("https://…  or  {{base_url}}/path")
+                InputState::new(window, cx).placeholder("https://…  or  {{base_url}}/path")
             }));
             self.body_input = Some(cx.new(|cx| {
                 InputState::new(window, cx)
@@ -772,7 +783,11 @@ impl Render for HttpPanel {
             .child(self.request_config(cx))
             // ── Response ────────────────────────────────────────────────────────────
             .child(self.response_region(cx))
-            .children(super::tab_menu_overlay(self.tab_menu.as_ref(), dismiss, window))
+            .children(super::tab_menu_overlay(
+                self.tab_menu.as_ref(),
+                dismiss,
+                window,
+            ))
     }
 }
 
@@ -802,10 +817,14 @@ impl HttpPanel {
                     .pb(px(3.))
                     .children(BodyFormat::ALL.iter().map(|f| {
                         let f = *f;
-                        format_chip(f.label(), self.body_format == f, cx.listener(move |this, _e, _w, cx| {
-                            this.body_format = f;
-                            cx.notify();
-                        }))
+                        format_chip(
+                            f.label(),
+                            self.body_format == f,
+                            cx.listener(move |this, _e, _w, cx| {
+                                this.body_format = f;
+                                cx.notify();
+                            }),
+                        )
                     })),
             )
             .child(self.body_editor(cx))
@@ -830,7 +849,11 @@ impl HttpPanel {
                             .flex_none()
                             .w(px(16.))
                             .text_size(theme::text_sm())
-                            .text_color(if on { theme::accent() } else { theme::tree_glyph() })
+                            .text_color(if on {
+                                theme::accent()
+                            } else {
+                                theme::tree_glyph()
+                            })
                             .cursor_pointer()
                             .child(if on { "☑" } else { "☐" })
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -840,8 +863,18 @@ impl HttpPanel {
                                 cx.notify();
                             })),
                     )
-                    .child(div().flex_1().min_w(px(0.)).child(Input::new(&r.key).small()))
-                    .child(div().flex_1().min_w(px(0.)).child(Input::new(&r.value).small()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(Input::new(&r.key).small()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(Input::new(&r.value).small()),
+                    )
                     // Remove row.
                     .child(
                         div()
@@ -851,7 +884,11 @@ impl HttpPanel {
                             .text_size(theme::text_xs())
                             .text_color(theme::text_muted())
                             .cursor_pointer()
-                            .hover(|d| d.text_color(theme::status_color(moonlight_domain::session::SessionStatus::Errored)))
+                            .hover(|d| {
+                                d.text_color(theme::status_color(
+                                    moonlight_domain::session::SessionStatus::Errored,
+                                ))
+                            })
                             .child("✕")
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 if i < this.rows_mut(t).len() {
@@ -1014,7 +1051,9 @@ impl HttpPanel {
                     .px_2()
                     .children(self.env_name_input.as_ref().map(Input::new)),
             )
-            .child(section_label("Variables  ·  use as {{name}} in URL / headers / body"))
+            .child(section_label(
+                "Variables  ·  use as {{name}} in URL / headers / body",
+            ))
             .child(self.kv_table(Tbl::Vars, cx))
             .child(section_label("Allowed hosts"))
             .child(
@@ -1092,9 +1131,9 @@ impl HttpPanel {
                     .text_size(theme::text_xs())
                     .text_color(theme::text_secondary())
                     .child(name)
-                    .on_click(cx.listener(move |this, _e, window, cx| {
-                        this.load_saved(i, window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(move |this, _e, window, cx| this.load_saved(i, window, cx)),
+                    ),
             );
         }
         col
@@ -1108,7 +1147,9 @@ impl HttpPanel {
                 .min_h(px(0.))
                 .p_3()
                 .text_size(theme::text_xs())
-                .text_color(theme::status_color(moonlight_domain::session::SessionStatus::Errored))
+                .text_color(theme::status_color(
+                    moonlight_domain::session::SessionStatus::Errored,
+                ))
                 .child(err.clone())
                 .into_any_element();
         }
@@ -1178,7 +1219,13 @@ impl HttpPanel {
                     .gap_3()
                     .px_2()
                     .py(px(4.))
-                    .child(div().font_weight(gpui::FontWeight::MEDIUM).text_color(status_color).text_size(theme::text_sm()).child(status_text))
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(status_color)
+                            .text_size(theme::text_sm())
+                            .child(status_text),
+                    )
                     .child(meta(format!("{} ms", resp.ms)))
                     .child(meta(format!("{} B", resp.bytes))),
             )
@@ -1191,12 +1238,32 @@ impl HttpPanel {
                     .gap_1()
                     .px_2()
                     .pb(px(2.))
-                    .child(tab_chip("r-tab-body", "Body", self.resp_tab == RespTab::Body,
-                        cx.listener(|this, _e, _w, cx| { this.resp_tab = RespTab::Body; cx.notify(); })))
-                    .child(tab_chip("r-tab-headers", &format!("Headers ({})", resp.headers.len()), self.resp_tab == RespTab::Headers,
-                        cx.listener(|this, _e, _w, cx| { this.resp_tab = RespTab::Headers; cx.notify(); }))),
+                    .child(tab_chip(
+                        "r-tab-body",
+                        "Body",
+                        self.resp_tab == RespTab::Body,
+                        cx.listener(|this, _e, _w, cx| {
+                            this.resp_tab = RespTab::Body;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(tab_chip(
+                        "r-tab-headers",
+                        &format!("Headers ({})", resp.headers.len()),
+                        self.resp_tab == RespTab::Headers,
+                        cx.listener(|this, _e, _w, cx| {
+                            this.resp_tab = RespTab::Headers;
+                            cx.notify();
+                        }),
+                    )),
             )
-            .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(body_view))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(body_view),
+            )
             .into_any_element()
     }
 }
@@ -1216,8 +1283,18 @@ fn header_row(k: &str, v: &str) -> impl IntoElement {
         .gap_2()
         .font_family(theme::mono_font())
         .text_size(theme::text_2xs())
-        .child(div().flex_none().text_color(theme::text_secondary()).child(format!("{k}:")))
-        .child(div().flex_1().text_color(theme::text_muted()).child(v.to_string()))
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme::text_secondary())
+                .child(format!("{k}:")),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_color(theme::text_muted())
+                .child(v.to_string()),
+        )
 }
 
 /// A small uppercased section header inside the request-config pane.

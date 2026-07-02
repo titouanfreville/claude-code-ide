@@ -102,9 +102,7 @@ pub fn url_for_session(id: &SessionId, cx: &App) -> Option<String> {
 /// embedded `moonlight` MCP server into its `claude` launch command. The JSON
 /// carries no single quotes, so the single-quoted shell arg is safe.
 pub fn mcp_config_flag(url: &str) -> String {
-    format!(
-        r#" --mcp-config '{{"mcpServers":{{"moonlight":{{"type":"http","url":"{url}"}}}}}}'"#
-    )
+    format!(r#" --mcp-config '{{"mcpServers":{{"moonlight":{{"type":"http","url":"{url}"}}}}}}'"#)
 }
 
 /// The default context every IDE-managed session is launched with: the workflow-phase
@@ -190,7 +188,10 @@ mod tests {
         let host = handle_on(&rt);
 
         let a1 = host.url_for(&SessionId::new("s1")).expect("bind s1");
-        assert!(a1.starts_with("http://127.0.0.1:") && a1.ends_with("/mcp"), "{a1}");
+        assert!(
+            a1.starts_with("http://127.0.0.1:") && a1.ends_with("/mcp"),
+            "{a1}"
+        );
         // Same session → the cached endpoint, not a second bind.
         let a2 = host.url_for(&SessionId::new("s1")).expect("cached s1");
         assert_eq!(a1, a2);
@@ -214,14 +215,27 @@ mod tests {
         // Whichever branch, the flag must be short — the long context rides in a file
         // (file form) or is the short inline fallback — so the typed launch line never
         // overflows the terminal's line-input limit (the bug this fixes).
-        assert!(flag.len() < 400, "launch flag must stay short: {} chars", flag.len());
+        assert!(
+            flag.len() < 400,
+            "launch flag must stay short: {} chars",
+            flag.len()
+        );
         assert!(flag.starts_with(" --append-system-prompt "), "{flag}");
         // The short inline fallback must be a safe single-quoted shell arg.
-        assert!(!IDE_CONTEXT_SHORT.contains('\n'), "short context must be one line");
-        assert!(!IDE_CONTEXT_SHORT.contains('\''), "short context must have no apostrophes");
+        assert!(
+            !IDE_CONTEXT_SHORT.contains('\n'),
+            "short context must be one line"
+        );
+        assert!(
+            !IDE_CONTEXT_SHORT.contains('\''),
+            "short context must have no apostrophes"
+        );
         // Both forms teach the key affordance.
         assert!(IDE_CONTEXT.contains("request_phase"), "{IDE_CONTEXT}");
-        assert!(IDE_CONTEXT_SHORT.contains("request_phase"), "{IDE_CONTEXT_SHORT}");
+        assert!(
+            IDE_CONTEXT_SHORT.contains("request_phase"),
+            "{IDE_CONTEXT_SHORT}"
+        );
     }
 
     #[test]
@@ -229,8 +243,16 @@ mod tests {
         // The assembled fragment is typed into a shell; unbalanced quotes were exactly
         // the launch bug. Both single and double quotes must come in pairs.
         let flags = session_launch_flags("http://127.0.0.1:9999/mcp");
-        assert_eq!(flags.matches('\'').count() % 2, 0, "unbalanced single quotes: {flags}");
-        assert_eq!(flags.matches('"').count() % 2, 0, "unbalanced double quotes: {flags}");
+        assert_eq!(
+            flags.matches('\'').count() % 2,
+            0,
+            "unbalanced single quotes: {flags}"
+        );
+        assert_eq!(
+            flags.matches('"').count() % 2,
+            0,
+            "unbalanced double quotes: {flags}"
+        );
     }
 
     #[test]

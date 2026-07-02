@@ -154,7 +154,10 @@ mod tests {
 
         let loaded = load(&root);
         assert_eq!(loaded.len(), 2);
-        let s1 = loaded.iter().find(|s| s.id == SessionId::new("s1")).unwrap();
+        let s1 = loaded
+            .iter()
+            .find(|s| s.id == SessionId::new("s1"))
+            .unwrap();
         assert_eq!(s1.phase, Phase::Review);
 
         // The dir self-ignores so it never shows in git status.

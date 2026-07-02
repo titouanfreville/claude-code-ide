@@ -23,6 +23,7 @@ use async_trait::async_trait;
 
 use moonlight_domain::audit::AuditAction;
 use moonlight_domain::errors::ControlError;
+use moonlight_domain::phase::Phase;
 use moonlight_domain::ports::mcp::{
     ActorRequest, ActorResult, ApprovalDecision, ApprovalGate, AuditSink, McpActor,
     PermissionRequest, PolicyDecisionPoint, SessionPolicySnapshot, SessionPolicyView, VerbExecutor,
@@ -85,7 +86,12 @@ async fn execute_and_audit(
     snapshot: &SessionPolicySnapshot,
 ) -> ActorResult {
     match executor
-        .execute(&req.session, snapshot.root.as_deref(), req.verb, &req.payload)
+        .execute(
+            &req.session,
+            snapshot.root.as_deref(),
+            req.verb,
+            &req.payload,
+        )
         .await
     {
         Ok(raw) => {
@@ -157,9 +163,15 @@ impl McpActor for ActorService {
             // Prompt → the operator must decide.
             PermissionOutcome::Prompt { .. } => {
                 if req.verb.is_phase_control() {
-                    // Auto-phasing: the operator pre-authorized phase changes, so run it
-                    // inline (fast — no hold), audited as an auto-approval.
-                    if self.auto_phase.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Auto-approve routine phase changes inline; only a move that GAINS
+                    // project-write access from a frozen phase (Discovery/Plan/Commit →
+                    // Auto/Test/Review) waits on the operator. The operator's global
+                    // auto-phasing toggle pre-authorizes even the sensitive ones. Either
+                    // way the change runs inline (fast — no hold), audited as an
+                    // auto-approval.
+                    let needs_operator = phase_change_needs_operator(snapshot.phase, &req.payload);
+                    if !needs_operator || self.auto_phase.load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         self.audit.record(
                             &req.session,
                             AuditAction::Approved {
@@ -220,7 +232,9 @@ impl McpActor for ActorService {
                     ApprovalDecision::Approve => {
                         self.audit.record(
                             &req.session,
-                            AuditAction::Approved { what: describe(req) },
+                            AuditAction::Approved {
+                                what: describe(req),
+                            },
                             false,
                         );
                         Ok(execute_and_audit(&self.executor, &self.audit, req, &snapshot).await)
@@ -283,6 +297,10 @@ impl ApprovalGate for DenyingApprovalGate {
 fn danger_class(verb: McpVerb) -> DangerClass {
     match verb {
         McpVerb::RunWithCoverage | McpVerb::QueryDb | McpVerb::OpenReview => DangerClass::Safe,
+        // Presenting a plan opens a review surface (no project side effect). The real
+        // gating is the PreToolUse hook *hold* (operator review), so here it is `Safe` —
+        // the server-side PDP must not double-prompt after the hook already held+approved.
+        McpVerb::PresentPlan => DangerClass::Safe,
         // Reading the Run console (status / captured logs / detected targets) has no
         // side effects.
         McpVerb::RunStatus | McpVerb::RunLogs | McpVerb::RunListTargets => DangerClass::Safe,
@@ -299,6 +317,27 @@ fn danger_class(verb: McpVerb) -> DangerClass {
         // A pure read of the session's own phase: harmless, runs in any phase.
         McpVerb::PhaseStatus => DangerClass::Safe,
     }
+}
+
+/// Whether a `request_phase` needs the operator's explicit OK, or may auto-approve.
+///
+/// The only sensitive move is one that **gains project-write access from a frozen
+/// phase** — Discovery/Plan/Commit (no writes) → Auto/Test/Review (writes). Every other
+/// transition (staying frozen, staying writable, or dropping back to a frozen phase)
+/// auto-approves so the agent isn't blocked stepping through the routine workflow. The
+/// target is read from the payload (empty / `next` ⇒ the next phase); an unparseable
+/// target is treated as sensitive so a typo can never silently unlock writes.
+fn phase_change_needs_operator(current: Phase, payload: &str) -> bool {
+    let token = payload.trim();
+    let target = if token.is_empty() || token.eq_ignore_ascii_case("next") {
+        current.next()
+    } else {
+        match Phase::from_token(token) {
+            Some(p) => p,
+            None => return true,
+        }
+    };
+    !current.allows_writes() && target.allows_writes()
 }
 
 /// A short audit/prompt description of a verb request (payload truncated).
@@ -626,6 +665,50 @@ mod tests {
         assert!(!exec.was_called());
     }
 
+    #[test]
+    fn phase_change_needs_operator_only_when_gaining_writes_from_frozen() {
+        // Gaining project-write access from a frozen phase = sensitive.
+        assert!(phase_change_needs_operator(Phase::Discovery, "auto"));
+        assert!(phase_change_needs_operator(Phase::Plan, "auto"));
+        assert!(phase_change_needs_operator(Phase::Plan, "test"));
+        assert!(phase_change_needs_operator(Phase::Commit, "auto"));
+        // `next` from Plan lands in AutoImplement (writable) — still sensitive.
+        assert!(phase_change_needs_operator(Phase::Plan, "next"));
+        // Frozen → frozen (Discovery → Plan, or `next` from Discovery) = fine.
+        assert!(!phase_change_needs_operator(Phase::Discovery, "plan"));
+        assert!(!phase_change_needs_operator(Phase::Discovery, "next"));
+        // Writable → writable, and dropping back to a frozen phase = fine.
+        assert!(!phase_change_needs_operator(Phase::AutoImplement, "test"));
+        assert!(!phase_change_needs_operator(Phase::Review, "commit"));
+        // An unparseable target fails safe (treated as sensitive).
+        assert!(phase_change_needs_operator(Phase::Plan, "ludicrous-speed"));
+    }
+
+    #[tokio::test]
+    async fn non_sensitive_phase_change_auto_approves_without_operator() {
+        // Discovery → Plan stays frozen (no new write access), so it must NOT wait on
+        // the operator even behind a default-deny gate: it auto-approves inline and runs.
+        let exec = Arc::new(FakeExecutor::ok("now in the Plan phase"));
+        let audit = Arc::new(FakeAudit::default());
+        let svc = service(
+            Some(snapshot(Phase::Discovery, TrustTier::Observed)),
+            exec.clone(),
+            audit.clone(),
+        );
+        let req = ActorRequest {
+            session: SessionId::new("s1"),
+            verb: McpVerb::RequestPhase,
+            payload: "plan".into(),
+        };
+        let out = svc.run(&req).await.unwrap();
+        assert!(out.ok, "{out:?}");
+        assert!(exec.was_called(), "a non-sensitive phase change runs inline");
+        assert!(audit
+            .actions()
+            .iter()
+            .any(|a| matches!(a, AuditAction::Approved { .. })));
+    }
+
     #[tokio::test]
     async fn allowed_verb_runs_compacts_and_audits_executed() {
         let exec = Arc::new(FakeExecutor::ok(
@@ -693,7 +776,10 @@ mod tests {
         );
         let result = svc.run(&req).await.unwrap();
         assert!(!result.ok);
-        assert!(!exec.was_called(), "frozen phase must not execute run_start");
+        assert!(
+            !exec.was_called(),
+            "frozen phase must not execute run_start"
+        );
         assert!(matches!(&audit.actions()[..], [AuditAction::Denied { .. }]));
 
         // AutoImplement at Standard: allowed autonomously.
@@ -756,7 +842,10 @@ mod tests {
         // Audit trail: Approved, then VerbExecuted.
         assert!(matches!(
             &audit.actions()[..],
-            [AuditAction::Approved { .. }, AuditAction::VerbExecuted { .. }]
+            [
+                AuditAction::Approved { .. },
+                AuditAction::VerbExecuted { .. }
+            ]
         ));
     }
 

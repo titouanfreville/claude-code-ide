@@ -131,10 +131,13 @@ impl Render for ProblemsPanel {
         let summary = if self.files.is_empty() {
             "no problems".to_string()
         } else {
-            format!("{} error{} · {} warning{}", c.errors,
+            format!(
+                "{} error{} · {} warning{}",
+                c.errors,
                 if c.errors == 1 { "" } else { "s" },
                 c.warnings,
-                if c.warnings == 1 { "" } else { "s" })
+                if c.warnings == 1 { "" } else { "s" }
+            )
         };
 
         div()
@@ -177,14 +180,21 @@ impl Render for ProblemsPanel {
                     .py_1()
                     .flex()
                     .flex_col()
-                    .children(self.files.iter().enumerate().flat_map(|(fi, (path, rows))| {
-                        let mut out: Vec<gpui::AnyElement> =
-                            vec![file_header(&display_path(path, &root), rows).into_any_element()];
-                        out.extend(rows.iter().enumerate().map(|(ri, d)| {
-                            problem_row(fi * 10_000 + ri, path.clone(), d, cx).into_any_element()
-                        }));
-                        out
-                    }))
+                    .children(
+                        self.files
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(fi, (path, rows))| {
+                                let mut out: Vec<gpui::AnyElement> =
+                                    vec![file_header(&display_path(path, &root), rows)
+                                        .into_any_element()];
+                                out.extend(rows.iter().enumerate().map(|(ri, d)| {
+                                    problem_row(fi * 10_000 + ri, path.clone(), d, cx)
+                                        .into_any_element()
+                                }));
+                                out
+                            }),
+                    )
                     .into_any_element()
             })
     }
@@ -224,7 +234,11 @@ fn file_header(rel: &str, rows: &[Diagnostic]) -> impl IntoElement {
         .py(px(3.))
         .bg(theme::surface_sunken())
         .text_size(theme::text_xs())
-        .child(div().text_color(theme::text_secondary()).child(rel.to_string()))
+        .child(
+            div()
+                .text_color(theme::text_secondary())
+                .child(rel.to_string()),
+        )
         .when(errors > 0, |d| {
             d.child(
                 div()
@@ -315,7 +329,11 @@ mod tests {
         assert_eq!((c.errors, c.warnings, c.others), (1, 2, 1));
         assert_eq!(c.lamp(), Some(theme::status_color(SessionStatus::Errored)));
 
-        let warn_only = Counts { errors: 0, warnings: 1, others: 0 };
+        let warn_only = Counts {
+            errors: 0,
+            warnings: 1,
+            others: 0,
+        };
         assert_eq!(
             warn_only.lamp(),
             Some(theme::status_color(SessionStatus::WaitingInput))

@@ -141,7 +141,10 @@ mod tests {
     #[test]
     fn indent_detects_tabs_spaces_and_ignores_one_space_artifacts() {
         assert_eq!(Indent::detect("fn a() {\n\tlet x = 1;\n}"), Indent::Tabs);
-        assert_eq!(Indent::detect("fn a() {\n    let x = 1;\n}"), Indent::Spaces(4));
+        assert_eq!(
+            Indent::detect("fn a() {\n    let x = 1;\n}"),
+            Indent::Spaces(4)
+        );
         // A block-comment ` *` line (1 space) must not be mistaken for a 1-space unit.
         assert_eq!(
             Indent::detect("/*\n * doc\n */\nfn a() {\n  let x = 1;\n}"),

@@ -196,7 +196,10 @@ mod tests {
     fn fixed_resolver_ignores_cwd() {
         let r = AiWorkspaceResolver::fixed(AiWorkspace::default());
         let ai = r.for_cwd("/anywhere");
-        assert_eq!(ai.scope_of("/anywhere/.ai/x", "/anywhere"), WriteScope::AiWorkspace);
+        assert_eq!(
+            ai.scope_of("/anywhere/.ai/x", "/anywhere"),
+            WriteScope::AiWorkspace
+        );
     }
 
     #[test]
@@ -208,9 +211,18 @@ mod tests {
         let r = AiWorkspaceResolver::layered(AiWorkspaceConfig::default());
         let ai = r.for_cwd(&cwd);
         // Default roots still apply, plus the workspace-declared extra.
-        assert_eq!(ai.scope_of(&format!("{cwd}/.ai/x"), &cwd), WriteScope::AiWorkspace);
-        assert_eq!(ai.scope_of(&format!("{cwd}/scratch/x"), &cwd), WriteScope::AiWorkspace);
-        assert_eq!(ai.scope_of(&format!("{cwd}/src/x"), &cwd), WriteScope::Project);
+        assert_eq!(
+            ai.scope_of(&format!("{cwd}/.ai/x"), &cwd),
+            WriteScope::AiWorkspace
+        );
+        assert_eq!(
+            ai.scope_of(&format!("{cwd}/scratch/x"), &cwd),
+            WriteScope::AiWorkspace
+        );
+        assert_eq!(
+            ai.scope_of(&format!("{cwd}/src/x"), &cwd),
+            WriteScope::Project
+        );
     }
 
     #[test]
@@ -224,9 +236,15 @@ mod tests {
         let r = AiWorkspaceResolver::layered(AiWorkspaceConfig::default());
         let ai = r.for_cwd(&cwd);
         // The ancestor's config (roots=["docs"]) governs a session in the subdir.
-        assert_eq!(ai.scope_of(&format!("{cwd}/docs/x"), &cwd), WriteScope::AiWorkspace);
+        assert_eq!(
+            ai.scope_of(&format!("{cwd}/docs/x"), &cwd),
+            WriteScope::AiWorkspace
+        );
         // It replaced the default base, so `.ai` is no longer AI-workspace here.
-        assert_eq!(ai.scope_of(&format!("{cwd}/.ai/x"), &cwd), WriteScope::Project);
+        assert_eq!(
+            ai.scope_of(&format!("{cwd}/.ai/x"), &cwd),
+            WriteScope::Project
+        );
     }
 
     #[test]
@@ -242,8 +260,14 @@ mod tests {
         };
         let r = AiWorkspaceResolver::layered(user);
         let ai = r.for_cwd(&cwd);
-        assert_eq!(ai.scope_of(&format!("{cwd}/mynotes/x"), &cwd), WriteScope::AiWorkspace);
-        assert_eq!(ai.scope_of(&format!("{cwd}/.ai/x"), &cwd), WriteScope::AiWorkspace);
+        assert_eq!(
+            ai.scope_of(&format!("{cwd}/mynotes/x"), &cwd),
+            WriteScope::AiWorkspace
+        );
+        assert_eq!(
+            ai.scope_of(&format!("{cwd}/.ai/x"), &cwd),
+            WriteScope::AiWorkspace
+        );
     }
 
     #[test]
@@ -279,7 +303,10 @@ mod tests {
         let cfg = load_config(&path).unwrap();
         assert_eq!(
             cfg.safe_tools,
-            vec!["mcp__phoenix__*".to_string(), "mcp__db__run_select".to_string()]
+            vec![
+                "mcp__phoenix__*".to_string(),
+                "mcp__db__run_select".to_string()
+            ]
         );
     }
 
@@ -309,6 +336,9 @@ mod tests {
         let err = append_safe_tool(&path, "mcp__phoenix__*").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         // The original (malformed) content is untouched.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ this is not json");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ this is not json"
+        );
     }
 }

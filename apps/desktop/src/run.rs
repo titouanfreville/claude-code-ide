@@ -422,7 +422,11 @@ mod tests {
     use super::*;
 
     /// Poll until `pred` holds on run `id` or ~5s passes.
-    fn wait_for(registry: &RunRegistry, id: u64, pred: impl Fn(&RunSnapshot) -> bool) -> RunSnapshot {
+    fn wait_for(
+        registry: &RunRegistry,
+        id: u64,
+        pred: impl Fn(&RunSnapshot) -> bool,
+    ) -> RunSnapshot {
         for _ in 0..100 {
             if let Some(snap) = registry.snapshot(id) {
                 if pred(&snap) {
@@ -478,7 +482,9 @@ mod tests {
     #[test]
     fn stop_kills_a_running_process() {
         let reg = RunRegistry::new();
-        let id = reg.start("sleeper", "sleep 30", std::env::temp_dir()).expect("spawn");
+        let id = reg
+            .start("sleeper", "sleep 30", std::env::temp_dir())
+            .expect("spawn");
         let snap = wait_for(&reg, id, |s| s.status.is_running());
         assert!(snap.status.is_running());
         assert_eq!(reg.overall_status(), Some(RunStatus::Running));
@@ -508,12 +514,19 @@ mod tests {
     fn tail_returns_the_last_n_lines_of_the_addressed_run() {
         let reg = RunRegistry::new();
         let id = reg
-            .start("count", "for i in 1 2 3 4 5; do echo line-$i; done", std::env::temp_dir())
+            .start(
+                "count",
+                "for i in 1 2 3 4 5; do echo line-$i; done",
+                std::env::temp_dir(),
+            )
             .unwrap();
         wait_for(&reg, id, |s| matches!(s.status, RunStatus::Exited(_)));
         assert_eq!(reg.tail(id, 2), "line-4\nline-5");
         assert_eq!(reg.tail(id, 100).lines().count(), 5);
-        assert_eq!(reg.find_by_command("for i in 1 2 3 4 5; do echo line-$i; done"), Some(id));
+        assert_eq!(
+            reg.find_by_command("for i in 1 2 3 4 5; do echo line-$i; done"),
+            Some(id)
+        );
     }
 
     #[test]

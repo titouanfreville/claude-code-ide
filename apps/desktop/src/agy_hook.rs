@@ -11,7 +11,7 @@
 //! Tolerant by design: an unexpected payload yields a best-effort request (empty fields),
 //! so the gate fails open rather than panicking — same posture as the Claude hook.
 
-use moonlight_control::HookRequest;
+use moonlight_control::{HookRequest, PRESENT_PLAN};
 use serde_json::{json, Value};
 
 /// Parse an AGY `PreToolUse` payload and normalize it to a [`HookRequest`].
@@ -91,6 +91,15 @@ fn map_tool(agy_name: &str, args: &Value) -> (String, Value) {
                 .unwrap_or_default();
             ("Grep".into(), json!({ "pattern": pattern }))
         }
+        // MoonlightCode's own plan-review verb, called via the embedded `moonlight` MCP
+        // host that AGY launches with (see `agy_setup::write_mcp_config`). AGY may name the
+        // MCP tool without Claude's `mcp__<server>__` prefix, so normalize any spelling
+        // ending in `present_plan` to the canonical name the gate holds on, carrying the
+        // plan markdown so the review panel opens for Gemini exactly as for Claude.
+        n if n == PRESENT_PLAN || n.ends_with("present_plan") => {
+            let plan = args.get("plan").and_then(Value::as_str).unwrap_or_default();
+            (PRESENT_PLAN.to_string(), json!({ "plan": plan }))
+        }
         // Unknown tool: pass the raw name + args through so classify's default governs
         // (and the danger/tier gate still applies). New AGY tools land here until mapped.
         other => (other.to_string(), args.clone()),
@@ -153,6 +162,21 @@ mod tests {
             "toolCall": { "name": "read_file", "args": { "filePath": "/x" } },
         });
         assert_eq!(normalize(&payload).cwd, "/ws/a");
+    }
+
+    #[test]
+    fn present_plan_normalizes_to_the_gated_name() {
+        // AGY may call the moonlight MCP verb by a bare or differently-prefixed name;
+        // both normalize to the canonical name the gate holds on, carrying the plan.
+        for name in ["present_plan", "moonlight__present_plan", PRESENT_PLAN] {
+            let payload = json!({
+                "conversationId": "c",
+                "toolCall": { "name": name, "args": { "plan": "## Plan\n1. a" } },
+            });
+            let req = normalize(&payload);
+            assert_eq!(req.tool_name, PRESENT_PLAN, "{name} → {PRESENT_PLAN}");
+            assert_eq!(req.tool_input["plan"], "## Plan\n1. a");
+        }
     }
 
     #[test]

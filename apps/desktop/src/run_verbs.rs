@@ -43,9 +43,7 @@ impl RunVerbExecutor {
 
     /// The session's project root, required by every run verb that touches targets.
     fn require_root(root: Option<&Path>) -> Result<&Path, ControlError> {
-        root.ok_or_else(|| {
-            ControlError::Unsupported("session has no attached project root".into())
-        })
+        root.ok_or_else(|| ControlError::Unsupported("session has no attached project root".into()))
     }
 
     fn list_targets(root: &Path) -> String {
@@ -77,9 +75,10 @@ impl RunVerbExecutor {
     fn resolve_run(&self, target: &str) -> Result<u64, ControlError> {
         let target = target.trim();
         if target.is_empty() {
-            return self.registry.last_started().ok_or_else(|| {
-                ControlError::Unsupported("nothing has been run yet".into())
-            });
+            return self
+                .registry
+                .last_started()
+                .ok_or_else(|| ControlError::Unsupported("nothing has been run yet".into()));
         }
         self.registry.find_by_command(target).ok_or_else(|| {
             ControlError::Unsupported(format!(
@@ -262,7 +261,7 @@ mod tests {
         let _ = run(&ex, Some(&root), McpVerb::RunLogs, "cargo run\n5").unwrap();
         let _ = run(&ex, Some(&root), McpVerb::RunStop, "cargo run").unwrap();
         let _ = run(&ex, Some(&root), McpVerb::RunStop, "").unwrap(); // latest = cargo test
-        // An unknown target is refused with the current run list.
+                                                                      // An unknown target is refused with the current run list.
         let err = run(&ex, Some(&root), McpVerb::RunLogs, "made-up-cmd").unwrap_err();
         assert!(err.to_string().contains("no run for target"), "{err}");
         std::fs::remove_dir_all(&root).ok();
@@ -285,13 +284,7 @@ mod tests {
 
     #[test]
     fn non_run_verbs_delegate_to_the_inner_executor() {
-        let out = run(
-            &executor(),
-            None,
-            McpVerb::RunWithCoverage,
-            "",
-        )
-        .unwrap();
+        let out = run(&executor(), None, McpVerb::RunWithCoverage, "").unwrap();
         assert_eq!(out, "inner:RunWithCoverage");
     }
 }

@@ -96,7 +96,9 @@ pub fn grid(page: &Page, offset: usize, header_cells: Vec<AnyElement>) -> impl I
                 .flex()
                 .flex_row()
                 .w(content_w)
-                .when(r % 2 == 1, |d| d.bg(theme::tint(theme::surface_raised(), 0.4)))
+                .when(r % 2 == 1, |d| {
+                    d.bg(theme::tint(theme::surface_raised(), 0.4))
+                })
                 .hover(|d| d.bg(theme::row_hover()))
                 .child(
                     div()
@@ -142,7 +144,14 @@ pub fn grid(page: &Page, offset: usize, header_cells: Vec<AnyElement>) -> impl I
         .flex_1()
         .min_h(px(0.))
         .overflow_x_scroll()
-        .child(div().flex().flex_col().min_w(content_w).child(header).child(body))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w(content_w)
+                .child(header)
+                .child(body),
+        )
 }
 
 /// A small toolbar text button.
@@ -241,7 +250,10 @@ impl DbGridPanel {
                     .and_then(|v| serde_json::from_value::<TableMeta>(v).ok())
                     .unwrap_or_default(),
             ),
-            _ => (DataSource::Sqlite(std::path::PathBuf::new()), TableMeta::default()),
+            _ => (
+                DataSource::Sqlite(std::path::PathBuf::new()),
+                TableMeta::default(),
+            ),
         };
         Self::new(source, table, cx)
     }
@@ -399,7 +411,11 @@ impl Render for DbGridPanel {
             })
             .child(grid(&self.page, self.offset, header_cells))
             .child(self.render_pagination(cx))
-            .children(super::tab_menu_overlay(self.tab_menu.as_ref(), dismiss, window))
+            .children(super::tab_menu_overlay(
+                self.tab_menu.as_ref(),
+                dismiss,
+                window,
+            ))
     }
 }
 
@@ -485,7 +501,12 @@ impl DbGridPanel {
             .border_t_1()
             .border_color(theme::border_subtle())
             .bg(theme::surface_void())
-            .child(page_button("db-first", "⏮", at_start, cx.listener(|this, _e, _w, cx| this.page_to(0, cx))))
+            .child(page_button(
+                "db-first",
+                "⏮",
+                at_start,
+                cx.listener(|this, _e, _w, cx| this.page_to(0, cx)),
+            ))
             .child(page_button(
                 "db-prev",
                 "‹",

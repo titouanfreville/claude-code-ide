@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseDownEvent,
-    WeakEntity, Window,
+    div, px, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    MouseDownEvent, WeakEntity, Window,
 };
 use gpui_component::dock::{Panel, PanelEvent, PanelInfo, PanelState, TabPanel};
 use gpui_component::input::{Input, InputState};
@@ -255,7 +255,17 @@ impl Render for DbConsolePanel {
                     .children(self.input.as_ref().map(|i| Input::new(i).small())),
             )
             // Results.
-            .child(div().flex_1().min_h(px(0.)).overflow_hidden().child(results))
-            .children(super::tab_menu_overlay(self.tab_menu.as_ref(), dismiss, window))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_hidden()
+                    .child(results),
+            )
+            .children(super::tab_menu_overlay(
+                self.tab_menu.as_ref(),
+                dismiss,
+                window,
+            ))
     }
 }

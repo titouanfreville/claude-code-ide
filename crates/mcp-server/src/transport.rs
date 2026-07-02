@@ -76,6 +76,14 @@ pub struct ReportBlockedParams {
     pub reason: String,
 }
 
+/// Parameters for the `present_plan` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PresentPlanParams {
+    /// The plan to present, as Markdown (headings / numbered steps / code fences render
+    /// as a document in the IDE's plan-review panel). This is the text the operator reviews.
+    pub plan: String,
+}
+
 /// An MCP tool server exposing the IDE's actor verbs for **one** Claude Code session,
 /// delegating each call to the policy-gated [`McpActor`]. The session is fixed at
 /// construction (the per-session stdio process model).
@@ -118,7 +126,8 @@ impl VerbToolServer {
         description = "Run the project's tests with coverage and return a compact pass/fail summary."
     )]
     async fn run_with_coverage(&self, params: Parameters<RunWithCoverageParams>) -> String {
-        self.dispatch(McpVerb::RunWithCoverage, params.0.target).await
+        self.dispatch(McpVerb::RunWithCoverage, params.0.target)
+            .await
     }
 
     /// List the project's detected run targets (the IDE Run widget's choices).
@@ -188,6 +197,17 @@ impl VerbToolServer {
         self.dispatch(McpVerb::ReportBlocked, params.0.reason).await
     }
 
+    /// Present a plan for operator review in the IDE's plan-review panel. Holds for the
+    /// operator's Approve / Refine / Reject — the cross-backend, any-mode equivalent of
+    /// leaving plan mode.
+    #[tool(
+        name = "present_plan",
+        description = "Present a plan to the operator for review in the IDE's plan-review panel. `plan` = the plan as Markdown. Use this to surface a plan for approval when you are NOT in Claude's native plan mode (e.g. in auto mode, or from another backend) — it opens the same clean plan view and BLOCKS on the operator's decision: Approve (proceed), Refine (revise), or Reject (with feedback). Prefer this over dumping a plan into chat when you want an explicit go/no-go."
+    )]
+    async fn present_plan(&self, params: Parameters<PresentPlanParams>) -> String {
+        self.dispatch(McpVerb::PresentPlan, params.0.plan).await
+    }
+
     /// Report the current workflow phase and what it allows — read-only, no approval.
     #[tool(
         name = "phase_status",
@@ -209,8 +229,11 @@ impl ServerHandler for VerbToolServer {
              run_logs (the IDE's Run console — shared with the operator); phase_status \
              (read-only: which workflow phase you are in and what it allows — call it \
              when unsure before requesting a change); request_phase (ask the operator to \
-             change the workflow phase — always operator-approved); report_blocked \
-             (signal you are stuck and need the operator — raises a ⚠ on your session)."
+             change the workflow phase — always operator-approved); present_plan (present a \
+             plan as Markdown for operator review in the plan panel — blocks on Approve / \
+             Refine / Reject; the any-mode, any-backend equivalent of leaving plan mode); \
+             report_blocked (signal you are stuck and need the operator — raises a ⚠ on your \
+             session)."
                 .to_string(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -241,7 +264,9 @@ pub async fn serve_http(
     listener: tokio::net::TcpListener,
 ) -> std::io::Result<()> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-    use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
 
     // A fresh tool server per MCP session, bound to this CC session id.
     let service = StreamableHttpService::new(

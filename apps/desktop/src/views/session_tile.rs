@@ -96,11 +96,7 @@ pub fn session_tile(
                                 }))
                                 // Custom-color dot (only when the operator set one).
                                 .children(dot.map(|fill| {
-                                    div()
-                                        .size(px(8.))
-                                        .rounded_full()
-                                        .bg(fill)
-                                        .flex_shrink_0()
+                                    div().size(px(8.)).rounded_full().bg(fill).flex_shrink_0()
                                 }))
                                 .child(
                                     // Single line, ellipsized — never wraps (a wrapped

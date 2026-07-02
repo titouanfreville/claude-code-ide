@@ -495,6 +495,150 @@ pub fn load_all() -> Vec<(String, SessionObs)> {
     out
 }
 
+/// Resolve each managed **Antigravity** session's model as `(managed_id, SessionObs)`,
+/// from AGY's OWN files (no third-party cache). AGY has no `--session-id`, so its transcript
+/// is keyed by AGY's own `conversationId`, not our managed id — we bridge by **root**:
+/// `history.jsonl` maps `conversationId → workspace`, so for each managed session `(id, root)`
+/// we take the most-recent AGY conversation whose workspace matches `root`, read its model,
+/// and key the result by the **managed id** (what the status bar looks up).
+///
+/// This is a live best-effort resolution (root can be reused across conversations, so we
+/// pick the newest) — a stopgap until the launch-time `conversationId` is discovered and
+/// persisted. `managed` is `(managed_id, root)` for AGY-backed sessions.
+pub fn agy_models(managed: &[(String, String)]) -> Vec<(String, SessionObs)> {
+    if managed.is_empty() {
+        return Vec::new();
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let base = PathBuf::from(&home).join(".gemini").join("antigravity-cli");
+    // workspace -> most-recent (timestamp, conversationId), from the CLI's own history.
+    let mut latest: std::collections::HashMap<String, (i64, String)> =
+        std::collections::HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(base.join("history.jsonl")) {
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let (Some(ws), Some(cid)) = (
+                v.get("workspace").and_then(|x| x.as_str()),
+                v.get("conversationId").and_then(|x| x.as_str()),
+            ) else {
+                continue;
+            };
+            let ts = v.get("timestamp").and_then(|x| x.as_i64()).unwrap_or(0);
+            let e = latest.entry(ws.to_string()).or_insert((i64::MIN, String::new()));
+            if ts >= e.0 {
+                *e = (ts, cid.to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (mid, root) in managed {
+        // Exact workspace match, else the newest conversation whose workspace is related
+        // to the root (sub/parent path).
+        let cid = latest.get(root).map(|(_, c)| c.clone()).or_else(|| {
+            latest
+                .iter()
+                .filter(|(ws, _)| ws.starts_with(root.as_str()) || root.starts_with(ws.as_str()))
+                .max_by_key(|(_, (ts, _))| *ts)
+                .map(|(_, (_, c))| c.clone())
+        });
+        let Some(cid) = cid else {
+            continue;
+        };
+        let transcript = base
+            .join("brain")
+            .join(&cid)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        if let Some(model) = read_head_model(&transcript) {
+            let session_ms = read_agy_duration(&transcript).unwrap_or(0);
+            out.push((
+                mid.clone(),
+                SessionObs {
+                    model,
+                    session_ms,
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// Read a bounded head of an AGY transcript and parse its session model. The model is set
+/// in the first `USER_INPUT` record, so a small head read suffices and is cheap to run
+/// each poll. `None` if no model marker is present.
+fn read_head_model(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 16 * 1024];
+    let n = f.read(&mut buf).ok()?;
+    parse_agy_model(&String::from_utf8_lossy(&buf[..n]))
+}
+
+/// Extract the human-readable model from an AGY `USER_SETTINGS_CHANGE`, e.g.
+/// ``…changed setting `Model Selection` from None to Gemini 3.5 Flash (Medium).…`` →
+/// `"Gemini 3.5 Flash"`. Untrusted input: returns `None` on any unexpected shape.
+fn parse_agy_model(text: &str) -> Option<String> {
+    let anchor = text.find("Model Selection")?;
+    let rest = &text[anchor..];
+    let after_to = &rest[rest.find(" to ")? + " to ".len()..];
+    // The name ends at the reasoning-level " (" or the sentence ". "; cap the length so a
+    // malformed line can't capture a runaway string, on a char boundary.
+    let mut end = after_to
+        .find(" (")
+        .or_else(|| after_to.find(". "))
+        .unwrap_or(after_to.len())
+        .min(40);
+    while end > 0 && !after_to.is_char_boundary(end) {
+        end -= 1;
+    }
+    let model = after_to[..end].trim();
+    if model.is_empty() || model.eq_ignore_ascii_case("None") {
+        None
+    } else {
+        Some(model.to_string())
+    }
+}
+
+/// Parse the start and end of an AGY conversation transcript to calculate total duration.
+fn read_agy_duration(path: &Path) -> Option<u64> {
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut first_ts: Option<i64> = None;
+    let mut last_ts: Option<i64> = None;
+
+    for line in reader.lines().flatten() {
+        if let Some(ts_str) = parse_created_at(&line) {
+            if first_ts.is_none() {
+                first_ts = parse_rfc3339_utc(&ts_str);
+            }
+            last_ts = parse_rfc3339_utc(&ts_str);
+        }
+    }
+
+    if let (Some(start), Some(end)) = (first_ts, last_ts) {
+        if end >= start {
+            return Some((end - start) as u64 * 1000);
+        }
+    }
+    None
+}
+
+/// Simple parser for created_at key in JSONL transcript lines.
+fn parse_created_at(line: &str) -> Option<String> {
+    let anchor = line.find("\"created_at\":\"")?;
+    let start = anchor + "\"created_at\":\"".len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 /// Format a ms duration compactly: `34s`, `12m`, `1h12m`.
 pub fn fmt_dur(ms: u64) -> String {
     let s = ms / 1000;
@@ -564,7 +708,11 @@ pub fn fmt_reset_in(reset_epoch: i64) -> Option<String> {
 
 /// A compact one-line summary for Claude Code to show as its statusLine stdout.
 pub fn render_line(obs: &SessionObs) -> String {
-    let model = if obs.model.is_empty() { "—" } else { &obs.model };
+    let model = if obs.model.is_empty() {
+        "—"
+    } else {
+        &obs.model
+    };
     let ctx = if obs.ctx_tokens > 0 {
         format!("{}k ctx", obs.ctx_tokens / 1000)
     } else if obs.exceeds_200k {
@@ -590,7 +738,8 @@ pub fn chain_statusline(input: &str) -> Option<String> {
     use std::process::{Command, Stdio};
 
     let settings = claude_config_dir()?.join("settings.json");
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(settings).ok()?).ok()?;
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(settings).ok()?).ok()?;
     let cmd = v.get("statusLine")?.get("command")?.as_str()?;
     // Never chain into ourselves.
     if cmd.contains("moonlight") && cmd.contains("statusline") {
@@ -759,7 +908,10 @@ mod tests {
         );
         // No `1m` marker, but CC reports >200k context — only a 1M window can do
         // that (the gauge would otherwise peg at 100% on a lightly-used session).
-        assert_eq!(context_limit("claude-opus-4-8", "Opus 4.8", true), 1_000_000);
+        assert_eq!(
+            context_limit("claude-opus-4-8", "Opus 4.8", true),
+            1_000_000
+        );
     }
 
     #[test]
@@ -791,10 +943,43 @@ mod tests {
     #[test]
     fn parse_rfc3339_utc_handles_window_resets() {
         // The fractional `.fff` and the `Z` are ignored; result is epoch seconds.
-        assert_eq!(parse_rfc3339_utc("2026-06-08T12:10:00.735Z"), Some(1_780_920_600));
+        assert_eq!(
+            parse_rfc3339_utc("2026-06-08T12:10:00.735Z"),
+            Some(1_780_920_600)
+        );
         assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z"), Some(0));
         // Malformed input hides the countdown rather than panicking.
         assert_eq!(parse_rfc3339_utc("x"), None);
         assert_eq!(parse_rfc3339_utc("2026/06/08 12:10:00"), None);
+    }
+
+    #[test]
+    fn parses_agy_model_from_settings_change() {
+        let line =
+            "stuff `Model Selection` from None to Gemini 3.5 Flash (Medium). No need to comment.";
+        assert_eq!(parse_agy_model(line).as_deref(), Some("Gemini 3.5 Flash"));
+        // No reasoning-level suffix → ends at the sentence period.
+        assert_eq!(
+            parse_agy_model("`Model Selection` from None to Gemini 3 Pro. ok").as_deref(),
+            Some("Gemini 3 Pro")
+        );
+        // No marker / unset model → nothing (untrusted input never panics).
+        assert_eq!(parse_agy_model("no model here"), None);
+        assert_eq!(parse_agy_model("Model Selection to None (x)"), None);
+    }
+
+    #[test]
+    fn read_agy_duration_calculates_interval_from_transcript_endpoints() {
+        let dir = std::env::temp_dir().join(format!("mlc-obs-dur-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dur_t.jsonl");
+        let body = "\
+{\"created_at\":\"2026-06-25T19:00:00Z\",\"type\":\"user\",\"message\":{\"content\":\"hi\"}}
+{\"created_at\":\"2026-06-25T19:15:30Z\",\"type\":\"assistant\",\"message\":{\"content\":\"hello\"}}
+";
+        std::fs::write(&path, body).unwrap();
+        // 15m 30s = 930s = 930_000ms
+        assert_eq!(read_agy_duration(&path), Some(930_000));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -19,24 +19,39 @@ pub fn classify(tool_name: &str, tool_input: &Value) -> DangerClass {
         // harness's names for `Task`/`SlashCommand`/(tool-schema loading): a launched
         // subagent or slash command has its *own* tool calls independently gated by
         // this same hook, so the launcher itself is Safe (and `ToolSearch` only loads
-        // schemas — it cannot mutate anything). `ScheduleWakeup` only arms a timer to
-        // resume the loop — no workspace effect. (`Workflow` is deliberately *not*
-        // here: it launches a fleet of writer subagents, and we haven't verified those
-        // are re-gated by this hook — so it stays mutating until that's confirmed.)
+        // schemas — it cannot mutate anything). `SendMessage` continues/steers an
+        // already-running subagent — the messaged agent's own calls stay independently
+        // gated, so the message itself mutates nothing (same rationale as `Agent`/`Task`;
+        // denying it would trap a Discovery/Plan session that fans work out to subagents).
+        // `ScheduleWakeup` only arms a timer to resume the loop — no workspace effect.
+        // (`Workflow` is deliberately *not* here: it launches a fleet of writer subagents,
+        // and we haven't verified those are re-gated by this hook — so it stays mutating
+        // until that's confirmed.)
         "Read" | "Grep" | "Glob" | "LS" | "NotebookRead" | "TodoWrite" | "Task" | "WebSearch"
         | "WebFetch" | "ExitPlanMode" | "BashOutput" | "SlashCommand" | "AskUserQuestion"
-        | "Agent" | "Skill" | "ToolSearch" | "ScheduleWakeup" => DangerClass::Safe,
+        | "Agent" | "Skill" | "ToolSearch" | "SendMessage" | "ScheduleWakeup" => {
+            DangerClass::Safe
+        }
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => DangerClass::Risky,
         // MoonlightCode's own actor verbs (`mcp__moonlight__*`) are independently
-        // policy-gated + audited by the embedded MCP server and its PDP. Two are pure
-        // control-plane / signaling calls that must reach the operator from *any*
-        // phase: `request_phase` is how a frozen session asks to move the gate — the
-        // generic MCP heuristic below reads its leading verb `request` as non-read and
-        // marks it Risky, so a frozen phase would deny the very escape hatch (the
-        // server's `is_phase_control` auto-prompt never gets a chance to run).
-        // `report_blocked` only raises a ⚠ attention signal. Neither mutates the
-        // workspace; classify them Safe so the hook defers to the server's gate.
-        "mcp__moonlight__request_phase" | "mcp__moonlight__report_blocked" => DangerClass::Safe,
+        // policy-gated + audited by the embedded MCP server and its PDP. Several are
+        // pure control-plane / signaling / read calls that must reach the operator (or
+        // just run) from *any* phase, but whose leading verb the generic MCP heuristic
+        // below misreads as non-read (`request`/`phase`/`run`/`report`) and would mark
+        // Risky — a frozen phase would then deny them. `request_phase` is how a frozen
+        // session asks to move the gate (denying it traps the session). `report_blocked`
+        // raises a ⚠ attention signal. `phase_status` is a pure read of the session's own
+        // phase (documented to work in every phase — the domain already models it as
+        // read-only). `run_status`/`run_logs`/`run_list_targets` only read the shared Run
+        // console. None mutates the workspace; classify them Safe so the hook defers to
+        // the server's own gate. (`run_start`/`run_stop` and `run_with_coverage` DO have
+        // side effects — they stay on the generic path → Risky.)
+        "mcp__moonlight__request_phase"
+        | "mcp__moonlight__report_blocked"
+        | "mcp__moonlight__phase_status"
+        | "mcp__moonlight__run_status"
+        | "mcp__moonlight__run_logs"
+        | "mcp__moonlight__run_list_targets" => DangerClass::Safe,
         "Bash" => {
             let cmd = tool_input
                 .get("command")
@@ -86,16 +101,69 @@ const READ_PROGRAMS: &[&str] = &[
 
 /// Programs that mutate state when they lead a segment (`Risky`).
 const WRITE_PROGRAMS: &[&str] = &[
-    "mv", "cp", "tee", "touch", "mkdir", "rmdir", "truncate", "ln", "install", "patch", "sed",
-    "npm", "pnpm", "yarn", "cargo", "make", "go", "pip", "pip3", "python", "python3", "node",
-    "docker", "kubectl", "terraform", "ansible", "helm", "apt", "apt-get", "brew", "gem", "bundle",
-    "cmake", "ninja", "mvn", "gradle", "rustup", "tar", "unzip", "zip", "curl", "wget",
+    "mv",
+    "cp",
+    "tee",
+    "touch",
+    "mkdir",
+    "rmdir",
+    "truncate",
+    "ln",
+    "install",
+    "patch",
+    "sed",
+    "npm",
+    "pnpm",
+    "yarn",
+    "cargo",
+    "make",
+    "go",
+    "pip",
+    "pip3",
+    "python",
+    "python3",
+    "node",
+    "docker",
+    "kubectl",
+    "terraform",
+    "ansible",
+    "helm",
+    "apt",
+    "apt-get",
+    "brew",
+    "gem",
+    "bundle",
+    "cmake",
+    "ninja",
+    "mvn",
+    "gradle",
+    "rustup",
+    "tar",
+    "unzip",
+    "zip",
+    "curl",
+    "wget",
 ];
 
 /// Git read-only subcommands. `config` is handled specially (it writes with args).
 const GIT_READ: &[&str] = &[
-    "status", "log", "diff", "show", "branch", "remote", "blame", "describe", "rev-parse",
-    "ls-files", "fetch", "shortlog", "tag", "cat-file", "name-rev", "reflog", "whatchanged",
+    "status",
+    "log",
+    "diff",
+    "show",
+    "branch",
+    "remote",
+    "blame",
+    "describe",
+    "rev-parse",
+    "ls-files",
+    "fetch",
+    "shortlog",
+    "tag",
+    "cat-file",
+    "name-rev",
+    "reflog",
+    "whatchanged",
 ];
 
 /// Classify a Bash command. The command is split into list/pipe segments and is as
@@ -192,8 +260,21 @@ fn max_danger(a: DangerClass, b: DangerClass) -> DangerClass {
 
 /// Substrings that make a single segment non-overridably dangerous.
 const DANGER_SUBSTR: &[&str] = &[
-    "sudo", "mkfs", "shutdown", "reboot", "halt", "poweroff", ":(){", "fdisk", "parted",
-    "/dev/sd", "/dev/disk", "dd if=/dev", "dd of=/dev", "> /dev/", "diskutil erase",
+    "sudo",
+    "mkfs",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    ":(){",
+    "fdisk",
+    "parted",
+    "/dev/sd",
+    "/dev/disk",
+    "dd if=/dev",
+    "dd of=/dev",
+    "> /dev/",
+    "diskutil erase",
 ];
 
 fn classify_segment(seg: &str) -> DangerClass {
@@ -294,7 +375,9 @@ fn is_env_assignment(tok: &str) -> bool {
     match tok.find('=') {
         Some(i) if i > 0 => {
             let key = &tok[..i];
-            key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            key.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                 && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         }
         _ => false,
@@ -317,9 +400,7 @@ fn has_file_redirect(tokens: &[&str]) -> bool {
     tokens.iter().any(|tok| {
         let t = tok.trim_start_matches(|c: char| c.is_ascii_digit());
         let t = t.strip_prefix('&').unwrap_or(t);
-        let rest = t
-            .strip_prefix(">>")
-            .or_else(|| t.strip_prefix('>'));
+        let rest = t.strip_prefix(">>").or_else(|| t.strip_prefix('>'));
         match rest {
             Some(after) => !after.starts_with('&'), // `>&N` is an fd-dup, not a file write
             None => false,
@@ -369,9 +450,11 @@ fn classify_git(tokens: &[&str]) -> DangerClass {
         }
         "reset" if has("--hard") => DangerClass::DangerZone,
         "clean"
-            if args
-                .iter()
-                .any(|t| t.starts_with('-') && !t.starts_with("--") && (t.contains('f') || t.contains('d') || t.contains('x'))) =>
+            if args.iter().any(|t| {
+                t.starts_with('-')
+                    && !t.starts_with("--")
+                    && (t.contains('f') || t.contains('d') || t.contains('x'))
+            }) =>
         {
             DangerClass::DangerZone
         }
@@ -380,7 +463,11 @@ fn classify_git(tokens: &[&str]) -> DangerClass {
             let write_flag = args.iter().any(|t| {
                 matches!(
                     *t,
-                    "--add" | "--unset" | "--unset-all" | "--replace-all" | "--remove-section"
+                    "--add"
+                        | "--unset"
+                        | "--unset-all"
+                        | "--replace-all"
+                        | "--remove-section"
                         | "--rename-section"
                 )
             });
@@ -480,7 +567,10 @@ mod tests {
         // A backslash-escaped pipe outside quotes is data too.
         assert_eq!(bash(r"grep a\|b file"), DangerClass::Safe);
         // Operators *outside* quotes still split — worst segment wins.
-        assert_eq!(bash(r#"grep "a\|b" f && rm -rf x"#), DangerClass::DangerZone);
+        assert_eq!(
+            bash(r#"grep "a\|b" f && rm -rf x"#),
+            DangerClass::DangerZone
+        );
         assert_eq!(bash(r#"echo "a;b" ; touch x"#), DangerClass::Risky);
     }
 
@@ -592,7 +682,14 @@ mod tests {
         // asks the operator to clarify; `ToolSearch` only loads tool schemas; `Agent`
         // and `Skill` are this harness's names for `Task`/`SlashCommand` (the launched
         // subagent/command is independently re-gated by the same hook).
-        for tool in ["AskUserQuestion", "ToolSearch", "Agent", "Skill", "ScheduleWakeup"] {
+        for tool in [
+            "AskUserQuestion",
+            "ToolSearch",
+            "Agent",
+            "Skill",
+            "SendMessage",
+            "ScheduleWakeup",
+        ] {
             assert_eq!(classify(tool, &json!({})), DangerClass::Safe, "{tool}");
         }
         // Workflow stays mutating until its subagent cascade is verified to re-gate.
@@ -613,5 +710,28 @@ mod tests {
             classify("mcp__moonlight__report_blocked", &json!({})),
             DangerClass::Safe
         );
+    }
+
+    #[test]
+    fn moonlight_read_only_verbs_pass_frozen_phases() {
+        // `phase_status` (a pure phase read) and the read-only Run-console verbs must
+        // survive frozen phases — the generic MCP heuristic reads their leading verb
+        // (`phase`/`run`) as non-read and would wrongly deny them. Special-cased Safe.
+        for tool in [
+            "mcp__moonlight__phase_status",
+            "mcp__moonlight__run_status",
+            "mcp__moonlight__run_logs",
+            "mcp__moonlight__run_list_targets",
+        ] {
+            assert_eq!(classify(tool, &json!({})), DangerClass::Safe, "{tool}");
+        }
+        // Side-effecting Run verbs correctly stay Risky (they start/stop/execute).
+        for tool in [
+            "mcp__moonlight__run_start",
+            "mcp__moonlight__run_stop",
+            "mcp__moonlight__run_with_coverage",
+        ] {
+            assert_eq!(classify(tool, &json!({})), DangerClass::Risky, "{tool}");
+        }
     }
 }

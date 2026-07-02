@@ -9,21 +9,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    runs-on: macos-latest
+  # Formatting + domain-purity are OS-independent — run once on Linux (cheapest).
+  format:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --all
       - name: Domain purity (no tokio/io/gpui in domain)
         run: |
           ! grep -E '(^|[^-])(tokio|gpui|reqwest|sqlx|rusqlite)\b' crates/domain/Cargo.toml \
             || (echo "domain must stay pure (no I/O/runtime/UI deps)"; exit 1)
+
+  # Clippy + tests on both platforms — the app must support macOS and Linux, and
+  # platform-gated code (Metal vs Vulkan, PTY, etc.) only compiles on its own OS.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # GPUI/blade (Vulkan) + alacritty terminal core need these to build on Linux.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake clang pkg-config mold \
+            libasound2-dev libfontconfig-dev \
+            libwayland-dev libxkbcommon-x11-dev \
+            libssl-dev libzstd-dev \
+            libvulkan-dev libgl1-mesa-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all

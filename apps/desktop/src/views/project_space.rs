@@ -173,9 +173,7 @@ impl ProjectSpace {
                     s.sessions = space_sessions::load(&s.root);
                 }
                 // Drop a dangling `active` that no longer names a known space.
-                let active = state
-                    .active
-                    .filter(|id| spaces.iter().any(|s| &s.id == id));
+                let active = state.active.filter(|id| spaces.iter().any(|s| &s.id == id));
                 Self {
                     spaces,
                     active,
@@ -569,7 +567,7 @@ mod tests {
 
         space.toggle_overview(); // remembers b, now on overview
         space.remove_space(&b); // b is gone (a remains)
-        // Restoring can't find b → falls back to the first known space (a).
+                                // Restoring can't find b → falls back to the first known space (a).
         assert!(space.toggle_overview());
         assert_eq!(
             space.active().map(|id| id.as_str()),
@@ -590,7 +588,13 @@ mod tests {
         let mut space = ProjectSpace::default();
         space.open_root(PathBuf::from("/tmp/a"));
         space.open_root(PathBuf::from("/tmp/b")); // b is active
-        let b = space.spaces().iter().find(|s| s.root == PathBuf::from("/tmp/b")).unwrap().id.clone();
+        let b = space
+            .spaces()
+            .iter()
+            .find(|s| s.root == PathBuf::from("/tmp/b"))
+            .unwrap()
+            .id
+            .clone();
 
         assert!(space.remove_space(&b));
         assert_eq!(space.spaces().len(), 1);

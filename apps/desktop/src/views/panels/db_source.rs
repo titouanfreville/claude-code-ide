@@ -313,7 +313,10 @@ mod sqlite {
             .map_err(|e| e.to_string())?
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
-        names.into_iter().map(|name| table_meta(conn, &name)).collect()
+        names
+            .into_iter()
+            .map(|name| table_meta(conn, &name))
+            .collect()
     }
 
     /// Build a [`TableMeta`] from PRAGMAs (columns, FKs, indexes) + a row count.
@@ -347,7 +350,9 @@ mod sqlite {
                 .prepare(&format!("PRAGMA foreign_key_list(\"{name}\")"))
                 .map_err(|e| e.to_string())?;
             let fks: Vec<(String, String)> = stmt
-                .query_map([], |row| Ok((row.get::<_, String>(2)?, row.get::<_, String>(3)?)))
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+                })
                 .map_err(|e| e.to_string())?
                 .collect::<Result<_, _>>()
                 .map_err(|e| e.to_string())?;
@@ -371,7 +376,9 @@ mod sqlite {
         };
         // Row count (best-effort; a plain COUNT(*) is fine for a browse).
         let row_count = conn
-            .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| r.get::<_, i64>(0))
+            .query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| {
+                r.get::<_, i64>(0)
+            })
             .ok();
 
         Ok(TableMeta {
@@ -420,7 +427,11 @@ mod sqlite {
         } else {
             col_names.into_iter().map(named_col).collect()
         };
-        Ok(Page { columns, rows, total: table.row_count })
+        Ok(Page {
+            columns,
+            rows,
+            total: table.row_count,
+        })
     }
 
     pub fn run_query(path: &Path, sql: &str) -> Result<Page, String> {
@@ -429,20 +440,29 @@ mod sqlite {
         let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let rows = collect_rows(&mut stmt, col_names.len())?;
         let columns = col_names.into_iter().map(named_col).collect();
-        Ok(Page { columns, rows, total: None })
+        Ok(Page {
+            columns,
+            rows,
+            total: None,
+        })
     }
 
     /// Run a prepared statement to typed rows.
     fn collect_rows(stmt: &mut rusqlite::Statement, ncol: usize) -> Result<Vec<Vec<Cell>>, String> {
-        stmt.query_map([], |row| Ok((0..ncol).map(|i| cell_of(row, i)).collect::<Vec<_>>()))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())
+        stmt.query_map([], |row| {
+            Ok((0..ncol).map(|i| cell_of(row, i)).collect::<Vec<_>>())
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())
     }
 
     /// A bare column (name only) for ad-hoc query results.
     fn named_col(name: String) -> ColumnMeta {
-        ColumnMeta { name, ..Default::default() }
+        ColumnMeta {
+            name,
+            ..Default::default()
+        }
     }
 
     /// Convert a SQLite cell to a typed [`Cell`].
@@ -652,7 +672,11 @@ mod postgres_driver {
                     .collect()
             })
             .collect();
-        Ok(Page { columns, rows: data, total: table.row_count })
+        Ok(Page {
+            columns,
+            rows: data,
+            total: table.row_count,
+        })
     }
 
     pub fn run_query(cfg: &PgConfig, sql: &str) -> Result<Page, String> {
@@ -674,7 +698,11 @@ mod postgres_driver {
             .iter()
             .map(|row| (0..columns.len()).map(|i| pg_cell(row, i)).collect())
             .collect();
-        Ok(Page { columns, rows: data, total: None })
+        Ok(Page {
+            columns,
+            rows: data,
+            total: None,
+        })
     }
 
     /// Re-type a `::text`-cast value using the column's declared Postgres type, so numbers
@@ -717,22 +745,30 @@ mod postgres_driver {
             return row.get::<_, Option<bool>>(i).map_or(Cell::Null, Cell::Bool);
         }
         if ty == Type::INT2 {
-            return row.get::<_, Option<i16>>(i).map_or(Cell::Null, |n| Cell::Int(n as i64));
+            return row
+                .get::<_, Option<i16>>(i)
+                .map_or(Cell::Null, |n| Cell::Int(n as i64));
         }
         if ty == Type::INT4 {
-            return row.get::<_, Option<i32>>(i).map_or(Cell::Null, |n| Cell::Int(n as i64));
+            return row
+                .get::<_, Option<i32>>(i)
+                .map_or(Cell::Null, |n| Cell::Int(n as i64));
         }
         if ty == Type::INT8 {
             return row.get::<_, Option<i64>>(i).map_or(Cell::Null, Cell::Int);
         }
         if ty == Type::FLOAT4 {
-            return row.get::<_, Option<f32>>(i).map_or(Cell::Null, |f| Cell::Real(f as f64));
+            return row
+                .get::<_, Option<f32>>(i)
+                .map_or(Cell::Null, |f| Cell::Real(f as f64));
         }
         if ty == Type::FLOAT8 {
             return row.get::<_, Option<f64>>(i).map_or(Cell::Null, Cell::Real);
         }
         if ty == Type::BYTEA {
-            return row.get::<_, Option<Vec<u8>>>(i).map_or(Cell::Null, |b| Cell::Blob(b.len()));
+            return row
+                .get::<_, Option<Vec<u8>>>(i)
+                .map_or(Cell::Null, |b| Cell::Blob(b.len()));
         }
         match row.try_get::<_, Option<String>>(i) {
             Ok(Some(s)) => Cell::Text(s),
@@ -789,9 +825,22 @@ mod tests {
         let users = schema.tables.iter().find(|t| t.name == "users").unwrap();
         assert_eq!(users.row_count, Some(3));
         assert!(users.columns.iter().find(|c| c.name == "id").unwrap().pk);
-        assert!(users.columns.iter().find(|c| c.name == "name").unwrap().not_null);
+        assert!(
+            users
+                .columns
+                .iter()
+                .find(|c| c.name == "name")
+                .unwrap()
+                .not_null
+        );
         assert_eq!(
-            users.columns.iter().find(|c| c.name == "team").unwrap().fk.as_deref(),
+            users
+                .columns
+                .iter()
+                .find(|c| c.name == "team")
+                .unwrap()
+                .fk
+                .as_deref(),
             Some("teams")
         );
         assert!(users.indexes.iter().any(|i| i.contains("idx_users_name")));
@@ -834,7 +883,9 @@ mod tests {
     #[test]
     fn query_guard_rejects_writes_and_multi_statement() {
         assert!(is_read_only_query("SELECT 1"));
-        assert!(is_read_only_query("  with x as (select 1) select * from x  "));
+        assert!(is_read_only_query(
+            "  with x as (select 1) select * from x  "
+        ));
         assert!(is_read_only_query("SELECT 1;"));
         assert!(!is_read_only_query("DELETE FROM users"));
         assert!(!is_read_only_query("SELECT 1; DROP TABLE users"));
@@ -844,14 +895,20 @@ mod tests {
 
     #[test]
     fn rejects_bad_table_name() {
-        let bad = TableMeta { name: "users; DROP".into(), ..Default::default() };
+        let bad = TableMeta {
+            name: "users; DROP".into(),
+            ..Default::default()
+        };
         let src = DataSource::Sqlite("/tmp/none.sqlite".into());
         assert!(load_page(&src, &bad, None, 0, 10).is_err());
     }
 
     #[test]
     fn pg_label_extracts_db_and_host() {
-        assert_eq!(pg_label("postgres://u:p@db.example.com:5432/shop?sslmode=require"), "shop@db.example.com");
+        assert_eq!(
+            pg_label("postgres://u:p@db.example.com:5432/shop?sslmode=require"),
+            "shop@db.example.com"
+        );
         assert_eq!(pg_label("postgres://localhost/app"), "app@localhost");
         assert_eq!(pg_label("not-a-dsn"), "not-a-dsn");
     }

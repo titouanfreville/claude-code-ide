@@ -20,9 +20,9 @@ pub mod server;
 
 pub use classify::classify;
 pub use config::{append_safe_tool, load_config, user_config_path, AiWorkspaceResolver};
-pub use gate::{decide, evaluate, GateDecision, GateState, HoldKind, EXIT_PLAN_MODE};
-pub use paths::{classify_write_scope, AiWorkspace, AiWorkspaceConfig};
+pub use gate::{decide, evaluate, GateDecision, GateState, HoldKind, EXIT_PLAN_MODE, PRESENT_PLAN};
 pub use ipc::{HookRequest, HookResponse};
+pub use paths::{classify_write_scope, AiWorkspace, AiWorkspaceConfig};
 pub use pending::{ApprovalNotifier, Decision, PendingApprovals};
 pub use server::{query_hook, ControlServer, GateView, RuntimeSafeTools, DEFAULT_HOLD};
 
@@ -251,7 +251,11 @@ mod tests {
             origin: FeedbackOrigin::HunkRejection,
         };
         steer.inject_feedback(&fb).await.expect("queued");
-        assert_eq!(rx.recv().await.unwrap(), fb, "feedback reaches the UI drainer");
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            fb,
+            "feedback reaches the UI drainer"
+        );
     }
 
     #[tokio::test]

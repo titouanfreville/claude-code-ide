@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1782316676590,
+  "lastScanned": 1782918538425,
   "projectRoot": "/Users/titouan/perso/claude-code-ide",
   "techStack": {
     "languages": [
@@ -18,8 +18,8 @@
     "runtime": null
   },
   "build": {
-    "buildCommand": "cd /Users/titouan/perso/claude-code-ide\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\ncargo build -p moonlight-desktop 2>&1 | grep -iE \"error\" | grep -v \"block v0.1.6\" | head; rtk cargo build -p moonlight-desktop 2>&1 | tail -2",
-    "testCommand": "cd /Users/titouan/perso/claude-code-ide\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\ncargo test -p moonlight-desktop 2>&1 | tail -2",
+    "buildCommand": "cd /Users/titouan/perso/claude-code-ide\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\ncargo build -p moonlight-desktop 2>&1 | grep -iE \"error|warning: unused\" | grep -v \"block v0.1.6\" | head -20; echo \"---build---\"; rtk cargo build -p moonlight-desktop 2>&1 | tail -1",
+    "testCommand": "cd /Users/titouan/perso/claude-code-ide\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\necho \"=== tests ===\"; cargo test -p moonlight-desktop 2>&1 | tail -2\necho \"=== sanity: resolve model by root (mirrors agy_models logic) ===\"\npython3 - <<'PY'\nimport json, os, collections\nbase=os.path.expanduser(\"~/.gemini/antigravity-cli\")\nlatest={}\nfor line in open(os.path.join(base,\"history.jsonl\"), errors=\"ignore\"):\n    try: d=json.loads(line)\n    except: continue\n    ws=d.get(\"workspace\"); cid=d.get(\"conversationId\"); ts=d.get(\"timestamp\",0)\n    if ws and cid and ts>=latest.get(ws,(-1,None))[0]: latest[ws]=(ts,cid)\nimport re\ndef model(cid):\n    p=os.path.join(base,\"brain\",cid,\".system_generated\",\"logs\",\"transcript.jsonl\")\n    try: head=open(p,errors=\"ignore\").read(16384)\n    except: return None\n    m=re.search(r\"Model Selection.*? to (.+?)(?: \\(|\\. )\", head)\n    return m.group(1) if m else None\nfor root in [\"/Users/titouan/perso/claude-code-ide\",\"/Users/titouan/essor/adtech_original\",\"/Users/titouan/essor/monorepo\"]:\n    cid = latest.get(root,(None,None))[1]\n    print(f\"{root[:40]:40} -> cid {str(cid)[:8]} -> model {model(cid) if cid else None}\")\nPY",
     "lintCommand": "cargo clippy",
     "devCommand": "cargo run",
     "scripts": {}
@@ -45,28 +45,28 @@
       "path": "_bmad",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1782316676579,
+      "lastAccessed": 1782918538413,
       "keyFiles": []
     },
     "apps": {
       "path": "apps",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1782316676579,
+      "lastAccessed": 1782918538414,
       "keyFiles": []
     },
     "crates": {
       "path": "crates",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1782316676579,
+      "lastAccessed": 1782918538415,
       "keyFiles": []
     },
     "target": {
       "path": "target",
       "purpose": null,
       "fileCount": 3,
-      "lastAccessed": 1782316676580,
+      "lastAccessed": 1782918538415,
       "keyFiles": [
         "CACHEDIR.TAG"
       ]
@@ -75,302 +75,284 @@
   "hotPaths": [
     {
       "path": "apps/desktop/src/views/workspace.rs",
-      "accessCount": 77,
-      "lastAccessed": 1782390614716,
+      "accessCount": 52,
+      "lastAccessed": 1782979451363,
       "type": "file"
     },
     {
-      "path": "apps/desktop/src/views/panels/session_monitor.rs",
-      "accessCount": 65,
-      "lastAccessed": 1782391122151,
+      "path": "apps/desktop/src/views/panels/status_bar.rs",
+      "accessCount": 15,
+      "lastAccessed": 1782979445082,
       "type": "file"
     },
     {
       "path": "apps/desktop/src/main.rs",
-      "accessCount": 49,
-      "lastAccessed": 1782382015343,
+      "accessCount": 10,
+      "lastAccessed": 1782938207385,
       "type": "file"
     },
     {
-      "path": "crates/control/src/server.rs",
-      "accessCount": 19,
-      "lastAccessed": 1782381656922,
+      "path": "apps/desktop/src/obs.rs",
+      "accessCount": 10,
+      "lastAccessed": 1782979266279,
       "type": "file"
     },
     {
-      "path": "crates/control/src/paths.rs",
-      "accessCount": 18,
-      "lastAccessed": 1782381279529,
-      "type": "file"
-    },
-    {
-      "path": "apps/desktop/src/views/grid_home.rs",
-      "accessCount": 17,
-      "lastAccessed": 1782382361905,
-      "type": "file"
-    },
-    {
-      "path": "crates/persistence/src/store.rs",
-      "accessCount": 13,
-      "lastAccessed": 1782328309447,
-      "type": "file"
-    },
-    {
-      "path": ".ai/handoffs/04-agy-gemini-integration-plan.md",
-      "accessCount": 13,
-      "lastAccessed": 1782391180634,
-      "type": "file"
-    },
-    {
-      "path": "crates/engine/src/supervisor.rs",
-      "accessCount": 9,
-      "lastAccessed": 1782381543352,
-      "type": "file"
-    },
-    {
-      "path": "apps/desktop/src/agent_backend.rs",
+      "path": "crates/domain/src/trust.rs",
       "accessCount": 8,
-      "lastAccessed": 1782381162264,
+      "lastAccessed": 1782939204404,
+      "type": "file"
+    },
+    {
+      "path": "crates/control/src/gate.rs",
+      "accessCount": 8,
+      "lastAccessed": 1782939232656,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/session_monitor.rs",
+      "accessCount": 8,
+      "lastAccessed": 1782978694265,
+      "type": "file"
+    },
+    {
+      "path": "crates/control/src/classify.rs",
+      "accessCount": 7,
+      "lastAccessed": 1782934141506,
       "type": "file"
     },
     {
       "path": "crates/trust/src/lib.rs",
       "accessCount": 7,
-      "lastAccessed": 1782379380120,
+      "lastAccessed": 1782934149765,
       "type": "file"
     },
     {
-      "path": "crates/control/src/gate.rs",
+      "path": "apps/desktop/src/views/panels/plan_review.rs",
       "accessCount": 7,
-      "lastAccessed": 1782379572876,
+      "lastAccessed": 1782970917562,
       "type": "file"
     },
     {
-      "path": "crates/detection/src/lib.rs",
-      "accessCount": 7,
-      "lastAccessed": 1782381694557,
-      "type": "file"
-    },
-    {
-      "path": "apps/desktop/src/views/center_requests.rs",
-      "accessCount": 7,
-      "lastAccessed": 1782390411592,
-      "type": "file"
-    },
-    {
-      "path": "crates/engine/src/lib.rs",
+      "path": "apps/desktop/src/views/panels/terminal.rs",
       "accessCount": 6,
-      "lastAccessed": 1782381535625,
+      "lastAccessed": 1782920585956,
       "type": "file"
     },
     {
-      "path": "apps/desktop/src/views/open_tabs.rs",
-      "accessCount": 5,
-      "lastAccessed": 1782379535435,
-      "type": "file"
-    },
-    {
-      "path": "crates/control/src/lib.rs",
-      "accessCount": 5,
-      "lastAccessed": 1782381705301,
-      "type": "file"
-    },
-    {
-      "path": "apps/desktop/src/views/panels/mod.rs",
-      "accessCount": 5,
-      "lastAccessed": 1782390310733,
-      "type": "file"
-    },
-    {
-      "path": "crates/domain/src/ports/store.rs",
-      "accessCount": 4,
-      "lastAccessed": 1782327591726,
-      "type": "file"
-    },
-    {
-      "path": "apps/desktop/src/hook_install.rs",
-      "accessCount": 4,
-      "lastAccessed": 1782371251166,
-      "type": "file"
-    },
-    {
-      "path": "crates/control/src/config.rs",
-      "accessCount": 4,
-      "lastAccessed": 1782381267970,
+      "path": "crates/control/src/paths.rs",
+      "accessCount": 6,
+      "lastAccessed": 1782934092830,
       "type": "file"
     },
     {
       "path": "apps/desktop/src/agy_setup.rs",
+      "accessCount": 6,
+      "lastAccessed": 1782934600123,
+      "type": "file"
+    },
+    {
+      "path": ".ai/handoffs/05-plan-view-map.md",
+      "accessCount": 5,
+      "lastAccessed": 1782978431377,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/obs_store.rs",
+      "accessCount": 5,
+      "lastAccessed": 1782979284636,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/agent_backend.rs",
       "accessCount": 4,
-      "lastAccessed": 1782381272539,
+      "lastAccessed": 1782934372906,
       "type": "file"
     },
     {
-      "path": ".ai/handoffs/05-frozen-phase-mcp-prompt-plan.md",
+      "path": "crates/control/src/server.rs",
       "accessCount": 4,
-      "lastAccessed": 1782390694537,
+      "lastAccessed": 1782934627153,
       "type": "file"
     },
     {
-      "path": "apps/desktop/src/obs.rs",
-      "accessCount": 3,
-      "lastAccessed": 1782317058286,
-      "type": "file"
-    },
-    {
-      "path": "apps/desktop/src/views/panels/spaces.rs",
-      "accessCount": 3,
-      "lastAccessed": 1782318413681,
-      "type": "file"
-    },
-    {
-      "path": ".ai/handoffs/00-status-and-tasks.md",
-      "accessCount": 3,
-      "lastAccessed": 1782318673499,
-      "type": "file"
-    },
-    {
-      "path": "apps/desktop/src/views/mcp_host.rs",
-      "accessCount": 3,
-      "lastAccessed": 1782325334758,
-      "type": "file"
-    },
-    {
-      "path": "crates/domain/src/lib.rs",
-      "accessCount": 3,
-      "lastAccessed": 1782325492529,
-      "type": "file"
-    },
-    {
-      "path": "crates/control/src/classify.rs",
-      "accessCount": 3,
-      "lastAccessed": 1782325880971,
-      "type": "file"
-    },
-    {
-      "path": "crates/mcp-server/src/lib.rs",
-      "accessCount": 3,
-      "lastAccessed": 1782379441397,
-      "type": "file"
-    },
-    {
-      "path": "crates/control/src/pending.rs",
-      "accessCount": 3,
-      "lastAccessed": 1782381551744,
-      "type": "file"
-    },
-    {
-      "path": "apps/desktop/src/transcript.rs",
-      "accessCount": 2,
-      "lastAccessed": 1782317047185,
+      "path": "apps/desktop/src/views/theme.rs",
+      "accessCount": 4,
+      "lastAccessed": 1782937976990,
       "type": "file"
     },
     {
       "path": "crates/domain/src/phase.rs",
-      "accessCount": 2,
-      "lastAccessed": 1782325349579,
+      "accessCount": 3,
+      "lastAccessed": 1782919389246,
       "type": "file"
     },
     {
-      "path": "crates/domain/src/trust.rs",
-      "accessCount": 2,
-      "lastAccessed": 1782326130486,
+      "path": ".ai/handoffs/05-tmp-and-readonly-tool-policy-plan.md",
+      "accessCount": 3,
+      "lastAccessed": 1782934355722,
       "type": "file"
     },
     {
-      "path": "crates/persistence/src/migrations.rs",
-      "accessCount": 2,
-      "lastAccessed": 1782327601411,
+      "path": "apps/desktop/src/views/center_requests.rs",
+      "accessCount": 3,
+      "lastAccessed": 1782934877067,
       "type": "file"
     },
     {
-      "path": "crates/mcp-server/src/adapters.rs",
-      "accessCount": 2,
-      "lastAccessed": 1782327689991,
+      "path": ".ai/handoffs/04-agy-gemini-integration-plan.md",
+      "accessCount": 3,
+      "lastAccessed": 1782934939521,
       "type": "file"
     },
     {
-      "path": "apps/desktop/src/views/project_space.rs",
-      "accessCount": 2,
-      "lastAccessed": 1782327886761,
+      "path": "crates/mcp-server/src/transport.rs",
+      "accessCount": 3,
+      "lastAccessed": 1782970889800,
       "type": "file"
     },
     {
-      "path": "crates/control/src/ipc.rs",
-      "accessCount": 2,
-      "lastAccessed": 1782370609701,
-      "type": "file"
-    },
-    {
-      "path": "crates/domain/src/ports/mcp.rs",
-      "accessCount": 2,
-      "lastAccessed": 1782379343874,
-      "type": "file"
-    },
-    {
-      "path": ".ai/handoffs/05-space-focus-and-restart-only-resume-plan.md",
-      "accessCount": 2,
-      "lastAccessed": 1782379666461,
+      "path": "apps/desktop/src/agy_hook.rs",
+      "accessCount": 3,
+      "lastAccessed": 1782971063682,
       "type": "file"
     },
     {
       "path": "crates/detection/src/jsonl.rs",
       "accessCount": 2,
-      "lastAccessed": 1782381529425,
+      "lastAccessed": 1782934369915,
       "type": "file"
     },
     {
-      "path": "apps/desktop/src/views/panels/plan_review.rs",
+      "path": "crates/detection/src/lib.rs",
       "accessCount": 2,
-      "lastAccessed": 1782382069403,
+      "lastAccessed": 1782934908030,
+      "type": "file"
+    },
+    {
+      "path": "crates/mcp-server/src/lib.rs",
+      "accessCount": 2,
+      "lastAccessed": 1782939213207,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/services.rs",
+      "accessCount": 2,
+      "lastAccessed": 1782970794542,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/phase_verbs.rs",
+      "accessCount": 2,
+      "lastAccessed": 1782970901732,
+      "type": "file"
+    },
+    {
+      "path": "crates/domain/src/ports/mcp.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782919233566,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/panels/spaces.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782919367825,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/project_space.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782919376150,
+      "type": "file"
+    },
+    {
+      "path": ".ai/handoffs/review-gates-ui.md",
+      "accessCount": 1,
+      "lastAccessed": 1782934327733,
+      "type": "file"
+    },
+    {
+      "path": ".ai/handoffs/00-status-and-tasks.md",
+      "accessCount": 1,
+      "lastAccessed": 1782934378949,
       "type": "file"
     },
     {
       "path": "apps/desktop/src/views/panels/code_review.rs",
       "accessCount": 1,
-      "lastAccessed": 1782317079185,
+      "lastAccessed": 1782934387565,
       "type": "file"
     },
     {
-      "path": "apps/desktop/src/views/panels/terminal.rs",
+      "path": "apps/desktop/src/transcript.rs",
       "accessCount": 1,
-      "lastAccessed": 1782317086597,
+      "lastAccessed": 1782934568853,
       "type": "file"
     },
     {
-      "path": "crates/domain/src/agent.rs",
+      "path": ".ai/handoffs/05-space-focus-and-restart-only-resume-plan.md",
       "accessCount": 1,
-      "lastAccessed": 1782325477410,
+      "lastAccessed": 1782934614124,
       "type": "file"
     },
     {
-      "path": "apps/desktop/src/views/edit_gate.rs",
+      "path": "apps/desktop/src/views/grid_home.rs",
       "accessCount": 1,
-      "lastAccessed": 1782325877713,
+      "lastAccessed": 1782934926105,
       "type": "file"
     },
     {
-      "path": "apps/desktop/src/views/session_io.rs",
+      "path": "crates/engine/src/lib.rs",
       "accessCount": 1,
-      "lastAccessed": 1782325917641,
-      "type": "file"
-    },
-    {
-      "path": "apps/desktop/src/agy_hook.rs",
-      "accessCount": 1,
-      "lastAccessed": 1782371027893,
-      "type": "file"
-    },
-    {
-      "path": "apps/desktop/src/views/active_context.rs",
-      "accessCount": 1,
-      "lastAccessed": 1782379266779,
+      "lastAccessed": 1782938208267,
       "type": "file"
     },
     {
       "path": "crates/domain/src/ports/detection.rs",
       "accessCount": 1,
-      "lastAccessed": 1782381485212,
+      "lastAccessed": 1782938209049,
+      "type": "file"
+    },
+    {
+      "path": "crates/mcp-server/src/adapters.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782939065716,
+      "type": "file"
+    },
+    {
+      "path": "crates/control/src/lib.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782971048131,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/notifications.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782978345996,
+      "type": "file"
+    },
+    {
+      "path": "crates/control/src/pending.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782978447551,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/session_io.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782978498488,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/approvals.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782978594491,
+      "type": "file"
+    },
+    {
+      "path": "apps/desktop/src/views/mod.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782978606126,
       "type": "file"
     }
   ],

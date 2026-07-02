@@ -118,9 +118,7 @@ impl Phase {
         match token.trim().to_ascii_lowercase().as_str() {
             "discovery" | "discover" => Some(Phase::Discovery),
             "plan" => Some(Phase::Plan),
-            "auto" | "autoimplement" | "auto-implement" | "implement" => {
-                Some(Phase::AutoImplement)
-            }
+            "auto" | "autoimplement" | "auto-implement" | "implement" => Some(Phase::AutoImplement),
             "test" => Some(Phase::Test),
             "review" => Some(Phase::Review),
             "commit" => Some(Phase::Commit),
@@ -250,8 +248,14 @@ mod tests {
         assert_eq!(Phase::from_token("Plan"), Some(Phase::Plan));
         // `auto` is the label; `autoimplement`/`implement` are accepted aliases.
         assert_eq!(Phase::from_token("auto"), Some(Phase::AutoImplement));
-        assert_eq!(Phase::from_token("AutoImplement"), Some(Phase::AutoImplement));
-        assert_eq!(Phase::from_token("  implement "), Some(Phase::AutoImplement));
+        assert_eq!(
+            Phase::from_token("AutoImplement"),
+            Some(Phase::AutoImplement)
+        );
+        assert_eq!(
+            Phase::from_token("  implement "),
+            Some(Phase::AutoImplement)
+        );
         assert_eq!(Phase::from_token("test"), Some(Phase::Test));
         assert_eq!(Phase::from_token("REVIEW"), Some(Phase::Review));
         assert_eq!(Phase::from_token("commit"), Some(Phase::Commit));

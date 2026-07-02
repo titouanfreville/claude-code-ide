@@ -95,7 +95,11 @@ impl SessionSupervisor {
             self.bus.publish(EngineEvent::SessionUpserted { session });
             restored += 1;
         }
-        tracing::info!(restored, fleet = self.fleet.len(), "fleet rehydrated from store");
+        tracing::info!(
+            restored,
+            fleet = self.fleet.len(),
+            "fleet rehydrated from store"
+        );
     }
 
     /// Refresh the persisted state of a *managed* session (UPDATE-only — a no-op if
@@ -206,7 +210,9 @@ impl SessionSupervisor {
             // Handled by the composition-root command router (runtime overlay + config
             // persist) before reaching the supervisor; arm kept for exhaustiveness.
             Command::AuthorizeAlwaysTool { .. } => {
-                tracing::debug!("AuthorizeAlwaysTool reached supervisor — expected router to consume it");
+                tracing::debug!(
+                    "AuthorizeAlwaysTool reached supervisor — expected router to consume it"
+                );
             }
         }
     }
@@ -889,7 +895,10 @@ mod tests {
         .await;
 
         let s = sup.session(&SessionId::new("m1")).expect("discovered");
-        assert!(s.adopted, "an app-managed record must auto-adopt on discovery");
+        assert!(
+            s.adopted,
+            "an app-managed record must auto-adopt on discovery"
+        );
         assert_eq!(s.phase, Phase::Discovery, "phase seeded from the record");
         assert_eq!(s.mode, Mode::Auto, "mode seeded from the record");
         assert!(
@@ -969,11 +978,9 @@ mod tests {
         // ...and each is announced so the delta-fed cockpit grid can show it.
         let events = drain(&mut rx);
         assert_eq!(events.len(), 2, "one upsert per restored session");
-        assert!(
-            events
-                .iter()
-                .all(|e| matches!(e, EngineEvent::SessionUpserted { .. }))
-        );
+        assert!(events
+            .iter()
+            .all(|e| matches!(e, EngineEvent::SessionUpserted { .. })));
     }
 
     #[tokio::test]
@@ -1010,7 +1017,10 @@ mod tests {
             status: SessionStatus::Running,
         })
         .await;
-        assert_eq!(sup.session(&SessionId::new("s")).unwrap().status, SessionStatus::Running);
+        assert_eq!(
+            sup.session(&SessionId::new("s")).unwrap().status,
+            SessionStatus::Running
+        );
         let _ = drain(&mut rx);
 
         sup.hydrate_from_store();
@@ -1022,7 +1032,10 @@ mod tests {
             SessionStatus::Running,
             "rehydration leaves a live session untouched"
         );
-        assert!(drain(&mut rx).is_empty(), "no upsert for an already-live session");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no upsert for an already-live session"
+        );
     }
 
     #[tokio::test]
@@ -1039,7 +1052,10 @@ mod tests {
         })
         .await;
 
-        assert!(sup.session(&SessionId::new("s")).is_none(), "dropped from fleet");
+        assert!(
+            sup.session(&SessionId::new("s")).is_none(),
+            "dropped from fleet"
+        );
         assert!(matches!(
             &drain(&mut rx)[..],
             [EngineEvent::SessionRemoved { session }] if session == &SessionId::new("s")
@@ -1248,7 +1264,10 @@ mod tests {
 
         let s = sup.session(&SessionId::new("s")).unwrap();
         assert_eq!(s.phase, Phase::Review, "Test → Review on advance");
-        assert!(!s.phase_pinned, "advancing returns the session to auto mode");
+        assert!(
+            !s.phase_pinned,
+            "advancing returns the session to auto mode"
+        );
         assert!(
             drain(&mut rx)
                 .iter()
@@ -1612,8 +1631,7 @@ mod tests {
         let control = Arc::new(FakeControl::default());
         let store = Arc::new(FakeStore::default());
         let bus = EventBus::new(64);
-        let mut sup =
-            SessionSupervisor::with_store(control, bus, Some(store.clone() as Arc<_>));
+        let mut sup = SessionSupervisor::with_store(control, bus, Some(store.clone() as Arc<_>));
         let id = SessionId::new("sess-1");
 
         // Spawn (Plan), then observe a phase change → should persist + audit.
@@ -1641,7 +1659,12 @@ mod tests {
         let audits = store.audits();
         assert!(
             audits.iter().any(|a| a.session_id == id
-                && matches!(a.action, AuditAction::PhaseChanged { to: Phase::AutoImplement })),
+                && matches!(
+                    a.action,
+                    AuditAction::PhaseChanged {
+                        to: Phase::AutoImplement
+                    }
+                )),
             "expected a PhaseChanged audit, got {audits:?}"
         );
         assert!(audits.iter().all(|a| !a.id.is_empty()));

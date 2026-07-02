@@ -47,9 +47,8 @@ pub fn read_message<R: BufRead>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
         }
         // Other headers (Content-Type) are ignored.
     }
-    let len = content_length.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length")
-    })?;
+    let len = content_length
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length"))?;
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
     Ok(Some(body))
@@ -116,7 +115,7 @@ pub fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
 fn map_kind(k: u64) -> SymbolKind {
     match k {
         5 => SymbolKind::Class,
-        6 | 9 => SymbolKind::Method, // Method, Constructor
+        6 | 9 => SymbolKind::Method,     // Method, Constructor
         7 | 8 | 22 => SymbolKind::Field, // Property, Field, EnumMember
         10 => SymbolKind::Enum,
         11 => SymbolKind::Interface,
@@ -125,7 +124,7 @@ fn map_kind(k: u64) -> SymbolKind {
         14 => SymbolKind::Constant,
         23 => SymbolKind::Struct,
         2..=4 => SymbolKind::Module, // Module, Namespace, Package
-        26 => SymbolKind::Type,          // TypeParameter
+        26 => SymbolKind::Type,      // TypeParameter
         _ => SymbolKind::Other,
     }
 }
@@ -213,9 +212,11 @@ fn start_line(range: &Value) -> Option<usize> {
 /// Convenience for the client: read one framed message and parse it as JSON.
 pub fn read_json<R: BufRead>(r: &mut R) -> io::Result<Option<Value>> {
     match read_message(r)? {
-        Some(body) => Ok(Some(serde_json::from_slice(&body).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, e)
-        })?)),
+        Some(body) => {
+            Ok(Some(serde_json::from_slice(&body).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, e)
+            })?))
+        }
         None => Ok(None),
     }
 }

@@ -23,7 +23,10 @@ use gpui_component::Placement;
 
 use super::CloseTab;
 
-actions!(moonlight_session, [SplitRight, SplitLeft, SplitUp, SplitDown]);
+actions!(
+    moonlight_session,
+    [SplitRight, SplitLeft, SplitUp, SplitDown]
+);
 
 use moonlight_domain::agent::AgentKind;
 use moonlight_domain::ids::{SessionId, Timestamp};
@@ -49,6 +52,68 @@ use crate::views::workspace::ShellDeps;
 const AUTO_RESUME_PROMPT: &str =
     "You appear to have stopped mid-task. Re-read your recent context and continue where \
      you left off until the work is complete.";
+
+/// How often a managed session polls its terminal for process exit (auto-resume watch).
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Cap on auto-relaunches after a CC process exit, so a session whose CC dies on launch
+/// can't relaunch in an unbounded loop. Beyond this the operator resumes manually.
+const MAX_EXIT_RESUMES: u8 = 3;
+
+/// Refusal reason sent to the agent when the operator refuses an external-MCP tool.
+const MCP_REFUSE_REASON: &str =
+    "External tool call refused by operator in this phase — request a phase change or use a different approach.";
+/// Refusal reason sent when the operator refuses a non-tool held approval (a sensitive
+/// phase change, a danger-zone command).
+const ACTION_REFUSE_REASON: &str = "Refused by operator.";
+
+/// A held operator authorization awaiting a verdict in this session's bottom-right
+/// popup (the small overlay on the focus view — the once/always/refuse gate that used
+/// to steal a whole center tab). Folded from [`EngineEvent::ApprovalRequested`] and
+/// cleared once the session resumes / changes phase / is removed.
+#[derive(Clone)]
+enum PendingAuthorize {
+    /// An external MCP tool a frozen phase blocked: once / always-tool / always-server /
+    /// refuse. Carries the full `mcp__server__tool` name.
+    McpTool(String),
+    /// A non-tool held approval (a sensitive phase change, a danger-zone command): a
+    /// plain approve / refuse. Carries the short `what` description shown in the prompt.
+    Action(String),
+}
+
+/// The `mcp__server__*` glob for an external MCP tool name (the "always allow this
+/// server" pattern). Falls back to the exact name when it isn't the expected
+/// `mcp__server__tool` shape, so a malformed name never becomes an over-broad glob.
+fn server_glob(tool: &str) -> String {
+    let parts: Vec<&str> = tool.split("__").collect();
+    if parts.len() >= 3 && parts[0] == "mcp" {
+        format!("{}__{}__*", parts[0], parts[1])
+    } else {
+        tool.to_string()
+    }
+}
+
+/// Friendly title + body for a non-tool held approval. A `request_phase` hold arrives
+/// as `"RequestPhase <token>"` (the verb's Debug name + the payload), so render it as a
+/// readable phase-change prompt; anything else (a danger-zone command) is shown verbatim.
+fn action_prompt(what: &str) -> (&'static str, String) {
+    if let Some(token) = what.strip_prefix("RequestPhase") {
+        let token = token.trim();
+        let target = if token.is_empty() || token.eq_ignore_ascii_case("next") {
+            "the next phase".to_string()
+        } else {
+            Phase::from_token(token)
+                .map(|p| p.label().to_string())
+                .unwrap_or_else(|| token.to_string())
+        };
+        (
+            "Authorize phase change",
+            format!("The agent wants to switch to {target} (this grants project-file writes)."),
+        )
+    } else {
+        ("Approve request", what.to_string())
+    }
+}
 
 pub struct SessionMonitor {
     id: SessionId,
@@ -86,6 +151,10 @@ pub struct SessionMonitor {
     /// is **pinned** (`EngineEvent::PhaseAdvanceRequested`). `Some(to)` renders an
     /// "Advance to <to>?" banner; cleared once the phase moves.
     pending_advance: Option<Phase>,
+    /// A held operator authorization (external-MCP tool / sensitive phase change)
+    /// awaiting a verdict, shown as the bottom-right popup on this session's focus
+    /// view. `None` when nothing is pending. See [`Self::authorize_popup`].
+    pending_authorize: Option<PendingAuthorize>,
     /// Whether this is the frontmost center tab (set in `set_active`). Gates the
     /// status-bar context announces and keeps them fresh as the session updates.
     active: bool,
@@ -127,10 +196,19 @@ pub struct SessionMonitor {
     /// exactly once, without fighting later operator overrides. See
     /// [`Self::maybe_apply_project_trust`].
     applied_project_trust: bool,
+    /// Whether the *current* terminal's process-exit has already been auto-resumed, so
+    /// the exit watcher acts once per exit (re-armed when a fresh terminal is live).
+    exit_handled: bool,
+    /// How many times this session has been auto-relaunched after its CC process exited,
+    /// capped at [`MAX_EXIT_RESUMES`] so a CC that dies on launch can't loop forever.
+    exit_resumes: u8,
     /// Holds the bus subscription alive for the panel's lifetime.
     _subscription: Option<Task<()>>,
     /// Holds the transcript-refresh poll alive (non-managed sessions only).
     _history: Option<Task<()>>,
+    /// Holds the process-exit watcher alive (managed sessions only) — drives
+    /// [`Self::check_terminal_exit`].
+    _exit_watch: Option<Task<()>>,
 }
 
 impl SessionMonitor {
@@ -187,13 +265,24 @@ impl SessionMonitor {
             .map(|s| resumable(s.status))
             .unwrap_or(false);
         let terminal = auto.then(|| {
-            let phase = initial.as_ref().map(|s| s.phase).unwrap_or_else(Phase::on_done);
+            let phase = initial
+                .as_ref()
+                .map(|s| s.phase)
+                .unwrap_or_else(Phase::on_done);
             let mcp = crate::views::mcp_host::url_for_session(&id, cx);
             let command = attach_command(&id, AgentKind::ClaudeCode, phase, mcp.as_deref());
             cx.new(|cx| TerminalPanel::new_running_in(root.clone(), &command, cx).embedded())
         });
         // Observed sessions are external `claude` — see [`new`].
-        Self::build(id, initial, terminal, Some(root), AgentKind::ClaudeCode, rx, cx)
+        Self::build(
+            id,
+            initial,
+            terminal,
+            Some(root),
+            AgentKind::ClaudeCode,
+            rx,
+            cx,
+        )
     }
 
     fn build(
@@ -266,6 +355,23 @@ impl SessionMonitor {
             })
         });
 
+        // Managed sessions: watch for the CC process exiting (PTY closed) so a project
+        // opted into auto-resume can relaunch it in place (`claude --resume` + a continue
+        // prompt). Distinct from the stall nudge — an *exited* process is unambiguously a
+        // session that stopped while working, so this fires for live sessions too (not
+        // just restored ones). See [`Self::check_terminal_exit`].
+        let exit_watch = terminal.is_some().then(|| {
+            cx.spawn(async move |weak, cx| loop {
+                cx.background_executor().timer(EXIT_POLL_INTERVAL).await;
+                let keep = weak
+                    .update(cx, |this, cx| this.check_terminal_exit(cx))
+                    .is_ok();
+                if !keep {
+                    break; // panel dropped
+                }
+            })
+        });
+
         // Register the embedded terminal so other panels (the Plan tab) can drive
         // this session's CC TUI — e.g. send Enter to accept a plan's continuation.
         if let Some(term) = &terminal {
@@ -303,6 +409,19 @@ impl SessionMonitor {
             .map(auto_compact::load_config)
             .unwrap_or_default();
 
+        // Recover an outstanding approval hold: this monitor may have been opened
+        // *after* the one-shot `ApprovalRequested` (e.g. via the bell notification, or
+        // by switching back to the session's space), which the live subscription above
+        // could not have seen. The retained hold rebuilds the popup so the operator can
+        // still act. See [`crate::views::approvals`].
+        let pending_authorize = cx
+            .try_global::<ShellDeps>()
+            .and_then(|d| d.approvals.get(&id))
+            .map(|hold| match hold.tool {
+                Some(tool) => PendingAuthorize::McpTool(tool),
+                None => PendingAuthorize::Action(hold.what),
+            });
+
         Self {
             id,
             agent,
@@ -315,6 +434,7 @@ impl SessionMonitor {
             tab_panel: None,
             tab_menu: None,
             pending_advance: None,
+            pending_authorize,
             active: false,
             meta,
             rename_input: None,
@@ -329,8 +449,11 @@ impl SessionMonitor {
             last_alert: None,
             resume_armed: false,
             applied_project_trust: false,
+            exit_handled: false,
+            exit_resumes: 0,
             _subscription: Some(subscription),
             _history: history,
+            _exit_watch: exit_watch,
         }
     }
 
@@ -343,7 +466,11 @@ impl SessionMonitor {
         let Some(root) = self.resume_root.clone() else {
             return;
         };
-        let phase = self.session.as_ref().map(|s| s.phase).unwrap_or_else(Phase::on_done);
+        let phase = self
+            .session
+            .as_ref()
+            .map(|s| s.phase)
+            .unwrap_or_else(Phase::on_done);
         let mcp = crate::views::mcp_host::url_for_session(&self.id, cx);
         let command = attach_command(&self.id, self.agent, phase, mcp.as_deref());
         let terminal = cx.new(|cx| TerminalPanel::new_running_in(root, &command, cx).embedded());
@@ -373,16 +500,40 @@ impl SessionMonitor {
     fn apply_event(&mut self, event: &EngineEvent) -> bool {
         match event {
             EngineEvent::SessionUpserted { session } if session.id == self.id => {
+                let waiting = matches!(session.status, SessionStatus::WaitingInput);
                 self.session = Some(session.clone());
                 // A full-row update means the phase (and pin) are current — any
                 // pending advance request has been resolved.
                 self.pending_advance = None;
+                // Unless the row still shows the session blocked on us, any held
+                // authorization has been resolved elsewhere — drop the popup.
+                if !waiting {
+                    self.pending_authorize = None;
+                }
                 true
             }
             EngineEvent::SessionStateChanged { session, status } if *session == self.id => {
                 if let Some(s) = self.session.as_mut() {
                     s.status = *status;
                 }
+                // A resume (any status but WaitingInput) means an outstanding
+                // authorization hold was resolved — dismiss the popup.
+                if !matches!(status, SessionStatus::WaitingInput) {
+                    self.pending_authorize = None;
+                }
+                true
+            }
+            // A held operator authorization (external-MCP tool, or a sensitive phase
+            // change / danger-zone command) — surface it in the bottom-right popup.
+            EngineEvent::ApprovalRequested {
+                session,
+                what,
+                authorize_tool,
+            } if *session == self.id => {
+                self.pending_authorize = Some(match authorize_tool {
+                    Some(tool) => PendingAuthorize::McpTool(tool.clone()),
+                    None => PendingAuthorize::Action(what.clone()),
+                });
                 true
             }
             EngineEvent::PhaseTransitioned { session, phase } if *session == self.id => {
@@ -390,6 +541,8 @@ impl SessionMonitor {
                     s.phase = *phase;
                 }
                 self.pending_advance = None;
+                // A phase move resolves a pending phase-change approval.
+                self.pending_authorize = None;
                 true
             }
             // A pinned session reached a checkpoint and the workflow wants to move;
@@ -496,12 +649,97 @@ impl SessionMonitor {
         .detach();
     }
 
+    /// Poll-driven auto-resume on **process exit**: when a managed session's CC process
+    /// ends (its PTY closes), a project opted into auto-resume relaunches the same
+    /// conversation in place (`claude --resume`) and nudges it to continue. Unlike the
+    /// stall nudge, an exited process is unambiguously a session that stopped while
+    /// working, so this fires for live sessions too — capped at [`MAX_EXIT_RESUMES`] so a
+    /// CC that dies on launch can't loop. Acts once per exit (re-armed when alive again).
+    fn check_terminal_exit(&mut self, cx: &mut Context<Self>) {
+        let Some(term) = self.terminal.as_ref() else {
+            return;
+        };
+        if !term.read(cx).has_exited() {
+            self.exit_handled = false; // a live (freshly relaunched) terminal → re-arm
+            return;
+        }
+        if self.exit_handled {
+            return; // already acted on this exit
+        }
+        self.exit_handled = true;
+        let Some(deps) = cx.try_global::<ShellDeps>().cloned() else {
+            return;
+        };
+        let Some(root) = self.space_root() else {
+            return;
+        };
+        if !deps.focus.read(cx).project_auto_resume(&root) {
+            return;
+        }
+        if self.exit_resumes >= MAX_EXIT_RESUMES {
+            tracing::warn!(
+                session = %self.id.as_str(),
+                "auto-resume: CC exited but the relaunch cap was reached — leaving it to the operator"
+            );
+            return;
+        }
+        self.exit_resumes += 1;
+        self.relaunch_after_exit(root, &deps, cx);
+    }
+
+    /// Relaunch a managed session whose CC process exited, resuming the same conversation
+    /// and injecting the continue prompt once the TUI is back. Mirrors [`Self::try_resume`]
+    /// but is window-free (poll-driven, no focus steal). Polls the screen so the nudge
+    /// isn't fired into a not-yet-ready CC (a lost keystroke).
+    fn relaunch_after_exit(&mut self, root: PathBuf, deps: &ShellDeps, cx: &mut Context<Self>) {
+        let phase = self
+            .session
+            .as_ref()
+            .map(|s| s.phase)
+            .unwrap_or_else(Phase::on_done);
+        let mcp = crate::views::mcp_host::url_for_session(&self.id, cx);
+        let command = attach_command(&self.id, self.agent, phase, mcp.as_deref());
+        let terminal = cx.new(|cx| TerminalPanel::new_running_in(root, &command, cx).embedded());
+        deps.session_io
+            .register(self.id.clone(), terminal.downgrade());
+        let weak_term = terminal.downgrade();
+        self.terminal = Some(terminal);
+        // The fresh terminal carries no armed injection.
+        self.compact_armed = false;
+        tracing::info!(
+            session = %self.id.as_str(),
+            "auto-resume: CC process exited — relaunched with --resume and nudging to continue"
+        );
+        cx.spawn(async move |_, cx| {
+            let mut waited = 0u64;
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                waited += 300;
+                let Ok(ready) = weak_term.update(cx, |t, _| !t.visible_text().trim().is_empty())
+                else {
+                    return; // terminal gone
+                };
+                if ready || waited >= 8000 {
+                    break;
+                }
+            }
+            let _ = weak_term.update(cx, |t, _| t.send_text(&format!("{AUTO_RESUME_PROMPT}\r")));
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Push this session's name / status / phase to the shared
     /// [`ActiveContext`](crate::views::active_context::ActiveContext) so the bottom
     /// status bar reflects it. Falls back to the short id + neutral status/phase
     /// before the engine record arrives.
     fn announce_context(&self, cx: &mut Context<Self>) {
-        let Some(ac) = cx.try_global::<ShellDeps>().map(|d| d.active_context.clone()) else {
+        let Some(ac) = cx
+            .try_global::<ShellDeps>()
+            .map(|d| d.active_context.clone())
+        else {
             return;
         };
         let ctx = match &self.session {
@@ -688,8 +926,7 @@ pub fn attach_command(
     // Resume the existing conversation when a transcript exists; otherwise start fresh
     // pinned to the same id (see the ghost-session note above). Backend-agnostic: the
     // command shape is the backend's job (ClaudeCode is byte-identical to before).
-    let (selector, permission_mode) = if crate::transcript::transcript_path(id.as_str()).is_some()
-    {
+    let (selector, permission_mode) = if crate::transcript::transcript_path(id.as_str()).is_some() {
         (SessionSelector::Resume(id), None)
     } else {
         (SessionSelector::Fresh(id), Some(phase.cc_permission_mode()))
@@ -831,7 +1068,6 @@ impl Panel for SessionMonitor {
             .menu("Split Up", Box::new(SplitUp))
     }
 
-
     /// When this session tab becomes frontmost, announce it to the bottom status bar.
     fn set_active(&mut self, active: bool, _window: &mut Window, cx: &mut Context<Self>) {
         self.active = active;
@@ -968,7 +1204,9 @@ impl Render for SessionMonitor {
                 head.child(top)
                     .children(self.color_open.then(|| self.color_palette(cx)))
                     .children((condensed && self.phase_open).then(|| self.phase_menu(s.phase, cx)))
-                    .children((condensed && self.trust_open).then(|| self.trust_menu(s.trust_tier, cx)))
+                    .children(
+                        (condensed && self.trust_open).then(|| self.trust_menu(s.trust_tier, cx)),
+                    )
             }
             None => div()
                 .text_color(theme::text_muted())
@@ -1014,6 +1252,7 @@ impl Render for SessionMonitor {
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                 super::close_this_tab(&this.tab_panel, cx.entity(), window, cx)
             }))
+            .relative()
             .flex()
             .flex_col()
             .gap(px(14.))
@@ -1036,11 +1275,222 @@ impl Render for SessionMonitor {
             // The CC terminal is always shown — condensing only trims header chrome,
             // handing the reclaimed height to the terminal.
             .child(self.transcript())
-            .children(super::tab_menu_overlay(self.tab_menu.as_ref(), dismiss, window))
+            // The bottom-right authorization popup floats over the focus view (added
+            // last so it paints above the terminal/transcript).
+            .children(self.authorize_popup(cx))
+            .children(super::tab_menu_overlay(
+                self.tab_menu.as_ref(),
+                dismiss,
+                window,
+            ))
     }
 }
 
 impl SessionMonitor {
+    /// Send an authorization verdict to the engine and dismiss the popup. The optimistic
+    /// clear keeps the overlay from lingering while the resumed status makes its bus
+    /// round-trip (the fold in [`Self::apply_event`] would clear it too, as a backstop).
+    fn resolve_authorize(&mut self, command: Command, cx: &mut Context<Self>) {
+        if let Some(deps) = cx.try_global::<ShellDeps>() {
+            let _ = deps.commands.send(command);
+            // Drop the retained hold now, not just on the resolving event, so a monitor
+            // reopened in the gap between this click and the engine's ack doesn't rebuild
+            // the popup (and let the operator double-decide). See [`crate::views::approvals`].
+            deps.approvals.clear(&self.id);
+        }
+        self.pending_authorize = None;
+        cx.notify();
+    }
+
+    /// A compact pill button for the authorization popup.
+    fn authorize_button(
+        id: &'static str,
+        label: String,
+        color: Hsla,
+        tint: f32,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .id(id)
+            .cursor_pointer()
+            .px(px(9.))
+            .py(px(4.))
+            .rounded(theme::radius_sm())
+            .bg(theme::tint(color, tint))
+            .text_color(color)
+            .text_size(px(11.))
+            .child(label)
+            .on_click(cx.listener(move |this, _ev, _w, cx| on_click(this, cx)))
+            .into_any_element()
+    }
+
+    /// The bottom-right authorization popup: a small overlay on the focus view that
+    /// surfaces a held operator decision (external-MCP tool / sensitive phase change /
+    /// danger-zone command) without stealing the whole center. `None` when nothing is
+    /// pending. Anchored by the render root's `.relative()`.
+    fn authorize_popup(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let pending = self.pending_authorize.as_ref()?;
+
+        let (title, body, buttons): (&str, String, Vec<gpui::AnyElement>) = match pending {
+            PendingAuthorize::McpTool(tool) => {
+                let tool_pat = tool.clone();
+                let glob = server_glob(tool);
+                let glob_label = glob.clone();
+                let buttons = vec![
+                    Self::authorize_button(
+                        "auth-allow-once",
+                        "✓ Allow once".to_string(),
+                        theme::accent(),
+                        0.18,
+                        |this, cx| {
+                            this.resolve_authorize(
+                                Command::ApproveAction {
+                                    session: this.id.clone(),
+                                },
+                                cx,
+                            )
+                        },
+                        cx,
+                    ),
+                    Self::authorize_button(
+                        "auth-always-tool",
+                        "✓ Always: this tool".to_string(),
+                        theme::accent(),
+                        0.12,
+                        move |this, cx| {
+                            this.resolve_authorize(
+                                Command::AuthorizeAlwaysTool {
+                                    session: this.id.clone(),
+                                    pattern: tool_pat.clone(),
+                                },
+                                cx,
+                            )
+                        },
+                        cx,
+                    ),
+                    Self::authorize_button(
+                        "auth-always-server",
+                        format!("✓ Always: {glob_label}"),
+                        theme::accent(),
+                        0.12,
+                        move |this, cx| {
+                            this.resolve_authorize(
+                                Command::AuthorizeAlwaysTool {
+                                    session: this.id.clone(),
+                                    pattern: glob.clone(),
+                                },
+                                cx,
+                            )
+                        },
+                        cx,
+                    ),
+                    Self::authorize_button(
+                        "auth-refuse",
+                        "✕ Refuse".to_string(),
+                        theme::status_color(SessionStatus::Errored),
+                        0.16,
+                        |this, cx| {
+                            this.resolve_authorize(
+                                Command::DenyAction {
+                                    session: this.id.clone(),
+                                    reason: MCP_REFUSE_REASON.to_string(),
+                                },
+                                cx,
+                            )
+                        },
+                        cx,
+                    ),
+                ];
+                ("Authorize external tool", tool.clone(), buttons)
+            }
+            PendingAuthorize::Action(what) => {
+                let buttons = vec![
+                    Self::authorize_button(
+                        "auth-approve",
+                        "✓ Approve".to_string(),
+                        theme::accent(),
+                        0.18,
+                        |this, cx| {
+                            this.resolve_authorize(
+                                Command::ApproveAction {
+                                    session: this.id.clone(),
+                                },
+                                cx,
+                            )
+                        },
+                        cx,
+                    ),
+                    Self::authorize_button(
+                        "auth-action-refuse",
+                        "✕ Refuse".to_string(),
+                        theme::status_color(SessionStatus::Errored),
+                        0.16,
+                        |this, cx| {
+                            this.resolve_authorize(
+                                Command::DenyAction {
+                                    session: this.id.clone(),
+                                    reason: ACTION_REFUSE_REASON.to_string(),
+                                },
+                                cx,
+                            )
+                        },
+                        cx,
+                    ),
+                ];
+                let (title, body) = action_prompt(what);
+                (title, body, buttons)
+            }
+        };
+
+        Some(
+            div()
+                .absolute()
+                .bottom(px(16.))
+                .right(px(16.))
+                .w(px(320.))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded(theme::radius_md())
+                .border_1()
+                .border_color(theme::accent())
+                .bg(theme::surface_raised())
+                .p_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(div().text_color(theme::accent()).child("◈"))
+                        .child(
+                            div()
+                                .text_size(theme::text_sm())
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title.to_string()),
+                        ),
+                )
+                .child(
+                    div()
+                        .font_family(theme::mono_font())
+                        .text_size(px(11.))
+                        .text_color(theme::text_secondary())
+                        .child(body),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(px(6.))
+                        .children(buttons),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// A subtle square glyph button for a header affordance (e.g. the rename pencil).
     fn icon_button(
         &self,
@@ -1176,7 +1626,11 @@ impl SessionMonitor {
                 .child(
                     div()
                         .w(px(64.))
-                        .text_color(if active { color } else { theme::text_secondary() })
+                        .text_color(if active {
+                            color
+                        } else {
+                            theme::text_secondary()
+                        })
                         .child(p.label()),
                 )
                 .child(
@@ -1186,14 +1640,17 @@ impl SessionMonitor {
                         .child(p.mode_label()),
                 );
             if active {
-                item = item.bg(theme::tint(color, 0.16)).font_weight(FontWeight::SEMIBOLD);
+                item = item
+                    .bg(theme::tint(color, 0.16))
+                    .font_weight(FontWeight::SEMIBOLD);
             } else {
-                item = item.cursor_pointer().hover(|d| d.bg(theme::surface_overlay())).on_click(
-                    cx.listener(move |this, _e, window, cx| {
+                item = item
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme::surface_overlay()))
+                    .on_click(cx.listener(move |this, _e, window, cx| {
                         this.phase_open = false;
                         this.request_phase(p, window, cx);
-                    }),
-                );
+                    }));
             }
             menu = menu.child(item);
         }
@@ -1234,7 +1691,11 @@ impl SessionMonitor {
                 .child(
                     div()
                         .w(px(64.))
-                        .text_color(if active { theme::accent() } else { theme::text_secondary() })
+                        .text_color(if active {
+                            theme::accent()
+                        } else {
+                            theme::text_secondary()
+                        })
                         .child(trust_label(t)),
                 )
                 .child(
@@ -1244,14 +1705,17 @@ impl SessionMonitor {
                         .child(desc),
                 );
             if active {
-                item = item.bg(theme::tint(theme::accent(), 0.16)).font_weight(FontWeight::SEMIBOLD);
+                item = item
+                    .bg(theme::tint(theme::accent(), 0.16))
+                    .font_weight(FontWeight::SEMIBOLD);
             } else {
-                item = item.cursor_pointer().hover(|d| d.bg(theme::surface_overlay())).on_click(
-                    cx.listener(move |this, _e, _w, cx| {
+                item = item
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme::surface_overlay()))
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
                         this.trust_open = false;
                         this.request_trust(t, cx);
-                    }),
-                );
+                    }));
             }
             menu = menu.child(item);
         }
@@ -1355,9 +1819,9 @@ impl SessionMonitor {
                         theme::surface_raised()
                     })
                     .hover(|d| d.border_color(theme::text_secondary()))
-                    .on_click(cx.listener(move |this, _ev, _w, cx| {
-                        this.pick_color(Some(color), cx)
-                    })),
+                    .on_click(
+                        cx.listener(move |this, _ev, _w, cx| this.pick_color(Some(color), cx)),
+                    ),
             );
         }
         row.child(
@@ -1391,7 +1855,10 @@ impl SessionMonitor {
         let (bg, fg) = if on {
             (theme::tint(theme::accent(), 0.18), theme::accent())
         } else {
-            (theme::tint(theme::text_muted(), 0.12), theme::text_secondary())
+            (
+                theme::tint(theme::text_muted(), 0.12),
+                theme::text_secondary(),
+            )
         };
         div()
             .id("session-auto-resume")
@@ -1402,7 +1869,11 @@ impl SessionMonitor {
             .bg(bg)
             .text_color(fg)
             .text_size(px(11.))
-            .child(if on { "⟳ auto-resume: on" } else { "⟳ auto-resume: off" })
+            .child(if on {
+                "⟳ auto-resume: on"
+            } else {
+                "⟳ auto-resume: off"
+            })
             .on_click(cx.listener(|this, _ev, _w, cx| this.toggle_auto_resume(cx)))
             .into_any_element()
     }
@@ -1550,7 +2021,10 @@ impl SessionMonitor {
         };
         // Context % exactly as the status bar shows it (CC's native figure when
         // the payload carries one, else tokens ÷ window).
-        let Some(pct) = obs.read(cx).get(&self.id).and_then(crate::obs::SessionObs::ctx_pct)
+        let Some(pct) = obs
+            .read(cx)
+            .get(&self.id)
+            .and_then(crate::obs::SessionObs::ctx_pct)
         else {
             return;
         };
@@ -1558,7 +2032,10 @@ impl SessionMonitor {
             auto_compact::Decision::Arm => {
                 term.update(cx, |t, _| t.arm_injection("/compact\r".to_string()));
                 self.compact_armed = true;
-                if let Some(n) = cx.try_global::<ShellDeps>().map(|d| d.notifications.clone()) {
+                if let Some(n) = cx
+                    .try_global::<ShellDeps>()
+                    .map(|d| d.notifications.clone())
+                {
                     let text = format!(
                         "Context {pct}% — compacting before your next message · {}",
                         self.title_text()
@@ -1609,9 +2086,9 @@ impl SessionMonitor {
             };
             s = s.child(p.label());
             if interactive && !active {
-                s = s
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _e, window, cx| this.request_phase(p, window, cx)));
+                s = s.cursor_pointer().on_click(
+                    cx.listener(move |this, _e, window, cx| this.request_phase(p, window, cx)),
+                );
             }
             s
         };
@@ -1645,7 +2122,11 @@ impl SessionMonitor {
 
         // When the operator has pinned the phase (manual override of auto-advance),
         // show a lock chip that resumes auto in place.
-        let pinned = self.session.as_ref().map(|s| s.phase_pinned).unwrap_or(false);
+        let pinned = self
+            .session
+            .as_ref()
+            .map(|s| s.phase_pinned)
+            .unwrap_or(false);
         let pin_chip = (pinned && interactive).then(|| {
             div()
                 .id("phase-unpin")
@@ -1766,7 +2247,22 @@ impl SessionMonitor {
             s.mode = target.operator_mode();
         }
         if prev_native != Some(target.cc_permission_mode()) {
-            self.relaunch_terminal(target.cc_permission_mode(), window, cx);
+            match self.agent {
+                // Claude re-pins its native `--permission-mode` by relaunching (`--resume`).
+                AgentKind::ClaudeCode => {
+                    self.relaunch_terminal(target.cc_permission_mode(), window, cx)
+                }
+                // AGY has no `--permission-mode` and can't be relaunched into a mode — and a
+                // restart would lose the conversation (no `--session-id`). The moonlight
+                // `PreToolUse` hook already enforces the new phase (the `SetPhase` above), so
+                // instead of restarting we toggle AGY's own plan mode in the running TUI via
+                // `/plan` (the boundary fires on entering *and* leaving Plan).
+                AgentKind::Antigravity => {
+                    if let Some(term) = &self.terminal {
+                        let _ = term.update(cx, |t, _| t.send_text("/plan\r"));
+                    }
+                }
+            }
         }
         cx.notify();
     }
@@ -1851,7 +2347,8 @@ impl SessionMonitor {
             // alignment is already done for this session, so block the one-shot re-apply.
             self.applied_project_trust = true;
             if let Some(root) = self.space_root() {
-                deps.focus.update(cx, |ps, _cx| ps.set_project_trust(&root, tier));
+                deps.focus
+                    .update(cx, |ps, _cx| ps.set_project_trust(&root, tier));
             }
         }
         cx.notify();
@@ -1860,7 +2357,12 @@ impl SessionMonitor {
     /// Relaunch the embedded session with an explicit `--permission-mode`, so CC's
     /// native mode matches the operator's pick. No-op for a session with no embedded
     /// terminal (observed/external) or no known repo root.
-    fn relaunch_terminal(&mut self, native_mode: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn relaunch_terminal(
+        &mut self,
+        native_mode: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.terminal.is_none() {
             return; // not a session we own a PTY for — nothing to relaunch
         }
@@ -1878,8 +2380,7 @@ impl SessionMonitor {
                 mcp_url: mcp.as_deref(),
             }),
         );
-        let terminal =
-            cx.new(|cx| TerminalPanel::new_running_in(root, &command, cx).embedded());
+        let terminal = cx.new(|cx| TerminalPanel::new_running_in(root, &command, cx).embedded());
         if let Some(io) = cx.try_global::<ShellDeps>().map(|d| d.session_io.clone()) {
             io.register(self.id.clone(), terminal.downgrade());
         }
@@ -2040,7 +2541,9 @@ fn message_row(idx: usize, msg: &crate::transcript::Message) -> impl IntoElement
     // Assistant turns are markdown (headings/lists/code/bold); user turns are shown
     // verbatim (they're plain prose, and markdown could misrender pasted content).
     let body = match msg.role {
-        Role::Assistant => TextView::markdown(("msg", idx), body_src).into_any_element(),
+        Role::Assistant => TextView::markdown(("msg", idx), body_src)
+            .style(theme::markdown_style())
+            .into_any_element(),
         Role::User => div()
             .text_size(theme::text_sm())
             .text_color(theme::text_primary())
@@ -2148,4 +2651,37 @@ fn transcript_placeholder() -> impl IntoElement {
                 .text_color(theme::text_muted())
                 .child("Live transcript — coming with the session feed"),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{action_prompt, server_glob};
+
+    #[test]
+    fn server_glob_covers_the_whole_server() {
+        assert_eq!(server_glob("mcp__phoenix__run_select_query"), "mcp__phoenix__*");
+        // A tool with extra `__` in its leaf still globs at the server boundary.
+        assert_eq!(server_glob("mcp__phoenix__open_snowflake_request"), "mcp__phoenix__*");
+        // A non-MCP-shaped name falls back to itself (never an over-broad glob).
+        assert_eq!(server_glob("weird"), "weird");
+        assert_eq!(server_glob("mcp__only"), "mcp__only");
+    }
+
+    #[test]
+    fn action_prompt_reads_request_phase_holds_as_phase_changes() {
+        // A `request_phase` hold ("RequestPhase <token>") renders as a phase prompt
+        // naming the target phase's label.
+        let (title, body) = action_prompt("RequestPhase auto");
+        assert_eq!(title, "Authorize phase change");
+        assert!(body.contains("Auto"), "{body}");
+        // `next` / empty resolve to a generic "next phase".
+        let (_, body) = action_prompt("RequestPhase next");
+        assert!(body.contains("next phase"), "{body}");
+        let (_, body) = action_prompt("RequestPhase");
+        assert!(body.contains("next phase"), "{body}");
+        // Anything else is shown verbatim under a generic title.
+        let (title, body) = action_prompt("rm -rf /tmp/scratch");
+        assert_eq!(title, "Approve request");
+        assert_eq!(body, "rm -rf /tmp/scratch");
+    }
 }

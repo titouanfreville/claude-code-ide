@@ -74,6 +74,13 @@ const DEFAULT_LIVENESS_WINDOW: Duration = Duration::from_secs(20);
 /// it. Raises an `Incomplete` ⚠ overlay; cleared when the session writes again.
 const DEFAULT_STALL_WINDOW: Duration = Duration::from_secs(180);
 
+/// Default **done** threshold: a finished turn (the agent replied / cleanly stopped)
+/// that's been quiet this long has *settled* — it drops from `WaitingInput` (the amber
+/// "your turn" nudge) to a calm `Idle`. Keeps a fresh hand-back briefly visible as
+/// "needs you", then stops nagging so a screen full of long-finished sessions doesn't
+/// blink amber forever. Longer than [`DEFAULT_LIVENESS_WINDOW`], shorter than the stall.
+const DEFAULT_DONE_WINDOW: Duration = Duration::from_secs(120);
+
 /// Tails Claude Code transcripts and emits [`DetectionEvent`]s. A session whose
 /// transcript was modified within `active_window` is part of the live fleet;
 /// sessions that go stale are `Ended`.
@@ -82,6 +89,7 @@ pub struct JsonlDetectionSource {
     active_window: Duration,
     liveness_window: Duration,
     stall_window: Duration,
+    done_window: Duration,
     state: Mutex<HashMap<String, FileState>>,
 }
 
@@ -92,8 +100,16 @@ impl JsonlDetectionSource {
             active_window,
             liveness_window: DEFAULT_LIVENESS_WINDOW,
             stall_window: DEFAULT_STALL_WINDOW,
+            done_window: DEFAULT_DONE_WINDOW,
             state: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Override the finished-turn "settled" threshold (a quiet reply/stop this long
+    /// cools from `WaitingInput` to `Idle`). Mainly for tests.
+    pub fn with_done_window(mut self, window: Duration) -> Self {
+        self.done_window = window;
+        self
     }
 
     /// Override the working-vs-waiting liveness threshold (mainly for tests).
@@ -283,9 +299,7 @@ impl DetectionSource for JsonlDetectionSource {
                                 plan,
                             });
                         }
-                        Signal::Summary(summary)
-                            if entry.summary.as_deref() != Some(&summary) =>
-                        {
+                        Signal::Summary(summary) if entry.summary.as_deref() != Some(&summary) => {
                             entry.summary = Some(summary.clone());
                             out.push(DetectionEvent::SummaryObserved {
                                 session: id.clone(),
@@ -300,7 +314,7 @@ impl DetectionSource for JsonlDetectionSource {
             // Recompute live status every poll (even with no new lines), so a
             // session flips working→waiting as its transcript goes quiet.
             let age = file_age(path);
-            let desired = status_for(entry.last_turn, age, self.liveness_window);
+            let desired = status_for(entry.last_turn, age, self.liveness_window, self.done_window);
             if entry.status != Some(desired) {
                 entry.status = Some(desired);
                 out.push(DetectionEvent::StatusChanged {
@@ -319,9 +333,21 @@ impl DetectionSource for JsonlDetectionSource {
             // its tool_use and tool_result writes, and a hookless session never trips the
             // `Assistant` arm — both keep false positives out. Edge-emitted (once each
             // on stall / recovery).
+            // What counts as a turn that *stalled* (silent past the working window). The
+            // two arms are complementary, keyed on whether a Stop hook is proven active
+            // (`seen_clean_stop`), so exactly one reliable signal applies:
+            //   - **Hookless** session: it ends a turn on a bare `Assistant` line (no
+            //     clean-stop marker), so that arm can't be trusted — instead a lingering
+            //     unanswered `User` prompt is the stall signal (the agent never started).
+            //   - **Stop-hook** session: a *finished* turn always writes a `StopClean`, so
+            //     a lingering `User`/`ToolResult` just means the agent is mid-think on the
+            //     prompt — NOT stuck. The cut-off signal moves to the `Assistant` arm (an
+            //     assistant turn with no following clean stop = generation cut off).
+            // A `ToolResult` is the agent's own working loop either way → never a stall.
             let interruptible_turn = match entry.last_turn {
-                Some(Turn::User) => true,
+                Some(Turn::User) => !entry.seen_clean_stop,
                 Some(Turn::Assistant) => entry.seen_clean_stop,
+                Some(Turn::ToolResult) => false,
                 _ => false,
             };
             let stalled = interruptible_turn && age >= self.stall_window;
@@ -429,7 +455,9 @@ mod tests {
         // Idempotent: still stalled, but the alert is edge-emitted (no repeat).
         let again = source.poll().await.unwrap();
         assert!(
-            !again.iter().any(|e| matches!(e, DetectionEvent::Alert { .. })),
+            !again
+                .iter()
+                .any(|e| matches!(e, DetectionEvent::Alert { .. })),
             "{again:?}"
         );
 
@@ -452,6 +480,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_silent_tool_result_does_not_raise_an_incomplete_alert() {
+        let dir = std::env::temp_dir().join(format!("ml-detect-tr-{}", std::process::id()));
+        let project = dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("sess-tr.jsonl");
+
+        // stall_window = 0 → any *interruptible* handed turn would stall at once.
+        let source = JsonlDetectionSource::new(dir.clone(), Duration::from_secs(3600))
+            .with_liveness_window(Duration::ZERO)
+            .with_stall_window(Duration::ZERO);
+
+        // A tool_result (a `user`-role line carrying a tool_result block) is the agent's
+        // working loop, not an unanswered prompt — even silent it must NOT flag.
+        write(
+            &transcript,
+            "{\"type\":\"user\",\"cwd\":\"/w\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"x\",\"content\":\"ok\"}]}}\n",
+        );
+        let events = source.poll().await.unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                DetectionEvent::Alert {
+                    alert: Some(AttentionKind::Incomplete),
+                    ..
+                }
+            )),
+            "a silent tool_result must not stall: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_user_prompt_does_not_stall_once_a_stop_hook_is_proven() {
+        let dir = std::env::temp_dir().join(format!("ml-detect-uhook-{}", std::process::id()));
+        let project = dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("sess-uhook.jsonl");
+
+        let source = JsonlDetectionSource::new(dir.clone(), Duration::from_secs(3600))
+            .with_liveness_window(Duration::ZERO)
+            .with_stall_window(Duration::ZERO);
+
+        // A clean stop proves a Stop hook is active → a *finished* turn always writes a
+        // StopClean. So a later operator prompt that's still silent means the agent is
+        // mid-think on it (would end on a StopClean), NOT stuck → no Incomplete.
+        write(
+            &transcript,
+            "{\"type\":\"system\",\"subtype\":\"stop_hook_summary\"}\n{\"type\":\"user\",\"cwd\":\"/w\"}\n",
+        );
+        let events = source.poll().await.unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                DetectionEvent::Alert {
+                    alert: Some(AttentionKind::Incomplete),
+                    ..
+                }
+            )),
+            "a user prompt under a proven Stop hook must not stall: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn an_assistant_stall_only_fires_after_a_clean_stop_proves_a_stop_hook() {
         let dir = std::env::temp_dir().join(format!("ml-detect-astall-{}", std::process::id()));
         let project = dir.join("proj");
@@ -468,10 +562,9 @@ mod tests {
         write(&transcript, "{\"type\":\"assistant\"}\n");
         let events = source.poll().await.unwrap();
         assert!(
-            !events.iter().any(|e| matches!(
-                e,
-                DetectionEvent::Alert { alert: Some(_), .. }
-            )),
+            !events
+                .iter()
+                .any(|e| matches!(e, DetectionEvent::Alert { alert: Some(_), .. })),
             "{events:?}"
         );
 
@@ -615,7 +708,10 @@ mod tests {
             }));
 
         std::fs::remove_file(&t).unwrap(); // session now absent from the active window
-        let ended = |evs: &[DetectionEvent]| evs.iter().any(|e| matches!(e, DetectionEvent::Ended { .. }));
+        let ended = |evs: &[DetectionEvent]| {
+            evs.iter()
+                .any(|e| matches!(e, DetectionEvent::Ended { .. }))
+        };
         assert!(!ended(&source.poll().await.unwrap()), "miss 1");
         assert!(!ended(&source.poll().await.unwrap()), "miss 2");
         assert!(

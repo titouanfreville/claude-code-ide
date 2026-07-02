@@ -127,7 +127,10 @@ impl AttentionKind {
     /// Whether this is a "did not finish correctly" alert (the operator should look) —
     /// as opposed to a normal, expected "needs you" pause.
     pub fn is_warning(self) -> bool {
-        matches!(self, AttentionKind::Incomplete | AttentionKind::Errored | AttentionKind::Stuck)
+        matches!(
+            self,
+            AttentionKind::Incomplete | AttentionKind::Errored | AttentionKind::Stuck
+        )
     }
 }
 

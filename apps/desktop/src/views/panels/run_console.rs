@@ -95,7 +95,10 @@ impl RunConsolePanel {
                         panel.follow = true;
                     }
                     // The selected onglet may have been closed via MCP/remove.
-                    if panel.active.is_some_and(|id| panel.registry.snapshot(id).is_none()) {
+                    if panel
+                        .active
+                        .is_some_and(|id| panel.registry.snapshot(id).is_none())
+                    {
                         panel.active = panel.registry.last_started();
                     }
                     if panel.follow {
@@ -113,8 +116,8 @@ impl RunConsolePanel {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search output…"));
         let mut subs = Vec::new();
         // Search input: live query on Change; Enter / Shift+Enter walk the matches.
-        subs.push(cx.subscribe(&search, |this, state, event: &InputEvent, cx| {
-            match event {
+        subs.push(
+            cx.subscribe(&search, |this, state, event: &InputEvent, cx| match event {
                 InputEvent::Change => {
                     this.query = state.read(cx).value().to_string();
                     this.current_match = 0;
@@ -122,8 +125,8 @@ impl RunConsolePanel {
                 }
                 InputEvent::PressEnter { shift, .. } => this.step_match(!shift, cx),
                 _ => {}
-            }
-        }));
+            }),
+        );
 
         Self {
             registry,
@@ -182,7 +185,8 @@ impl RunConsolePanel {
         };
         let line = matches[self.current_match].saturating_sub(2);
         self.follow = false;
-        self.scroll.set_offset(point(px(0.), -px(line as f32 * LINE_H)));
+        self.scroll
+            .set_offset(point(px(0.), -px(line as f32 * LINE_H)));
         cx.notify();
     }
 
@@ -237,7 +241,9 @@ impl Render for RunConsolePanel {
             .or_else(|| tabs.last().map(|t| t.id));
         let active = active_id.and_then(|id| self.registry.snapshot(id));
         let matches = active.as_ref().map(|s| self.matches(s)).unwrap_or_default();
-        let current = matches.get(self.current_match.min(matches.len().saturating_sub(1))).copied();
+        let current = matches
+            .get(self.current_match.min(matches.len().saturating_sub(1)))
+            .copied();
 
         div()
             .id("run-console")
@@ -265,7 +271,13 @@ impl Render for RunConsolePanel {
                     .flex()
                     .flex_row()
                     .child(control_strip(active.as_ref(), cx))
-                    .child(log_body(active.as_ref(), &self.scroll, &matches, current, cx)),
+                    .child(log_body(
+                        active.as_ref(),
+                        &self.scroll,
+                        &matches,
+                        current,
+                        cx,
+                    )),
             )
     }
 }
@@ -331,7 +343,9 @@ fn run_onglet(
         .max_w(px(180.))
         .overflow_hidden();
     onglet = if is_active {
-        onglet.bg(theme::surface_raised()).text_color(theme::accent())
+        onglet
+            .bg(theme::surface_raised())
+            .text_color(theme::accent())
     } else {
         onglet
             .text_color(theme::text_muted())
@@ -406,16 +420,25 @@ fn search_row(
         .child(div().text_color(theme::text_muted()).child("⌕"))
         .child(div().w(px(220.)).child(Input::new(&panel.search).small()))
         .child(div().text_color(theme::text_muted()).child(count))
-        .child(strip_btn("run-search-prev", "‹", "Previous match (Shift+Enter)", cx.listener(
-            |this, _ev, _w, cx| this.step_match(false, cx),
-        )))
-        .child(strip_btn("run-search-next", "›", "Next match (Enter)", cx.listener(
-            |this, _ev, _w, cx| this.step_match(true, cx),
-        )))
+        .child(strip_btn(
+            "run-search-prev",
+            "‹",
+            "Previous match (Shift+Enter)",
+            cx.listener(|this, _ev, _w, cx| this.step_match(false, cx)),
+        ))
+        .child(strip_btn(
+            "run-search-next",
+            "›",
+            "Next match (Enter)",
+            cx.listener(|this, _ev, _w, cx| this.step_match(true, cx)),
+        ))
         .child(div().flex_1())
-        .child(strip_btn("run-search-close", "✕", "Close search (Esc)", cx.listener(
-            |this, _ev, window, cx| this.on_close_search(&CloseSearch, window, cx),
-        )))
+        .child(strip_btn(
+            "run-search-close",
+            "✕",
+            "Close search (Esc)",
+            cx.listener(|this, _ev, window, cx| this.on_close_search(&CloseSearch, window, cx)),
+        ))
 }
 
 /// The left vertical control strip (JetBrains run-console style): ↻ Restart,
@@ -441,43 +464,61 @@ fn control_strip(
     let id = active.id;
     let running = active.status.is_running();
 
-    strip = strip.child(strip_btn("run-restart", "↻", "Restart", cx.listener(
-        |this, _ev, _w, cx| this.restart(cx),
-    )));
+    strip = strip.child(strip_btn(
+        "run-restart",
+        "↻",
+        "Restart",
+        cx.listener(|this, _ev, _w, cx| this.restart(cx)),
+    ));
     if running {
-        strip = strip.child(strip_btn("run-stop", "⏹", "Stop", cx.listener(
-            move |this, _ev, _w, cx| {
+        strip = strip.child(strip_btn(
+            "run-stop",
+            "⏹",
+            "Stop",
+            cx.listener(move |this, _ev, _w, cx| {
                 this.registry.stop(id);
                 cx.notify();
-            },
-        )));
+            }),
+        ));
     }
     strip = strip
-        .child(strip_btn("run-clear", "⌫", "Clear output", cx.listener(
-            move |this, _ev, _w, cx| {
+        .child(strip_btn(
+            "run-clear",
+            "⌫",
+            "Clear output",
+            cx.listener(move |this, _ev, _w, cx| {
                 this.registry.clear_logs(id);
                 cx.notify();
-            },
-        )))
+            }),
+        ))
         .child(strip_divider())
-        .child(strip_btn("run-scroll-top", "⤒", "Scroll to top", cx.listener(
-            |this, _ev, _w, cx| {
+        .child(strip_btn(
+            "run-scroll-top",
+            "⤒",
+            "Scroll to top",
+            cx.listener(|this, _ev, _w, cx| {
                 this.follow = false;
                 this.scroll.set_offset(gpui::Point::default());
                 cx.notify();
-            },
-        )))
-        .child(strip_btn("run-scroll-end", "⤓", "Scroll to end (follow)", cx.listener(
-            |this, _ev, _w, cx| {
+            }),
+        ))
+        .child(strip_btn(
+            "run-scroll-end",
+            "⤓",
+            "Scroll to end (follow)",
+            cx.listener(|this, _ev, _w, cx| {
                 this.follow = true;
                 this.scroll.scroll_to_bottom();
                 cx.notify();
-            },
-        )))
+            }),
+        ))
         .child(strip_divider())
-        .child(strip_btn("run-search", "⌕", "Search (Cmd+F)", cx.listener(
-            |this, _ev, window, cx| this.on_toggle_search(&ToggleSearch, window, cx),
-        )));
+        .child(strip_btn(
+            "run-search",
+            "⌕",
+            "Search (Cmd+F)",
+            cx.listener(|this, _ev, window, cx| this.on_toggle_search(&ToggleSearch, window, cx)),
+        ));
     strip
 }
 
@@ -519,17 +560,20 @@ fn log_body(
                 .items_center()
                 .gap_1()
                 .text_color(theme::text_muted())
-                .child(div().text_color(theme::tint(theme::accent(), 0.6)).child("▶"))
+                .child(
+                    div()
+                        .text_color(theme::tint(theme::accent(), 0.6))
+                        .child("▶"),
+                )
                 .child("Launch a target from the toolbar — each run gets its own tab here"),
         );
     };
     if active.logs.is_empty() {
-        body = body.child(
-            div()
-                .pt_2()
-                .text_color(theme::text_muted())
-                .child(format!("`{}` — {} (no output yet)", active.command, active.status.label())),
-        );
+        body = body.child(div().pt_2().text_color(theme::text_muted()).child(format!(
+            "`{}` — {} (no output yet)",
+            active.command,
+            active.status.label()
+        )));
     } else {
         body = body.children(active.logs.iter().enumerate().map(|(i, line)| {
             let mut row = div()

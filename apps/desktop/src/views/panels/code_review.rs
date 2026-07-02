@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseDownEvent, WeakEntity,
-    Window,
+    div, px, App, Context, Entity, EventEmitter, FocusHandle, Focusable, MouseDownEvent,
+    WeakEntity, Window,
 };
 use gpui_component::dock::{Panel, PanelEvent, PanelInfo, PanelState, TabPanel};
 use gpui_component::input::{Input, InputState};
@@ -38,7 +38,9 @@ use moonlight_domain::review::{Feedback, FeedbackOrigin, ReviewHunk};
 use moonlight_engine::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::git::diff::{changed_files, file_diff, parse_hunks, restage_file, split_file_diff, ChangedFile};
+use crate::git::diff::{
+    changed_files, file_diff, parse_hunks, restage_file, split_file_diff, ChangedFile,
+};
 use crate::git::status::GitFileStatus;
 use crate::views::theme;
 
@@ -181,7 +183,13 @@ impl CodeReviewPanel {
             .map(|(_, h)| h.diff.clone())
             .collect();
         let untracked = file.status == GitFileStatus::Untracked;
-        match restage_file(&root, &file.display(), &self.diff_header, &accepted, untracked) {
+        match restage_file(
+            &root,
+            &file.display(),
+            &self.diff_header,
+            &accepted,
+            untracked,
+        ) {
             Ok(()) => self.error = None,
             Err(e) => self.error = Some(format!("staging failed: {e}")),
         }
@@ -307,7 +315,10 @@ fn run_full_review_blocking(root: &PathBuf) -> String {
             let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
-                text.push_str(&format!("\n[full-review exited with {}]\n{err}", out.status));
+                text.push_str(&format!(
+                    "\n[full-review exited with {}]\n{err}",
+                    out.status
+                ));
             }
             if text.trim().is_empty() {
                 "(full-review produced no output)".to_string()
@@ -802,6 +813,10 @@ impl Render for CodeReviewPanel {
             this.tab_menu = None;
             cx.notify();
         });
-        root.children(super::tab_menu_overlay(self.tab_menu.as_ref(), dismiss, window))
+        root.children(super::tab_menu_overlay(
+            self.tab_menu.as_ref(),
+            dismiss,
+            window,
+        ))
     }
 }

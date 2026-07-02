@@ -137,6 +137,9 @@ pub trait ManagedSessionStore: Send + Sync {
     /// Append one audit entry (append-only; never updates an existing row).
     fn append_audit(&self, entry: &AuditEntry) -> Result<(), StoreError>;
     /// The most recent `limit` audit entries for `session`, newest first.
-    fn recent_audit(&self, session: &SessionId, limit: usize)
-        -> Result<Vec<AuditEntry>, StoreError>;
+    fn recent_audit(
+        &self,
+        session: &SessionId,
+        limit: usize,
+    ) -> Result<Vec<AuditEntry>, StoreError>;
 }
