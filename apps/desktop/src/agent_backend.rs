@@ -208,10 +208,7 @@ mod tests {
             permission_mode: None,
             mcp_url: None,
         });
-        assert_eq!(
-            cmd,
-            "agy --conversation abc123"
-        );
+        assert_eq!(cmd, "agy --conversation abc123");
     }
 
     #[test]

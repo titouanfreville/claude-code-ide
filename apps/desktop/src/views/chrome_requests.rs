@@ -10,10 +10,8 @@
 
 use gpui::EventEmitter;
 
-/// A chrome-level ask raised from inside a tool window.
-// The shared `Hide` prefix is the point: today's requests are all hides (the
-// uniform header ✕); reveal/zoom variants may join without renaming these.
-#[allow(clippy::enum_variant_names)]
+/// A chrome-level ask raised from inside a tool window — mostly the uniform header ✕
+/// hides, plus the DB tool's request to open the (window-level) Add-Data-Source modal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChromeRequest {
     /// Hide the left dock (Project files + Structure).
@@ -24,6 +22,9 @@ pub enum ChromeRequest {
     HideBottomDock,
     /// Hide the right dock (DB observer).
     HideRightDock,
+    /// Open the Add-Data-Source modal (raised by the DB tool's `+` button; the modal is
+    /// hosted by the Workspace so it centers over the whole window, not the narrow dock).
+    OpenAddDataSource,
 }
 
 /// Event hub for chrome requests. A unit entity whose only job is to relay

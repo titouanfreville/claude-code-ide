@@ -1186,6 +1186,8 @@ mod tests {
         let untitled = ManagedSession {
             id: SessionId::new("untitled"),
             agent: moonlight_domain::AgentKind::ClaudeCode,
+            conversation_id: None,
+            trust_tier: moonlight_domain::trust::TrustTier::Observed,
             root: Some("/repo".to_string()),
             title: None,
             mode: Mode::Auto,
@@ -1233,6 +1235,8 @@ mod tests {
         let rec = |id: &str| ManagedSession {
             id: SessionId::new(id),
             agent: moonlight_domain::AgentKind::ClaudeCode,
+            conversation_id: None,
+            trust_tier: moonlight_domain::trust::TrustTier::Observed,
             root: Some("/repo".to_string()),
             title: Some("Seeded title".to_string()),
             mode: Mode::Auto,

@@ -229,7 +229,13 @@ struct ImageJson {
 fn parse_image(line: &str) -> Option<Image> {
     let j: ImageJson = serde_json::from_str(line).ok()?;
     Some(Image {
-        id: j.id.strip_prefix("sha256:").unwrap_or(&j.id).chars().take(12).collect(),
+        id: j
+            .id
+            .strip_prefix("sha256:")
+            .unwrap_or(&j.id)
+            .chars()
+            .take(12)
+            .collect(),
         repo: if j.repository.is_empty() {
             "<none>".to_string()
         } else {
@@ -475,10 +481,7 @@ struct InspectMount {
 /// can't be parsed. The container's `image` lives on the [`Container`] already; this
 /// adds the deeper facts (ports/env/mounts/networks/policy/command).
 pub fn inspect_snapshot(id: &str) -> Option<Inspect> {
-    let output = Command::new("docker")
-        .args(["inspect", id])
-        .output()
-        .ok()?;
+    let output = Command::new("docker").args(["inspect", id]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -638,7 +641,10 @@ mod tests {
             i.ports,
             vec!["5432/tcp → 0.0.0.0:5432", "9999/tcp (not published)"]
         );
-        assert_eq!(i.mounts, vec!["/var/lib/pg → /var/lib/postgresql/data (rw)"]);
+        assert_eq!(
+            i.mounts,
+            vec!["/var/lib/pg → /var/lib/postgresql/data (rw)"]
+        );
         assert_eq!(i.networks, vec!["moonlight_default"]);
     }
 
@@ -657,7 +663,10 @@ mod tests {
 
     #[test]
     fn parse_network_and_volume() {
-        let n = parse_network(r#"{"ID":"9f0e1d2c3b4a5678","Name":"bridge","Driver":"bridge","Scope":"local"}"#).unwrap();
+        let n = parse_network(
+            r#"{"ID":"9f0e1d2c3b4a5678","Name":"bridge","Driver":"bridge","Scope":"local"}"#,
+        )
+        .unwrap();
         assert_eq!(n.id, "9f0e1d2c3b4a");
         assert_eq!(n.name, "bridge");
         assert_eq!(n.driver, "bridge");

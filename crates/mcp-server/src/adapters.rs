@@ -204,6 +204,8 @@ mod tests {
             mode: Mode::Auto,
             phase,
             agent: moonlight_domain::AgentKind::ClaudeCode,
+            conversation_id: None,
+            trust_tier: TrustTier::Observed,
             adopted: true,
             paused: false,
             phase_pinned: false,

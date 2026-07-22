@@ -81,6 +81,8 @@ pub struct ObsView {
     /// Context-window usage %, when known (raw tokens ÷ the model's window).
     pub ctx_pct: Option<u8>,
     pub persona: String,
+    /// Cumulative tokens consumed this session (AGY pay-as-you-go readout); `0` hides it.
+    pub tokens: u64,
 }
 
 /// The account usage quota — shown account-wide (independent of the selected session).
@@ -339,12 +341,31 @@ fn agy_zone(obs_view: Option<ObsView>) -> gpui::Div {
             if o.time != "0s" && !o.time.is_empty() && o.time != "—" {
                 r = r.child(obs("◷", o.time));
             }
+            // Context usage as a % gauge — same notation as Claude, against Gemini's 1M
+            // window (see `obs::GEMINI_CONTEXT_WINDOW`). Beside it, the cumulative token
+            // consumption (`Σ`, the pay-as-you-go readout); both AGY-only, from its
+            // language-server RPC, hidden until a live/cached figure exists.
+            r = r.child(gauge("ctx", o.ctx_pct));
+            if o.tokens > 0 {
+                r = r.child(obs("Σ", fmt_count(o.tokens)));
+            }
             r
         }
         None => row.child(obs("⌬", "—")),
     };
 
     row
+}
+
+/// Compact a token count: `936 → "936"`, `124_446 → "124k"`, `1_180_465 → "1.18M"`.
+fn fmt_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2}M", n as f64 / 1_000_000.)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
 }
 
 /// A micro-gauge instrument: tiny uppercase label, a 3px track whose fill glows in

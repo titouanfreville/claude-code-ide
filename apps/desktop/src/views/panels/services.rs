@@ -36,8 +36,8 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, svg, AnyElement, App, ClickEvent, Context, Div, FontWeight, Hsla, Pixels, SharedString,
-    Stateful, Window,
+    div, px, svg, AnyElement, App, ClickEvent, Context, Div, FontWeight, Hsla, Pixels,
+    SharedString, Stateful, Window,
 };
 
 use moonlight_domain::audit::{AuditAction, AuditEntry};
@@ -241,8 +241,7 @@ impl ServicesPanel {
         cx.spawn(async move |this, cx| {
             let mut cache: mcp_activity::ScanCache = std::collections::HashMap::new();
             loop {
-                let gathered =
-                    this.update(cx, |_p: &mut Self, cx| gather_mcp_inputs(cx));
+                let gathered = this.update(cx, |_p: &mut Self, cx| gather_mcp_inputs(cx));
                 let Ok(gathered) = gathered else {
                     break; // panel dropped
                 };
@@ -613,7 +612,12 @@ fn clip(s: &str, max: usize) -> String {
 /// Group containers by Compose stack for the tree: `(stack, members)` pairs sorted by
 /// stack name, then the standalone (no-project) containers. Ordering is deterministic
 /// so the tree never jitters between polls.
-fn stack_groups(containers: &[docker::Container]) -> (Vec<(String, Vec<&docker::Container>)>, Vec<&docker::Container>) {
+fn stack_groups(
+    containers: &[docker::Container],
+) -> (
+    Vec<(String, Vec<&docker::Container>)>,
+    Vec<&docker::Container>,
+) {
     use std::collections::BTreeMap;
     let mut stacks: BTreeMap<String, Vec<&docker::Container>> = BTreeMap::new();
     let mut standalone: Vec<&docker::Container> = Vec::new();
@@ -820,10 +824,7 @@ impl ServicesPanel {
         )
         .child(group_label("Control server"))
         .child(div().flex_1())
-        .child(chip(
-            if ok { "listening" } else { "down" }.into(),
-            status,
-        ))
+        .child(chip(if ok { "listening" } else { "down" }.into(), status))
     }
 
     /// The MCP servers category: a collapsible header (server count + total calls)
@@ -868,7 +869,11 @@ impl ServicesPanel {
                     theme::status_color(SessionStatus::Idle)
                 };
                 let chip_text = if active {
-                    format!("{} call{}", s.total_calls, if s.total_calls == 1 { "" } else { "s" })
+                    format!(
+                        "{} call{}",
+                        s.total_calls,
+                        if s.total_calls == 1 { "" } else { "s" }
+                    )
                 } else {
                     "idle".to_string()
                 };
@@ -1204,10 +1209,9 @@ impl ServicesPanel {
             Selection::DockerVolume(name) => {
                 match self.docker.volumes.iter().find(|v| v.name == name) {
                     Some(v) => scroll_detail("svc-d-vol", self.detail_volume(v)),
-                    None => scroll_detail(
-                        "svc-d-vol",
-                        detail_gone("This volume is no longer listed."),
-                    ),
+                    None => {
+                        scroll_detail("svc-d-vol", detail_gone("This volume is no longer listed."))
+                    }
                 }
             }
             Selection::Http => scroll_detail("svc-d-http", self.detail_http(snap, now, cx)),
@@ -1245,7 +1249,12 @@ impl ServicesPanel {
                 .child(field_mono("socket", self.socket.display().to_string()))
                 .child(field_text(
                     "reachable",
-                    if ok { "yes — a connect succeeds" } else { "no" }.into(),
+                    if ok {
+                        "yes — a connect succeeds"
+                    } else {
+                        "no"
+                    }
+                    .into(),
                     status,
                 ))
                 .child(detail_note(
@@ -1277,7 +1286,11 @@ impl ServicesPanel {
             (None, _) => "MCP server (seen in transcripts)".to_string(),
         };
         let pill = if active {
-            format!("{} call{}", s.total_calls, if s.total_calls == 1 { "" } else { "s" })
+            format!(
+                "{} call{}",
+                s.total_calls,
+                if s.total_calls == 1 { "" } else { "s" }
+            )
         } else if s.accessible {
             "accessible".to_string()
         } else {
@@ -1334,7 +1347,10 @@ impl ServicesPanel {
                 snap.endpoints.iter().flat_map(|e| e.logs.clone()).collect();
             lines.sort_by(|a, b| b.at_millis.cmp(&a.at_millis));
             lines.truncate(12);
-            let mut block = div().flex().flex_col().child(detail_sub("Moonlight verb log"));
+            let mut block = div()
+                .flex()
+                .flex_col()
+                .child(detail_sub("Moonlight verb log"));
             if lines.is_empty() {
                 block = block.child(hint_row(0, "no verb calls yet"));
             } else {
@@ -1365,9 +1381,11 @@ impl ServicesPanel {
         // Tool breakdown.
         let tools = (!s.tools.is_empty()).then(|| {
             let mut block = div().flex().flex_col().child(detail_sub("Tools"));
-            block = block.children(s.tools.iter().map(|(tool, n)| {
-                mcp_meta_row(tool.clone(), format!("{n}×"), String::new())
-            }));
+            block = block.children(
+                s.tools
+                    .iter()
+                    .map(|(tool, n)| mcp_meta_row(tool.clone(), format!("{n}×"), String::new())),
+            );
             block
         });
 
@@ -1528,11 +1546,7 @@ impl ServicesPanel {
         match text {
             None => box_ = box_.child(loading_line()),
             Some(t) if t.trim().is_empty() => {
-                box_ = box_.child(
-                    div()
-                        .text_color(theme::text_muted())
-                        .child("· no output ·"),
-                )
+                box_ = box_.child(div().text_color(theme::text_muted()).child("· no output ·"))
             }
             Some(t) => {
                 box_ = box_.children(
@@ -1554,13 +1568,21 @@ impl ServicesPanel {
         match &self.detail_stats {
             Some((sid, Some(s))) if sid.as_str() == id => {
                 body = body
-                    .child(field_text("cpu", s.cpu_perc.clone(), theme::text_secondary()))
+                    .child(field_text(
+                        "cpu",
+                        s.cpu_perc.clone(),
+                        theme::text_secondary(),
+                    ))
                     .child(field_text(
                         "memory",
                         format!("{}  ({})", s.mem_usage, s.mem_perc),
                         theme::text_secondary(),
                     ))
-                    .child(field_text("net i/o", s.net_io.clone(), theme::text_secondary()))
+                    .child(field_text(
+                        "net i/o",
+                        s.net_io.clone(),
+                        theme::text_secondary(),
+                    ))
                     .child(field_text(
                         "block i/o",
                         s.block_io.clone(),
@@ -1641,13 +1663,21 @@ impl ServicesPanel {
                 .flex_col()
                 .child(field_mono("id", img.id.clone()))
                 .child(field_text("tag", img.tag.clone(), theme::text_secondary()))
-                .child(field_text("size", img.size.clone(), theme::text_secondary()))
+                .child(field_text(
+                    "size",
+                    img.size.clone(),
+                    theme::text_secondary(),
+                ))
                 .child(field_text(
                     "created",
                     img.created.clone(),
                     theme::text_secondary(),
                 ))
-                .child(list_block("Used by containers", &users, "not used by any container")),
+                .child(list_block(
+                    "Used by containers",
+                    &users,
+                    "not used by any container",
+                )),
         )
     }
 
@@ -1674,8 +1704,16 @@ impl ServicesPanel {
                 .flex()
                 .flex_col()
                 .child(field_mono("id", n.id.clone()))
-                .child(field_text("driver", n.driver.clone(), theme::text_secondary()))
-                .child(field_text("scope", n.scope.clone(), theme::text_secondary()))
+                .child(field_text(
+                    "driver",
+                    n.driver.clone(),
+                    theme::text_secondary(),
+                ))
+                .child(field_text(
+                    "scope",
+                    n.scope.clone(),
+                    theme::text_secondary(),
+                ))
                 .when(!attached.is_empty(), |d| {
                     d.child(list_block("Likely attached", &attached, "—"))
                 }),
@@ -1690,8 +1728,9 @@ impl ServicesPanel {
         };
         let mount_el = match mount {
             Some(m) => field_mono("mountpoint", m).into_any_element(),
-            None => field_text("mountpoint", "loading…".into(), theme::text_muted())
-                .into_any_element(),
+            None => {
+                field_text("mountpoint", "loading…".into(), theme::text_muted()).into_any_element()
+            }
         };
         detail_body(
             detail_head(
@@ -1705,7 +1744,11 @@ impl ServicesPanel {
             div()
                 .flex()
                 .flex_col()
-                .child(field_text("driver", v.driver.clone(), theme::text_secondary()))
+                .child(field_text(
+                    "driver",
+                    v.driver.clone(),
+                    theme::text_secondary(),
+                ))
                 .child(mount_el),
         )
     }
@@ -1740,7 +1783,10 @@ impl ServicesPanel {
 
         let mut calls = div().flex().flex_col().child(detail_sub("Recent calls"));
         if snap.http_calls.is_empty() {
-            calls = calls.child(hint_row(0, "no requests yet — http_request calls land here"));
+            calls = calls.child(hint_row(
+                0,
+                "no requests yet — http_request calls land here",
+            ));
         } else {
             calls = calls.children(snap.http_calls.iter().map(|c| http_row(c, now)));
         }
@@ -1928,11 +1974,12 @@ fn detail_head(
 ) -> impl IntoElement {
     // The lamp: the type icon at title size, tinted by health, with a soft glow when
     // the resource is live. Wrapped so the glow applies to glyphs and SVG marks alike.
-    let mut lamp = div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .child(ico_el(icon, dot, theme::text_md()));
+    let mut lamp =
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .child(ico_el(icon, dot, theme::text_md()));
     if live {
         lamp = lamp.shadow(theme::glow(dot));
     }

@@ -112,6 +112,7 @@ impl SessionSupervisor {
             title: s.title.clone(),
             phase: s.phase,
             mode: s.mode,
+            trust_tier: s.trust_tier,
             adopted: s.adopted,
             paused: s.paused,
             phase_pinned: s.phase_pinned,
@@ -281,9 +282,10 @@ impl SessionSupervisor {
             .publish(EngineEvent::SessionUpserted { session: upserted });
     }
 
-    /// Set a session's trust tier (operator override) and republish the row so the
-    /// control gate's PDP sees the new tier. No-op if unchanged or untracked. (Trust
-    /// is not yet persisted — it lives for the session; revisit with the store.)
+    /// Set a session's trust tier (operator override), persist it, and republish the
+    /// row so the control gate's PDP sees the new tier. No-op if unchanged or untracked.
+    /// Persisting (via [`Self::persist`], UPDATE-only) is what makes a "trust this
+    /// session" decision survive restart/reset instead of reseeding to `Observed`.
     fn set_trust(&mut self, session: SessionId, tier: TrustTier) {
         let Some(s) = self.fleet.get_mut(&session) else {
             tracing::debug!(session = %session, "SetTrust for untracked session (ignored)");
@@ -296,6 +298,7 @@ impl SessionSupervisor {
         s.last_activity = now();
         let upserted = s.clone();
         tracing::info!(session = %session, ?tier, "trust tier set");
+        self.persist(&upserted);
         self.bus
             .publish(EngineEvent::SessionUpserted { session: upserted });
     }
@@ -571,6 +574,11 @@ impl SessionSupervisor {
                             s.adopted = rec.adopted;
                             s.phase = rec.phase;
                             s.mode = rec.mode;
+                            // Restore the persisted trust tier too: it was seeded at launch
+                            // from the project default and may carry a per-session operator
+                            // override, so a discovered managed session is gated at its own
+                            // tier immediately (not the default-deny `Observed`).
+                            s.trust_tier = rec.trust_tier;
                         }
                     }
                     self.fleet.insert(session.clone(), s.clone());
@@ -765,6 +773,13 @@ mod tests {
             self.updates.lock().unwrap().push(u.clone());
             Ok(true)
         }
+        fn set_conversation_id(
+            &self,
+            _id: &SessionId,
+            _conversation_id: &str,
+        ) -> Result<bool, StoreError> {
+            Ok(true)
+        }
         fn managed(&self, _id: &SessionId) -> Result<Option<ManagedSession>, StoreError> {
             Ok(self.managed_rec.clone())
         }
@@ -874,6 +889,10 @@ mod tests {
             managed_rec: Some(ManagedSession {
                 id: SessionId::new("m1"),
                 agent: moonlight_domain::AgentKind::ClaudeCode,
+                conversation_id: None,
+                // A per-session trust override the operator set earlier — discovery must
+                // restore it, not reseed the default-deny `Observed`.
+                trust_tier: TrustTier::Trusted,
                 root: Some("/repo".into()),
                 title: None,
                 mode: Mode::Auto,
@@ -901,6 +920,11 @@ mod tests {
         );
         assert_eq!(s.phase, Phase::Discovery, "phase seeded from the record");
         assert_eq!(s.mode, Mode::Auto, "mode seeded from the record");
+        assert_eq!(
+            s.trust_tier,
+            TrustTier::Trusted,
+            "per-session trust restored from the record on discovery"
+        );
         assert!(
             matches!(&drain(&mut rx)[..], [EngineEvent::SessionUpserted { session }] if session.adopted)
         );
@@ -932,6 +956,8 @@ mod tests {
                 ManagedSession {
                     id: SessionId::new("a"),
                     agent: moonlight_domain::AgentKind::ClaudeCode,
+                    conversation_id: None,
+                    trust_tier: TrustTier::Observed,
                     root: Some("/repo/a".into()),
                     title: None,
                     mode: Mode::Auto,
@@ -946,6 +972,8 @@ mod tests {
                 ManagedSession {
                     id: SessionId::new("b"),
                     agent: moonlight_domain::AgentKind::ClaudeCode,
+                    conversation_id: None,
+                    trust_tier: TrustTier::Observed,
                     root: Some("/repo/b".into()),
                     title: None,
                     mode: Mode::Plan,
@@ -993,6 +1021,8 @@ mod tests {
             managed_all: vec![ManagedSession {
                 id: SessionId::new("s"),
                 agent: moonlight_domain::AgentKind::ClaudeCode,
+                conversation_id: None,
+                trust_tier: TrustTier::Observed,
                 root: Some("/repo".into()),
                 title: None,
                 mode: Mode::Plan,

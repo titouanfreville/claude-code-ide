@@ -702,7 +702,10 @@ mod tests {
         };
         let out = svc.run(&req).await.unwrap();
         assert!(out.ok, "{out:?}");
-        assert!(exec.was_called(), "a non-sensitive phase change runs inline");
+        assert!(
+            exec.was_called(),
+            "a non-sensitive phase change runs inline"
+        );
         assert!(audit
             .actions()
             .iter()

@@ -49,6 +49,10 @@ pub struct SessionObs {
     pub ctx_used_pct: Option<u8>,
     /// CC's own flag that the context exceeds 200k tokens (`exceeds_200k_tokens`).
     pub exceeds_200k: bool,
+    /// Cumulative tokens consumed this session (input + output). AGY-only, from its
+    /// language-server RPC (see [`crate::agy_ls`]); `0` for Claude (whose statusline
+    /// exposes cost, not a running token total). Used for the AGY pay-as-you-go readout.
+    pub total_tokens: u64,
     /// When this snapshot was written (epoch ms), for staleness checks.
     pub updated_ms: i64,
 }
@@ -200,6 +204,7 @@ pub fn ingest(json: &str, now_ms: i64) -> Option<(String, SessionObs)> {
         ctx_limit,
         ctx_used_pct: input.context_window.used_pct(),
         exceeds_200k: input.exceeds_200k_tokens,
+        total_tokens: 0, // Claude's statusline exposes cost, not a running token total.
         updated_ms: now_ms,
     };
     Some((input.session_id, obs))
@@ -276,6 +281,13 @@ fn context_limit(model_id: &str, model_name: &str, exceeds_200k: bool) -> u64 {
         200_000
     }
 }
+
+/// Context window for Antigravity's Gemini models — **1,048,576 tokens (1M)**, the
+/// window shared by the current Gemini Pro/Flash line (2.5 Pro, 3 Pro). AGY's usage
+/// RPC reports occupancy (`estimatedTokensUsed`) but not the window size, so we supply
+/// this constant to render the ctx gauge as a percentage (same notation as Claude)
+/// rather than a bare token count.
+pub(crate) const GEMINI_CONTEXT_WINDOW: u64 = 1_048_576;
 
 /// Account usage quota — the 5h rolling, weekly, and Sonnet-weekly utilization %s
 /// (the headline OMC-HUD numbers). `None` for any source we don't have.
@@ -495,17 +507,24 @@ pub fn load_all() -> Vec<(String, SessionObs)> {
     out
 }
 
-/// Resolve each managed **Antigravity** session's model as `(managed_id, SessionObs)`,
-/// from AGY's OWN files (no third-party cache). AGY has no `--session-id`, so its transcript
-/// is keyed by AGY's own `conversationId`, not our managed id — we bridge by **root**:
-/// `history.jsonl` maps `conversationId → workspace`, so for each managed session `(id, root)`
-/// we take the most-recent AGY conversation whose workspace matches `root`, read its model,
-/// and key the result by the **managed id** (what the status bar looks up).
+/// Resolve each managed **Antigravity** session's observability as `(managed_id,
+/// SessionObs)`, from AGY's OWN data (no third-party cache): model + duration from the
+/// transcript, and — layered on top — live tokens / context / authoritative model from
+/// the `agy` language-server RPC (see [`crate::agy_ls`]).
 ///
-/// This is a live best-effort resolution (root can be reused across conversations, so we
-/// pick the newest) — a stopgap until the launch-time `conversationId` is discovered and
-/// persisted. `managed` is `(managed_id, root)` for AGY-backed sessions.
-pub fn agy_models(managed: &[(String, String)]) -> Vec<(String, SessionObs)> {
+/// Each entry is `(managed_id, root, conversation_id)`. When the launch-time
+/// `conversation_id` has been **discovered + persisted** (see
+/// [`discover_agy_conversation`]) we key on it **exactly**; otherwise we fall back to a
+/// root bridge — the newest AGY conversation whose workspace matches `root` (a display
+/// stopgap for the brief window before correlation lands, since a root is reused across
+/// conversations). The result is keyed by the **managed id** (what the status bar looks up).
+///
+/// `fetch_live` gates the (expensive: process scan + HTTP) live usage refresh — the
+/// caller sets it on a slow cadence and the fast ticks read the write-through cache.
+pub fn agy_models(
+    managed: &[(String, String, Option<String>)],
+    fetch_live: bool,
+) -> Vec<(String, SessionObs)> {
     if managed.is_empty() {
         return Vec::new();
     }
@@ -513,37 +532,47 @@ pub fn agy_models(managed: &[(String, String)]) -> Vec<(String, SessionObs)> {
         return Vec::new();
     };
     let base = PathBuf::from(&home).join(".gemini").join("antigravity-cli");
-    // workspace -> most-recent (timestamp, conversationId), from the CLI's own history.
+    // workspace -> most-recent (timestamp, conversationId), from the CLI's own history —
+    // only built (and read) for sessions still lacking a persisted conversation id.
     let mut latest: std::collections::HashMap<String, (i64, String)> =
         std::collections::HashMap::new();
-    if let Ok(text) = std::fs::read_to_string(base.join("history.jsonl")) {
-        for line in text.lines() {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            let (Some(ws), Some(cid)) = (
-                v.get("workspace").and_then(|x| x.as_str()),
-                v.get("conversationId").and_then(|x| x.as_str()),
-            ) else {
-                continue;
-            };
-            let ts = v.get("timestamp").and_then(|x| x.as_i64()).unwrap_or(0);
-            let e = latest.entry(ws.to_string()).or_insert((i64::MIN, String::new()));
-            if ts >= e.0 {
-                *e = (ts, cid.to_string());
+    let need_bridge = managed.iter().any(|(_, _, cid)| cid.is_none());
+    if need_bridge {
+        if let Ok(text) = std::fs::read_to_string(base.join("history.jsonl")) {
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let (Some(ws), Some(cid)) = (
+                    v.get("workspace").and_then(|x| x.as_str()),
+                    v.get("conversationId").and_then(|x| x.as_str()),
+                ) else {
+                    continue;
+                };
+                let ts = v.get("timestamp").and_then(|x| x.as_i64()).unwrap_or(0);
+                let e = latest
+                    .entry(ws.to_string())
+                    .or_insert((i64::MIN, String::new()));
+                if ts >= e.0 {
+                    *e = (ts, cid.to_string());
+                }
             }
         }
     }
     let mut out = Vec::new();
-    for (mid, root) in managed {
-        // Exact workspace match, else the newest conversation whose workspace is related
-        // to the root (sub/parent path).
-        let cid = latest.get(root).map(|(_, c)| c.clone()).or_else(|| {
-            latest
-                .iter()
-                .filter(|(ws, _)| ws.starts_with(root.as_str()) || root.starts_with(ws.as_str()))
-                .max_by_key(|(_, (ts, _))| *ts)
-                .map(|(_, (_, c))| c.clone())
+    for (mid, root, persisted) in managed {
+        // Prefer the persisted, launch-correlated conversation id (exact); else bridge by
+        // root (exact workspace match, else the newest related conversation).
+        let cid = persisted.clone().or_else(|| {
+            latest.get(root).map(|(_, c)| c.clone()).or_else(|| {
+                latest
+                    .iter()
+                    .filter(|(ws, _)| {
+                        ws.starts_with(root.as_str()) || root.starts_with(ws.as_str())
+                    })
+                    .max_by_key(|(_, (ts, _))| *ts)
+                    .map(|(_, (_, c))| c.clone())
+            })
         });
         let Some(cid) = cid else {
             continue;
@@ -554,19 +583,91 @@ pub fn agy_models(managed: &[(String, String)]) -> Vec<(String, SessionObs)> {
             .join(".system_generated")
             .join("logs")
             .join("transcript.jsonl");
-        if let Some(model) = read_head_model(&transcript) {
-            let session_ms = read_agy_duration(&transcript).unwrap_or(0);
-            out.push((
-                mid.clone(),
-                SessionObs {
-                    model,
-                    session_ms,
-                    ..Default::default()
-                },
-            ));
+        // Live usage from the `agy` RPC when refreshing this tick, else the last cached
+        // value (both AGY's own data — see `agy_ls`). Carries the authoritative model
+        // label + cumulative tokens + context occupancy.
+        let usage = if fetch_live {
+            crate::agy_ls::usage_for_conversation_cached(&cid)
+        } else {
+            crate::agy_ls::cached_usage(&cid)
+        };
+        // Model: the RPC's authoritative label wins; else parse it from the transcript.
+        let model = usage
+            .as_ref()
+            .map(|u| u.model.clone())
+            .filter(|m| !m.is_empty())
+            .or_else(|| read_head_model(&transcript));
+        // Emit a row if we learned anything about this session.
+        if model.is_none() && usage.is_none() {
+            continue;
         }
+        let session_ms = read_agy_duration(&transcript).unwrap_or(0);
+        out.push((
+            mid.clone(),
+            SessionObs {
+                model: model.unwrap_or_default(),
+                session_ms,
+                ctx_tokens: usage.as_ref().map(|u| u.context_tokens).unwrap_or(0),
+                // Supply Gemini's 1M window so `ctx_pct()` renders the context gauge as a
+                // percentage (same as Claude); AGY's RPC reports occupancy but not the size.
+                ctx_limit: GEMINI_CONTEXT_WINDOW,
+                total_tokens: usage.as_ref().map(|u| u.total_tokens()).unwrap_or(0),
+                ..Default::default()
+            },
+        ));
     }
     out
+}
+
+/// Discover the AGY `conversationId` a freshly-launched managed session created, by
+/// correlating its `root` + launch time against AGY's own `history.jsonl`. AGY has no
+/// `--session-id`, so it mints its own id on first interaction; we identify it as the
+/// **earliest conversation created at/after `since_millis`** (the record's creation,
+/// ≈ launch) whose workspace equals `root`. Returns `None` until AGY has logged a
+/// conversation for this launch (the caller retries on the next poll, then persists).
+///
+/// Timestamps in `history.jsonl` are epoch **milliseconds** (directly comparable to a
+/// [`Timestamp`](moonlight_domain::ids::Timestamp)'s `as_millis`). Limitation: two AGY
+/// sessions launched into the *same* root before either interacts are inherently
+/// ambiguous (no per-session id to disambiguate) — the earliest-after-launch match is
+/// the best available heuristic.
+pub fn discover_agy_conversation(root: &str, since_millis: i64) -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let base = PathBuf::from(&home).join(".gemini").join("antigravity-cli");
+    let text = std::fs::read_to_string(base.join("history.jsonl")).ok()?;
+    earliest_conversation_after(&text, root, since_millis)
+}
+
+/// Pure correlation core of [`discover_agy_conversation`] (IO-free, so unit-testable):
+/// from `history.jsonl` text, the id of the conversation whose *earliest* line in
+/// `root` is the smallest timestamp `>= since_millis`.
+fn earliest_conversation_after(history: &str, root: &str, since_millis: i64) -> Option<String> {
+    // Per-conversation earliest timestamp (its creation), restricted to this workspace.
+    let mut first_seen: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for line in history.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let (Some(ws), Some(cid)) = (
+            v.get("workspace").and_then(|x| x.as_str()),
+            v.get("conversationId").and_then(|x| x.as_str()),
+        ) else {
+            continue;
+        };
+        if ws != root {
+            continue;
+        }
+        let ts = v.get("timestamp").and_then(|x| x.as_i64()).unwrap_or(0);
+        let e = first_seen.entry(cid.to_string()).or_insert(i64::MAX);
+        if ts < *e {
+            *e = ts;
+        }
+    }
+    first_seen
+        .into_iter()
+        .filter(|(_, ts)| *ts >= since_millis)
+        .min_by_key(|(_, ts)| *ts)
+        .map(|(cid, _)| cid)
 }
 
 /// Read a bounded head of an AGY transcript and parse its session model. The model is set
@@ -818,6 +919,38 @@ mod tests {
     fn ingest_rejects_empty_and_idless_payloads() {
         assert!(ingest("not json", 0).is_none());
         assert!(ingest(r#"{"model":{"display_name":"x"}}"#, 0).is_none());
+    }
+
+    #[test]
+    fn discover_picks_earliest_conversation_after_launch_in_root() {
+        // AGY logs multiple lines per conversation; a launch correlates to the earliest
+        // conversation *created* at/after its launch time, scoped to the session's root.
+        let history = r#"
+{"workspace":"/repo/a","conversationId":"old","timestamp":100}
+{"workspace":"/repo/a","conversationId":"old","timestamp":300}
+{"workspace":"/repo/a","conversationId":"mine","timestamp":250}
+{"workspace":"/repo/a","conversationId":"mine","timestamp":900}
+{"workspace":"/repo/b","conversationId":"other","timestamp":260}
+{"workspace":"/repo/a","conversationId":"later","timestamp":500}
+"#;
+        // Launch at 200: `old` (created @100) predates it; `mine` (@250) is the earliest
+        // conversation created after launch — even though a `mine` line at 900 is latest.
+        assert_eq!(
+            earliest_conversation_after(history, "/repo/a", 200),
+            Some("mine".to_string())
+        );
+        // A different root doesn't leak in.
+        assert_eq!(
+            earliest_conversation_after(history, "/repo/b", 200),
+            Some("other".to_string())
+        );
+        // Nothing created after a late launch → no correlation yet (retry next poll).
+        assert_eq!(earliest_conversation_after(history, "/repo/a", 1000), None);
+        // Malformed lines are skipped, not fatal.
+        assert_eq!(
+            earliest_conversation_after("garbage\n{}\n", "/repo/a", 0),
+            None
+        );
     }
 
     #[test]

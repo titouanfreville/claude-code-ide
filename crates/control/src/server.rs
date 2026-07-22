@@ -34,6 +34,9 @@ pub type GateView = Arc<RwLock<HashMap<SessionId, GateState>>>;
 /// `~/.moonlight/config.json` entry only takes effect on the next app start.
 pub type RuntimeSafeTools = Arc<RwLock<std::collections::HashSet<String>>>;
 
+/// A type alias for resolving an external conversation ID back to the launch UUID.
+pub type IdResolver = Arc<dyn Fn(&str) -> Option<SessionId> + Send + Sync>;
+
 /// How long the server holds a connection waiting for an operator decision before
 /// denying. Must stay under Claude Code's per-hook timeout (≈60s) so the *server*
 /// resolves the hold (a clean deny) rather than the client giving up and failing
@@ -76,6 +79,8 @@ pub struct ControlServer {
     /// Runtime "always allow" tool patterns (operator decisions), consulted in addition
     /// to the config `safe_tools`. Empty unless wired via [`ControlServer::with_runtime_safe`].
     runtime_safe: RuntimeSafeTools,
+    /// Resolves an external session ID / conversation ID back to the launch UUID.
+    id_resolver: Option<IdResolver>,
 }
 
 impl ControlServer {
@@ -90,6 +95,7 @@ impl ControlServer {
             hold_timeout: Some(DEFAULT_HOLD),
             ai: AiWorkspaceResolver::default(),
             runtime_safe: RuntimeSafeTools::default(),
+            id_resolver: None,
         }
     }
 
@@ -97,6 +103,15 @@ impl ControlServer {
     /// restart (the cockpit appends to the same `Arc`; the server reads it per request).
     pub fn with_runtime_safe(mut self, runtime_safe: RuntimeSafeTools) -> Self {
         self.runtime_safe = runtime_safe;
+        self
+    }
+
+    /// Wire the external conversation ID resolver (e.g. for Antigravity).
+    pub fn with_id_resolver(
+        mut self,
+        id_resolver: IdResolver,
+    ) -> Self {
+        self.id_resolver = Some(id_resolver);
         self
     }
 
@@ -134,6 +149,7 @@ impl ControlServer {
             hold_timeout,
             ai: AiWorkspaceResolver::default(),
             runtime_safe: RuntimeSafeTools::default(),
+            id_resolver: None,
         }
     }
 
@@ -184,7 +200,11 @@ impl ControlServer {
         if !req.event.is_empty() && req.event != "PreToolUse" {
             return HookResponse::Allow;
         }
-        let session = SessionId::new(req.session_id.clone());
+        let session = if let Some(resolver) = &self.id_resolver {
+            resolver(&req.session_id).unwrap_or_else(|| SessionId::new(req.session_id.clone()))
+        } else {
+            SessionId::new(req.session_id.clone())
+        };
 
         // Resolve which part of the tree a file write touches (path + cwd vs the
         // cwd's effective AI-workspace allowlist) so a frozen phase freezes project
@@ -555,6 +575,30 @@ mod tests {
         r.event = "Stop".into();
         let bytes = serde_json::to_vec(&r).unwrap();
         assert_eq!(server.decide(&bytes).await, HookResponse::Allow);
+    }
+
+    #[tokio::test]
+    async fn id_resolver_resolves_external_session_id() {
+        let gates = gates_with(
+            "internal-uuid-123",
+            GateState {
+                adopted: true,
+                phase: Phase::Plan,
+                ..Default::default()
+            },
+        );
+        let resolver = Arc::new(|conversation_id: &str| {
+            if conversation_id == "external-conversation-456" {
+                Some(SessionId::new("internal-uuid-123"))
+            } else {
+                None
+            }
+        });
+        let server =
+            Arc::new(ControlServer::new(gates, Arc::new(TestPdp)).with_id_resolver(resolver));
+        // Querying using the external conversation ID should trigger the plan-phase write protection (denied)
+        let resp = roundtrip(server, &req("external-conversation-456", "Edit")).await;
+        assert!(matches!(resp, HookResponse::Deny { .. }));
     }
 
     #[tokio::test]

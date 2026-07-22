@@ -13,15 +13,13 @@ use std::path::PathBuf;
 
 use gpui::prelude::*;
 use gpui::{
-    div, px, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, PathPromptOptions,
-    SharedString, Window,
+    div, px, App, Context, EventEmitter, FocusHandle, Focusable, Hsla, SharedString, Window,
 };
 use gpui_component::dock::{Panel, PanelEvent};
-use gpui_component::input::{Input, InputState};
-use gpui_component::Sizable;
 
-use super::db_source::{self, DataSource, PgConfig, Schema, TableMeta};
+use super::db_source::{self, DataSource, Schema, TableMeta};
 use crate::views::center_requests::OpenRequest;
+use crate::views::chrome_requests::ChromeRequest;
 use crate::views::theme;
 
 pub struct DbObserverPanel {
@@ -39,9 +37,6 @@ pub struct DbObserverPanel {
     selected: Option<String>,
     /// First render loads the persisted source list.
     needs_init: bool,
-    /// Postgres connect form: visibility + DSN input (lazy — needs a `Window`).
-    connect_open: bool,
-    dsn_input: Option<Entity<InputState>>,
     focus_handle: FocusHandle,
 }
 
@@ -56,8 +51,6 @@ impl DbObserverPanel {
             open: HashSet::new(),
             selected: None,
             needs_init: true,
-            connect_open: false,
-            dsn_input: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -67,14 +60,10 @@ impl DbObserverPanel {
             .map(|d| d.focus.read(cx).root())
     }
 
-    /// Add a data source (persist + select + expand so its schema loads).
+    /// Add a data source (persist to the global store + select + expand so its schema loads).
     pub fn add_source(&mut self, source: DataSource, cx: &mut Context<Self>) {
         let key = source.key();
-        if let Some(root) = self.project_root(cx) {
-            self.sources = db_source::add_source(&root, &source);
-        } else if !self.sources.iter().any(|s| s.key() == key) {
-            self.sources.push(source.clone());
-        }
+        self.sources = db_source::add_source(&sources_dir(), &source);
         self.selected = Some(key.clone());
         self.open.insert(src_node_id(&key));
         self.load_schema_for(source, cx);
@@ -84,11 +73,7 @@ impl DbObserverPanel {
     /// Remove a data source (forget its schema + persisted entry).
     fn remove_source(&mut self, source: &DataSource, cx: &mut Context<Self>) {
         let key = source.key();
-        if let Some(root) = self.project_root(cx) {
-            self.sources = db_source::remove_source(&root, source);
-        } else {
-            self.sources.retain(|s| s.key() != key);
-        }
+        self.sources = db_source::remove_source(&sources_dir(), source);
         self.schemas.remove(&key);
         self.errors.remove(&key);
         self.loading.remove(&key);
@@ -158,29 +143,14 @@ impl DbObserverPanel {
         self.emit(OpenRequest::DbConsole { source }, cx);
     }
 
-    /// Pick a SQLite file to add as a data source.
-    fn pick_sqlite(&self, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some(SharedString::from("Add SQLite Database")),
-        });
-        cx.spawn(async move |weak, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await {
-                if let Some(path) = paths.into_iter().next() {
-                    let _ = weak.update(cx, |this, cx| {
-                        this.add_source(DataSource::Sqlite(path), cx);
-                    });
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn toggle_connect(&mut self, cx: &mut Context<Self>) {
-        self.connect_open = !self.connect_open;
-        cx.notify();
+    /// Ask the workspace to open the (window-level) Add-Data-Source modal.
+    fn open_add_source(&self, cx: &mut Context<Self>) {
+        if let Some(chrome) = cx
+            .try_global::<crate::views::workspace::ShellDeps>()
+            .map(|d| d.chrome.clone())
+        {
+            chrome.update(cx, |_, cx| cx.emit(ChromeRequest::OpenAddDataSource));
+        }
     }
 }
 
@@ -189,11 +159,15 @@ impl DbObserverPanel {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NodeKind {
     Db,
+    /// A Postgres schema namespace (`public`, …); absent for SQLite.
+    Schema,
+    /// A folder row: Tables / Views / Columns / Keys / Indexes.
     Group,
     Table,
     View,
     Column,
-    IndexGroup,
+    /// A PK/FK column listed under a table's "Keys" folder.
+    Key,
     Index,
     Note,
 }
@@ -213,6 +187,16 @@ struct TreeRow {
     has_children: bool,
     open: bool,
     selected: bool,
+}
+
+/// The stable, app-global store dir for the operator's data sources — `~/.moonlight`
+/// (home-anchored like the control socket). Independent of the volatile project root, so
+/// sources survive restarts and are shared across projects, DataGrip-style.
+fn sources_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".moonlight")
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -275,6 +259,9 @@ fn build_tree(
     rows
 }
 
+/// Push a source's schema. Postgres tables carry a namespace (`public`, …) so they nest under
+/// a Schema layer; SQLite (`schema = None`) has a single namespace and stays flat. Each table
+/// then expands to Columns / Keys / Indexes folders — the DataGrip-style shape.
 fn push_schema(
     rows: &mut Vec<TreeRow>,
     source: &DataSource,
@@ -282,101 +269,201 @@ fn push_schema(
     schema: &Schema,
     open: &HashSet<u64>,
 ) {
+    // Distinct namespaces in first-seen order (None ⇒ SQLite, one flat namespace).
+    let mut namespaces: Vec<Option<String>> = Vec::new();
+    for t in schema.tables.iter().chain(schema.views.iter()) {
+        if !namespaces.contains(&t.schema) {
+            namespaces.push(t.schema.clone());
+        }
+    }
+    let layered = namespaces.iter().any(Option::is_some);
+
+    for ns in &namespaces {
+        // A Schema node (Postgres) shifts the groups one level deeper; SQLite skips it.
+        let (depth, prefix) = if layered {
+            let name = ns.as_deref().unwrap_or("public");
+            let nid = hash_str(&format!("{skey}/ns/{name}"));
+            let nopen = open.contains(&nid);
+            let count = schema
+                .tables
+                .iter()
+                .chain(schema.views.iter())
+                .filter(|t| &t.schema == ns)
+                .count();
+            rows.push(TreeRow {
+                id: nid,
+                depth: 1,
+                kind: NodeKind::Schema,
+                label: name.to_string(),
+                source: None,
+                table: None,
+                col: None,
+                count: Some(count as i64),
+                has_children: count > 0,
+                open: nopen,
+                selected: false,
+            });
+            if !nopen {
+                continue;
+            }
+            (2usize, format!("{skey}/ns/{name}"))
+        } else {
+            (1usize, skey.to_string())
+        };
+        push_groups(rows, source, &prefix, depth, schema, ns, open);
+    }
+}
+
+/// The Tables / Views folders for one namespace `ns` at `depth`.
+fn push_groups(
+    rows: &mut Vec<TreeRow>,
+    source: &DataSource,
+    prefix: &str,
+    depth: usize,
+    schema: &Schema,
+    ns: &Option<String>,
+    open: &HashSet<u64>,
+) {
     let groups: [(&str, &Vec<TableMeta>, NodeKind); 2] = [
         ("Tables", &schema.tables, NodeKind::Table),
         ("Views", &schema.views, NodeKind::View),
     ];
     for (glabel, objs, kind) in groups {
-        if objs.is_empty() {
+        let items: Vec<&TableMeta> = objs.iter().filter(|t| &t.schema == ns).collect();
+        if items.is_empty() {
             continue;
         }
-        let gid = hash_str(&format!("{skey}/{glabel}"));
+        let gid = hash_str(&format!("{prefix}/{glabel}"));
         let gopen = open.contains(&gid);
-        rows.push(TreeRow {
-            id: gid,
-            depth: 1,
-            kind: NodeKind::Group,
-            label: glabel.to_string(),
-            source: None,
-            table: None,
-            col: None,
-            count: Some(objs.len() as i64),
-            has_children: true,
-            open: gopen,
-            selected: false,
-        });
+        rows.push(group_row(gid, depth, glabel, items.len(), gopen));
         if !gopen {
             continue;
         }
-        for t in objs {
-            let tid = hash_str(&format!("{skey}/{glabel}/{}", t.name));
-            let topen = open.contains(&tid);
+        for t in items {
+            push_table(rows, source, prefix, depth + 1, glabel, kind, t, open);
+        }
+    }
+}
+
+/// One table/view row, expanding to Columns / Keys / Indexes sub-folders.
+#[allow(clippy::too_many_arguments)]
+fn push_table(
+    rows: &mut Vec<TreeRow>,
+    source: &DataSource,
+    prefix: &str,
+    depth: usize,
+    glabel: &str,
+    kind: NodeKind,
+    t: &TableMeta,
+    open: &HashSet<u64>,
+) {
+    let tid = hash_str(&format!("{prefix}/{glabel}/{}", t.name));
+    let topen = open.contains(&tid);
+    rows.push(TreeRow {
+        id: tid,
+        depth,
+        kind,
+        label: t.name.clone(),
+        source: Some(source.clone()),
+        table: Some(t.clone()),
+        col: None,
+        count: t.row_count,
+        has_children: !t.columns.is_empty() || !t.indexes.is_empty(),
+        open: topen,
+        selected: false,
+    });
+    if !topen {
+        return;
+    }
+    let base = format!("{prefix}/{glabel}/{}", t.name);
+    let fdepth = depth + 1;
+    let cdepth = depth + 2;
+
+    if !t.columns.is_empty() && push_folder(rows, &base, "Columns", fdepth, t.columns.len(), open) {
+        for c in &t.columns {
+            rows.push(column_row(&base, cdepth, NodeKind::Column, c));
+        }
+    }
+
+    let keys: Vec<&db_source::ColumnMeta> = t
+        .columns
+        .iter()
+        .filter(|c| c.pk || c.fk.is_some())
+        .collect();
+    if !keys.is_empty() && push_folder(rows, &base, "Keys", fdepth, keys.len(), open) {
+        for c in keys {
+            rows.push(column_row(&base, cdepth, NodeKind::Key, c));
+        }
+    }
+
+    if !t.indexes.is_empty() && push_folder(rows, &base, "Indexes", fdepth, t.indexes.len(), open) {
+        for ix in &t.indexes {
             rows.push(TreeRow {
-                id: tid,
-                depth: 2,
-                kind,
-                label: t.name.clone(),
-                source: Some(source.clone()),
-                table: Some(t.clone()),
+                id: hash_str(&format!("{base}/idx/{ix}")),
+                depth: cdepth,
+                kind: NodeKind::Index,
+                label: ix.clone(),
+                source: None,
+                table: None,
                 col: None,
-                count: t.row_count,
-                has_children: !t.columns.is_empty() || !t.indexes.is_empty(),
-                open: topen,
+                count: None,
+                has_children: false,
+                open: false,
                 selected: false,
             });
-            if !topen {
-                continue;
-            }
-            for c in &t.columns {
-                rows.push(TreeRow {
-                    id: hash_str(&format!("{skey}/{glabel}/{}/col/{}", t.name, c.name)),
-                    depth: 3,
-                    kind: NodeKind::Column,
-                    label: c.name.clone(),
-                    source: None,
-                    table: None,
-                    col: Some((c.ty.clone(), c.pk, c.fk.clone())),
-                    count: None,
-                    has_children: false,
-                    open: false,
-                    selected: false,
-                });
-            }
-            if !t.indexes.is_empty() {
-                let iid = hash_str(&format!("{skey}/{glabel}/{}/__idx", t.name));
-                let iopen = open.contains(&iid);
-                rows.push(TreeRow {
-                    id: iid,
-                    depth: 3,
-                    kind: NodeKind::IndexGroup,
-                    label: "Indexes".to_string(),
-                    source: None,
-                    table: None,
-                    col: None,
-                    count: Some(t.indexes.len() as i64),
-                    has_children: true,
-                    open: iopen,
-                    selected: false,
-                });
-                if iopen {
-                    for ix in &t.indexes {
-                        rows.push(TreeRow {
-                            id: hash_str(&format!("{skey}/{glabel}/{}/idx/{ix}", t.name)),
-                            depth: 4,
-                            kind: NodeKind::Index,
-                            label: ix.clone(),
-                            source: None,
-                            table: None,
-                            col: None,
-                            count: None,
-                            has_children: false,
-                            open: false,
-                            selected: false,
-                        });
-                    }
-                }
-            }
         }
+    }
+}
+
+/// Push a folder row (Columns / Keys / Indexes) and report whether it's expanded.
+fn push_folder(
+    rows: &mut Vec<TreeRow>,
+    base: &str,
+    label: &str,
+    depth: usize,
+    count: usize,
+    open: &HashSet<u64>,
+) -> bool {
+    let id = hash_str(&format!("{base}/__{label}"));
+    let fopen = open.contains(&id);
+    rows.push(group_row(id, depth, label, count, fopen));
+    fopen
+}
+
+/// A folder row with a child count.
+fn group_row(id: u64, depth: usize, label: &str, count: usize, open: bool) -> TreeRow {
+    TreeRow {
+        id,
+        depth,
+        kind: NodeKind::Group,
+        label: label.to_string(),
+        source: None,
+        table: None,
+        col: None,
+        count: Some(count as i64),
+        has_children: count > 0,
+        open,
+        selected: false,
+    }
+}
+
+/// A column row — used both under "Columns" (shows the type) and "Keys" (badges only).
+fn column_row(base: &str, depth: usize, kind: NodeKind, c: &db_source::ColumnMeta) -> TreeRow {
+    let is_key = matches!(kind, NodeKind::Key);
+    let tag = if is_key { "key" } else { "col" };
+    let ty = if is_key { String::new() } else { c.ty.clone() };
+    TreeRow {
+        id: hash_str(&format!("{base}/{tag}/{}", c.name)),
+        depth,
+        kind,
+        label: c.name.clone(),
+        source: None,
+        table: None,
+        col: Some((ty, c.pk, c.fk.clone())),
+        count: None,
+        has_children: false,
+        open: false,
+        selected: false,
     }
 }
 
@@ -399,13 +486,30 @@ fn note_row(skey: &str, depth: usize, label: String) -> TreeRow {
 /// Accent colour for a tree node kind (from the theme's ANSI palette).
 fn kind_color(kind: NodeKind) -> Hsla {
     let idx = match kind {
-        NodeKind::Db => 14,        // bright cyan — the data source
-        NodeKind::Table => 2,      // green — base data
-        NodeKind::View => 6,       // cyan — derived
-        NodeKind::IndexGroup => 8, // grey
+        NodeKind::Db => 14,     // bright cyan — the data source
+        NodeKind::Schema => 5,  // magenta — a namespace
+        NodeKind::Table => 2,   // green — base data
+        NodeKind::View => 6,    // cyan — derived
+        NodeKind::Key => 3,     // yellow/gold — keys
+        NodeKind::Index => 8,   // grey
+        NodeKind::Column => 12, // bright blue — a field
         _ => return theme::text_muted(),
     };
     theme::ansi_base(idx).unwrap_or_else(theme::text_muted)
+}
+
+/// A leading glyph icon per node kind (folders rely on their chevron + label instead).
+fn kind_glyph(kind: NodeKind) -> Option<&'static str> {
+    Some(match kind {
+        NodeKind::Db => "⛁",
+        NodeKind::Schema => "❖",
+        NodeKind::Table => "▦",
+        NodeKind::View => "◫",
+        NodeKind::Column => "▪",
+        NodeKind::Key => "⚿",
+        NodeKind::Index => "≡",
+        NodeKind::Group | NodeKind::Note => return None,
+    })
 }
 
 impl Focusable for DbObserverPanel {
@@ -439,14 +543,21 @@ impl Panel for DbObserverPanel {
 }
 
 impl Render for DbObserverPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // First render: load the persisted source list.
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // First render: load the persisted source list from the stable global store.
         if self.needs_init {
             self.needs_init = false;
-            self.sources = self
-                .project_root(cx)
-                .map(|r| db_source::load_sources(&r))
-                .unwrap_or_default();
+            let dir = sources_dir();
+            self.sources = db_source::load_sources(&dir);
+            // One-time migration for users whose sources still live in the old per-project
+            // store: adopt them into the global store the first time it's empty.
+            if self.sources.is_empty() {
+                if let Some(root) = self.project_root(cx) {
+                    for s in db_source::load_legacy_sources(&root) {
+                        self.sources = db_source::add_source(&dir, &s);
+                    }
+                }
+            }
         }
         // Lazily fetch schemas for expanded sources we haven't loaded yet.
         let to_load: Vec<DataSource> = self
@@ -464,13 +575,6 @@ impl Render for DbObserverPanel {
         for s in to_load {
             self.load_schema_for(s, cx);
         }
-        // Stand up the DSN input the first time the connect form shows.
-        if self.connect_open && self.dsn_input.is_none() {
-            self.dsn_input = Some(cx.new(|cx| {
-                InputState::new(window, cx).placeholder("postgres://user:pass@host:5432/dbname")
-            }));
-        }
-
         div()
             .track_focus(&self.focus_handle)
             .flex()
@@ -479,7 +583,6 @@ impl Render for DbObserverPanel {
             .bg(theme::surface_raised())
             .text_color(theme::text_primary())
             .child(self.render_header(cx))
-            .children(self.connect_open.then(|| self.render_connect_bar(cx)))
             .child(self.render_tree(cx))
     }
 }
@@ -502,58 +605,10 @@ impl DbObserverPanel {
                     .text_color(theme::text_muted())
                     .child("DATA SOURCES"),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(add_button(
-                        "db-add-file",
-                        "+ File",
-                        cx.listener(|this, _e, _w, cx| this.pick_sqlite(cx)),
-                    ))
-                    .child(add_button(
-                        "db-add-conn",
-                        "+ Connect",
-                        cx.listener(|this, _e, _w, cx| this.toggle_connect(cx)),
-                    )),
-            )
-    }
-
-    fn render_connect_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .w_full()
-            .px_2()
-            .py(px(6.))
-            .border_b_1()
-            .border_color(theme::border_subtle())
-            .bg(theme::surface_base())
-            .child(
-                div()
-                    .flex_1()
-                    .children(self.dsn_input.as_ref().map(|i| Input::new(i).small())),
-            )
             .child(add_button(
-                "db-do-connect",
-                "Connect",
-                cx.listener(|this, _e, _w, cx| {
-                    if let Some(input) = this.dsn_input.clone() {
-                        let dsn = input.read(cx).value().trim().to_string();
-                        if !dsn.is_empty() {
-                            let cfg = PgConfig {
-                                label: db_source::pg_label(&dsn),
-                                dsn,
-                            };
-                            this.connect_open = false;
-                            this.add_source(DataSource::Postgres(cfg), cx);
-                        }
-                    }
-                }),
+                "db-add-source",
+                "＋ Add",
+                cx.listener(|this, _e, _w, cx| this.open_add_source(cx)),
             ))
     }
 
@@ -643,24 +698,15 @@ impl DbObserverPanel {
             .flex_1()
             .overflow_hidden();
 
-        // Category chip for DB / table / view rows.
-        if matches!(kind, NodeKind::Db | NodeKind::Table | NodeKind::View) {
-            let kc = kind_color(kind);
-            let chip = match kind {
-                NodeKind::Db => "DB",
-                NodeKind::View => "VIEW",
-                _ => "TABLE",
-            };
+        // Leading glyph icon (coloured by kind); folders show only their chevron + label.
+        if let Some(glyph) = kind_glyph(kind) {
             name = name.child(
                 div()
                     .flex_none()
-                    .px(px(4.))
-                    .py(px(1.))
-                    .rounded(px(3.))
-                    .bg(theme::tint(kc, 0.14))
-                    .text_color(kc)
-                    .text_size(px(9.))
-                    .child(chip),
+                    .w(px(13.))
+                    .text_size(px(11.))
+                    .text_color(kind_color(kind))
+                    .child(glyph),
             );
         }
 
@@ -671,7 +717,7 @@ impl DbObserverPanel {
                 .text_size(theme::text_sm())
                 .text_color(match kind {
                     NodeKind::Group => theme::text_secondary(),
-                    NodeKind::Index | NodeKind::IndexGroup | NodeKind::Note => theme::text_muted(),
+                    NodeKind::Index | NodeKind::Note => theme::text_muted(),
                     _ => theme::text_primary(),
                 })
                 .child(label.clone()),
@@ -890,5 +936,67 @@ mod tests {
         assert!(rows
             .iter()
             .any(|r| matches!(r.kind, NodeKind::Table) && r.label == "users"));
+    }
+
+    #[test]
+    fn expanded_table_shows_columns_and_keys_folders() {
+        let src = DataSource::Sqlite("/tmp/a.sqlite".into());
+        let key = src.key();
+        let base = format!("{key}/Tables/users");
+        let open = [
+            src_node_id(&key),
+            hash_str(&format!("{key}/Tables")),
+            hash_str(&base),
+            hash_str(&format!("{base}/__Columns")),
+        ];
+        let rows = tree_for(&src, &open);
+        // Columns folder + the `id` column revealed inside it.
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r.kind, NodeKind::Group) && r.label == "Columns"));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r.kind, NodeKind::Column) && r.label == "id"));
+        // `id` is a PK, so a Keys folder is offered (collapsed).
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r.kind, NodeKind::Group) && r.label == "Keys"));
+    }
+
+    #[test]
+    fn postgres_nests_tables_under_a_schema_node() {
+        let src = DataSource::Postgres(db_source::PgConfig {
+            dsn: "postgres://localhost/app".into(),
+            label: "app@localhost".into(),
+        });
+        let key = src.key();
+        let pg = Schema {
+            tables: vec![TableMeta {
+                name: "users".into(),
+                schema: Some("public".into()),
+                row_count: Some(1),
+                columns: vec![],
+                indexes: vec![],
+            }],
+            views: vec![],
+        };
+        let mut schemas = HashMap::new();
+        schemas.insert(key.clone(), pg);
+        let open: HashSet<u64> = [src_node_id(&key)].into_iter().collect();
+        let rows = build_tree(
+            std::slice::from_ref(&src),
+            &schemas,
+            &HashMap::new(),
+            &HashSet::new(),
+            &open,
+            None,
+        );
+        // The schema namespace shows; the Tables group hides until it's expanded.
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r.kind, NodeKind::Schema) && r.label == "public"));
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r.kind, NodeKind::Group) && r.label == "Tables"));
     }
 }

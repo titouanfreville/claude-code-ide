@@ -80,7 +80,11 @@ pub fn parse_rfc3339_millis(s: &str) -> Option<i64> {
     // Optional `.fff` fractional seconds → millis (pad/truncate to 3 digits).
     let mut millis = 0i64;
     if s.as_bytes().get(19) == Some(&b'.') {
-        let mut frac: String = s[20..].chars().take_while(|c| c.is_ascii_digit()).take(3).collect();
+        let mut frac: String = s[20..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .take(3)
+            .collect();
         while frac.len() < 3 {
             frac.push('0');
         }
@@ -369,7 +373,10 @@ mod tests {
         assert_eq!(phoenix[0].tool, "run_select_query");
         let moon = calls.iter().find(|c| c.server == "moonlight").unwrap();
         assert_eq!(moon.tool, "request_phase");
-        assert_eq!(moon.at_millis, parse_rfc3339_millis("2026-07-01T10:00:05.000Z").unwrap());
+        assert_eq!(
+            moon.at_millis,
+            parse_rfc3339_millis("2026-07-01T10:00:05.000Z").unwrap()
+        );
     }
 
     #[test]
@@ -390,7 +397,10 @@ mod tests {
         assert_eq!(phoenix.sessions.len(), 1);
         assert_eq!(phoenix.sessions[0].name.as_deref(), Some("My Session"));
         assert_eq!(phoenix.sessions[0].calls, 2);
-        assert!(!phoenix.accessible, "phoenix only seen in transcript, not config");
+        assert!(
+            !phoenix.accessible,
+            "phoenix only seen in transcript, not config"
+        );
 
         let terraform = views.iter().find(|v| v.server == "terraform").unwrap();
         assert!(terraform.accessible && terraform.total_calls == 0);

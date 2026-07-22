@@ -30,6 +30,19 @@ pub struct PgConfig {
     pub label: String,
 }
 
+impl PgConfig {
+    /// Assemble a `PgConfig` from the modal's structured fields (host/port/db/user/password),
+    /// percent-encoding the userinfo so passwords with `@ : /` survive the URL. `label` is
+    /// derived by [`pg_label`]. A pasted raw DSN bypasses this and constructs `PgConfig` directly.
+    pub fn from_parts(host: &str, port: &str, database: &str, user: &str, password: &str) -> Self {
+        let dsn = pg_dsn(host, port, database, user, password);
+        Self {
+            label: pg_label(&dsn),
+            dsn,
+        }
+    }
+}
+
 impl DataSource {
     /// A short human label for tabs / the tree root.
     pub fn label(&self) -> String {
@@ -183,6 +196,15 @@ pub fn load_page(
     }
 }
 
+/// Open a fresh connection and report the server version — the modal's "Test Connection".
+/// A cheap round-trip that proves the DSN/file resolves and is reachable read-only.
+pub fn test_connection(src: &DataSource) -> Result<String, String> {
+    match src {
+        DataSource::Sqlite(path) => sqlite::test(path),
+        DataSource::Postgres(cfg) => postgres_driver::test(cfg),
+    }
+}
+
 /// Run a read-only `SELECT`/`WITH` query and return its rows.
 pub fn run_query(src: &DataSource, sql: &str) -> Result<Page, String> {
     let trimmed = sql.trim();
@@ -219,27 +241,40 @@ fn safe_ident(name: &str) -> bool {
 
 // ── Saved data sources ───────────────────────────────────────────────────────
 //
-// The operator's data sources (SQLite files + Postgres connections) persist in
-// `<root>/.moonlight-local/db_sources.json` — the **gitignored** local dir — so DSNs
-// (which may carry a password) never land in a tracked config file.
+// The operator's data sources (SQLite files + Postgres connections) persist as
+// `<dir>/db_sources.json`, where `dir` is the caller's **stable, app-global** store
+// (`~/.moonlight`) — NOT a project root. Storing them per-project-root lost them on
+// restart, because the "root" is `current_dir()` on the Overview (varies by how the app is
+// launched). A home-anchored store survives restarts and is shared across projects, like a
+// DataGrip data source. It stays outside any repo, so DSNs (which may carry a password)
+// never land in tracked config. `dir` is a parameter (not hardcoded) so tests stay hermetic.
 
-fn sources_path(root: &Path) -> PathBuf {
-    root.join(".moonlight-local").join("db_sources.json")
+fn sources_path(dir: &Path) -> PathBuf {
+    dir.join("db_sources.json")
 }
 
 /// Load the saved data sources (missing/malformed → none).
-pub fn load_sources(root: &Path) -> Vec<DataSource> {
-    std::fs::read(sources_path(root))
+pub fn load_sources(dir: &Path) -> Vec<DataSource> {
+    std::fs::read(sources_path(dir))
         .ok()
         .and_then(|b| serde_json::from_slice::<Vec<DataSource>>(&b).ok())
         .unwrap_or_default()
 }
 
-/// Write the full source list, best-effort (creates the local dir).
-fn write_sources(root: &Path, sources: &[DataSource]) {
-    let path = sources_path(root);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+/// Load data sources from the **legacy** per-project store (`<root>/.moonlight-local/…`), for
+/// one-time migration into the global store. Missing → none.
+pub fn load_legacy_sources(root: &Path) -> Vec<DataSource> {
+    std::fs::read(root.join(".moonlight-local").join("db_sources.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<DataSource>>(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Write the full source list, best-effort (creates the store dir).
+fn write_sources(dir: &Path, sources: &[DataSource]) {
+    let path = sources_path(dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(json) = serde_json::to_vec_pretty(sources) {
         let _ = std::fs::write(path, json);
@@ -247,21 +282,59 @@ fn write_sources(root: &Path, sources: &[DataSource]) {
 }
 
 /// Add a data source (dedup by [`DataSource::key`]); returns the updated list.
-pub fn add_source(root: &Path, source: &DataSource) -> Vec<DataSource> {
-    let mut sources = load_sources(root);
+pub fn add_source(dir: &Path, source: &DataSource) -> Vec<DataSource> {
+    let mut sources = load_sources(dir);
     if !sources.iter().any(|s| s.key() == source.key()) {
         sources.push(source.clone());
-        write_sources(root, &sources);
+        write_sources(dir, &sources);
     }
     sources
 }
 
 /// Remove a data source by key; returns the updated list.
-pub fn remove_source(root: &Path, source: &DataSource) -> Vec<DataSource> {
-    let mut sources = load_sources(root);
+pub fn remove_source(dir: &Path, source: &DataSource) -> Vec<DataSource> {
+    let mut sources = load_sources(dir);
     sources.retain(|s| s.key() != source.key());
-    write_sources(root, &sources);
+    write_sources(dir, &sources);
     sources
+}
+
+/// Build a libpq URL DSN from structured parts. Host defaults to `localhost`; an empty
+/// user/password/port is simply omitted. Userinfo + dbname are percent-encoded.
+pub fn pg_dsn(host: &str, port: &str, database: &str, user: &str, password: &str) -> String {
+    let host = if host.trim().is_empty() {
+        "localhost"
+    } else {
+        host.trim()
+    };
+    let mut auth = String::new();
+    if !user.is_empty() {
+        auth.push_str(&pct(user));
+        if !password.is_empty() {
+            auth.push(':');
+            auth.push_str(&pct(password));
+        }
+        auth.push('@');
+    }
+    let port = match port.trim() {
+        "" => String::new(),
+        p => format!(":{p}"),
+    };
+    format!("postgresql://{auth}{host}{port}/{}", pct(database.trim()))
+}
+
+/// Minimal RFC 3986 percent-encoding of a URL component (unreserved set kept verbatim).
+fn pct(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// A short label for a DSN — `dbname@host` when parseable, else the raw DSN.
@@ -290,6 +363,15 @@ mod sqlite {
     fn open_ro(path: &Path) -> Result<Connection, String> {
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| e.to_string())
+    }
+
+    /// Open read-only and read the engine version — proves the file exists and opens.
+    pub fn test(path: &Path) -> Result<String, String> {
+        let conn = open_ro(path)?;
+        let v: String = conn
+            .query_row("SELECT sqlite_version()", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok(format!("SQLite {v}"))
     }
 
     pub fn load_schema(path: &Path) -> Result<Schema, String> {
@@ -492,6 +574,26 @@ mod postgres_driver {
             .batch_execute("SET default_transaction_read_only = on")
             .map_err(|e| e.to_string())?;
         Ok(client)
+    }
+
+    /// Connect and read the server banner — the modal's "Test Connection" for Postgres.
+    pub fn test(cfg: &PgConfig) -> Result<String, String> {
+        let mut client = connect(cfg)?;
+        let row = client
+            .query_one("SELECT version()", &[])
+            .map_err(|e| e.to_string())?;
+        let full: String = row.get(0);
+        // "PostgreSQL 16.12 (Debian …) on x86_64…" → "PostgreSQL 16.12".
+        Ok(short_version(&full))
+    }
+
+    /// The first two whitespace tokens of a `version()` banner (engine + number).
+    fn short_version(v: &str) -> String {
+        let mut it = v.split_whitespace();
+        match (it.next(), it.next()) {
+            (Some(a), Some(b)) => format!("{a} {b}"),
+            _ => v.to_string(),
+        }
     }
 
     pub fn load_schema(cfg: &PgConfig) -> Result<Schema, String> {
@@ -904,6 +1006,30 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_sqlite_reports_version() {
+        let dir = tmp();
+        let src = DataSource::Sqlite(make_db(&dir));
+        let v = test_connection(&src).unwrap();
+        assert!(v.starts_with("SQLite "), "unexpected version: {v}");
+        // A missing file fails rather than panics.
+        assert!(test_connection(&DataSource::Sqlite("/tmp/does-not-exist.sqlite".into())).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_parts_builds_encoded_dsn_and_label() {
+        let cfg = PgConfig::from_parts("db.example.com", "5432", "shop", "postgres", "p@ss:w/rd");
+        assert_eq!(
+            cfg.dsn,
+            "postgresql://postgres:p%40ss%3Aw%2Frd@db.example.com:5432/shop"
+        );
+        assert_eq!(cfg.label, "shop@db.example.com");
+
+        // Empty host → localhost; no user → no userinfo; no port → omitted.
+        assert_eq!(pg_dsn("", "", "app", "", ""), "postgresql://localhost/app");
+    }
+
+    #[test]
     fn pg_label_extracts_db_and_host() {
         assert_eq!(
             pg_label("postgres://u:p@db.example.com:5432/shop?sslmode=require"),
@@ -929,6 +1055,33 @@ mod tests {
 
         let after_remove = remove_source(&dir, &pg);
         assert_eq!(after_remove, vec![lite]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_per_project_store_is_readable_for_migration() {
+        let dir = tmp();
+        let pg = DataSource::Postgres(PgConfig {
+            dsn: "postgres://localhost/app".into(),
+            label: "app@localhost".into(),
+        });
+        // Seed the OLD per-project location.
+        let legacy_dir = dir.join(".moonlight-local");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("db_sources.json"),
+            serde_json::to_vec(&vec![pg.clone()]).unwrap(),
+        )
+        .unwrap();
+
+        // The new (global) store is separate + empty; the legacy reader finds the old file.
+        let store = dir.join("store");
+        assert!(load_sources(&store).is_empty());
+        assert_eq!(load_legacy_sources(&dir), vec![pg.clone()]);
+
+        // Adopting into the global store round-trips.
+        add_source(&store, &pg);
+        assert_eq!(load_sources(&store), vec![pg]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

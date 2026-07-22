@@ -27,8 +27,9 @@ use crate::views::project_space::ProjectSpace;
 use crate::views::theme;
 use crate::views::workspace::ShellDeps;
 
-/// How often to re-read git status (catches edits made by agents/the terminal).
-const GIT_POLL: Duration = Duration::from_secs(5);
+/// How often to re-sync the tree + git status with disk (catches files and
+/// edits created/deleted/renamed by agents or the terminal).
+const POLL: Duration = Duration::from_secs(5);
 
 /// One directory entry, as read from the filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,10 +143,17 @@ impl FileTreePanel {
             .detach();
         }
 
-        // Periodically re-read git status so agent/terminal edits surface.
+        // Periodically re-sync the tree + git status so agent/terminal edits
+        // (new/deleted/renamed files, content changes) surface without a reroot.
         let tick = cx.spawn(async move |weak, cx| loop {
-            cx.background_executor().timer(GIT_POLL).await;
-            let keep = weak.update(cx, |this, cx| this.refresh_git(cx)).is_ok();
+            cx.background_executor().timer(POLL).await;
+            let keep = weak
+                .update(cx, |this, cx| {
+                    this.refresh_tree();
+                    this.refresh_git(cx);
+                    cx.notify();
+                })
+                .is_ok();
             if !keep {
                 break; // view dropped
             }
@@ -171,6 +179,28 @@ impl FileTreePanel {
         self.nodes = read_dir_sorted(&root).into_iter().map(Node::new).collect();
         self.root = root;
         self.selected = None;
+    }
+
+    /// Re-read the directory structure from disk, preserving which folders are
+    /// expanded (and their already-loaded children). Catches files an agent or
+    /// the terminal created/deleted/renamed. Drops the selection if its path is
+    /// gone. Cheap: only expanded directories are re-`read_dir`'d.
+    fn refresh_tree(&mut self) {
+        let root = self.root.clone();
+        self.nodes = reconcile_dir(&root, std::mem::take(&mut self.nodes));
+        if let Some(sel) = &self.selected {
+            if !sel.exists() {
+                self.selected = None;
+            }
+        }
+    }
+
+    /// Force a full refresh — tree listing + git decorations — and repaint.
+    /// Wired to the header ⟳ button.
+    fn refresh_all(&mut self, cx: &mut Context<Self>) {
+        self.refresh_tree();
+        self.refresh_git(cx);
+        cx.notify();
     }
 
     /// Recompute git status for the current root off the UI thread, then refresh.
@@ -285,6 +315,41 @@ fn push_rows(nodes: &[Node], depth: usize, rows: &mut Vec<Row>) {
             }
         }
     }
+}
+
+/// Re-read `dir` from disk, carrying over expansion state (and, recursively, the
+/// loaded children) from `old` nodes whose path still exists. New entries appear
+/// collapsed; vanished entries drop out. An expanded directory recurses so its
+/// own contents re-sync too; a collapsed/unloaded one keeps its state untouched.
+fn reconcile_dir(dir: &Path, old: Vec<Node>) -> Vec<Node> {
+    // Index the previous nodes by path for O(1) carry-over lookup.
+    let mut old_by_path: std::collections::HashMap<PathBuf, Node> =
+        old.into_iter().map(|n| (n.entry.path.clone(), n)).collect();
+
+    read_dir_sorted(dir)
+        .into_iter()
+        .map(|entry| match old_by_path.remove(&entry.path) {
+            // Existing, expanded directory with loaded children: recurse to
+            // refresh its contents while keeping it expanded.
+            Some(mut prev) if entry.is_dir && prev.expanded && prev.children.is_some() => {
+                let children = prev.children.take().unwrap();
+                let path = entry.path.clone();
+                Node {
+                    entry,
+                    expanded: true,
+                    children: Some(reconcile_dir(&path, children)),
+                }
+            }
+            // Existing but collapsed / not-yet-loaded: keep prior state as-is.
+            Some(prev) => Node {
+                entry,
+                expanded: prev.expanded,
+                children: prev.children,
+            },
+            // Brand-new entry.
+            None => Node::new(entry),
+        })
+        .collect()
 }
 
 /// Find the node at `path` and toggle its expansion, lazily loading children on
@@ -563,7 +628,7 @@ impl FileTreePanel {
                         "ft-refresh",
                         "⟳",
                         cx.listener(|this, _ev, _w, cx| {
-                            this.refresh_git(cx);
+                            this.refresh_all(cx);
                         }),
                     ))
                     .child(
@@ -769,6 +834,53 @@ mod tests {
         // Only a real `.lock` extension is a lockfile; `pnpm-lock.yaml` is yaml → Data.
         assert_eq!(file_kind(Path::new("pnpm-lock.yaml")), FileKind::Data);
         assert_eq!(file_kind(Path::new("Makefile")), FileKind::Other);
+    }
+
+    #[test]
+    fn reconcile_dir_syncs_disk_while_keeping_expansion() {
+        let tmp = std::env::temp_dir().join(format!("mlc-reconcile-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("open_dir")).unwrap();
+        fs::create_dir_all(tmp.join("closed_dir")).unwrap();
+        fs::write(tmp.join("open_dir").join("a.txt"), b"x").unwrap();
+        fs::write(tmp.join("keep.txt"), b"x").unwrap();
+        fs::write(tmp.join("gone.txt"), b"x").unwrap();
+
+        // Initial tree: expand+load open_dir, leave closed_dir collapsed.
+        let mut nodes: Vec<Node> = read_dir_sorted(&tmp).into_iter().map(Node::new).collect();
+        assert!(toggle_node(&mut nodes, &tmp.join("open_dir")));
+
+        // Mutate disk the way an agent would: add a new file inside the expanded
+        // dir, remove a top-level file.
+        fs::write(tmp.join("open_dir").join("b.txt"), b"x").unwrap();
+        fs::write(tmp.join("new.txt"), b"x").unwrap();
+        fs::remove_file(tmp.join("gone.txt")).unwrap();
+
+        let synced = reconcile_dir(&tmp, nodes);
+        let by_name = |name: &str| synced.iter().find(|n| n.entry.name == name);
+
+        // Deleted file dropped, new file appeared.
+        assert!(by_name("gone.txt").is_none());
+        assert!(by_name("new.txt").is_some());
+        assert!(by_name("keep.txt").is_some());
+
+        // Collapsed dir stayed collapsed + unloaded.
+        let closed = by_name("closed_dir").unwrap();
+        assert!(!closed.expanded && closed.children.is_none());
+
+        // Expanded dir stayed expanded and its children re-synced (a.txt + b.txt).
+        let open = by_name("open_dir").unwrap();
+        assert!(open.expanded);
+        let child_names: Vec<&str> = open
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|n| n.entry.name.as_str())
+            .collect();
+        assert_eq!(child_names, vec!["a.txt", "b.txt"]);
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

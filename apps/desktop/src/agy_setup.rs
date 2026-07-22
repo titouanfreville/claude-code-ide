@@ -280,7 +280,10 @@ fn install() {
         let _ = write_json(&hooks_path, &hooks_json(&command));
         let _ = write_json(&manifest_file, &plugin_manifest());
         let _ = std::fs::write(dir.join("GEMINI.md"), GEMINI_MD);
-        println!("refreshed the MoonlightCode AGY plugin at {}", dir.display());
+        println!(
+            "refreshed the MoonlightCode AGY plugin at {}",
+            dir.display()
+        );
         return;
     }
 

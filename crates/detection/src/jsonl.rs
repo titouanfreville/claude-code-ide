@@ -464,12 +464,22 @@ mod tests {
         );
         // Settled well past the done window ⇒ calm Idle (no more amber "needs you").
         assert_eq!(
-            status_for(Some(Turn::Assistant), Duration::from_secs(600), window, done),
+            status_for(
+                Some(Turn::Assistant),
+                Duration::from_secs(600),
+                window,
+                done
+            ),
             SessionStatus::Idle
         );
         // A clean stop cools the same way.
         assert_eq!(
-            status_for(Some(Turn::StopClean), Duration::from_secs(600), window, done),
+            status_for(
+                Some(Turn::StopClean),
+                Duration::from_secs(600),
+                window,
+                done
+            ),
             SessionStatus::Idle
         );
     }

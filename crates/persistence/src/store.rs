@@ -51,8 +51,8 @@ impl ManagedSessionStore for Store {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO managed_session
-                (id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen, agent)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                (id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen, agent, conversation_id, trust_tier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                 root         = excluded.root,
                 title        = excluded.title,
@@ -62,7 +62,9 @@ impl ManagedSessionStore for Store {
                 paused       = excluded.paused,
                 phase_pinned = excluded.phase_pinned,
                 hidden       = excluded.hidden,
-                last_seen    = excluded.last_seen",
+                last_seen    = excluded.last_seen,
+                trust_tier   = excluded.trust_tier,
+                conversation_id = COALESCE(excluded.conversation_id, managed_session.conversation_id)",
             params![
                 s.id.as_str(),
                 s.root,
@@ -76,6 +78,8 @@ impl ManagedSessionStore for Store {
                 s.created_at.as_millis(),
                 s.last_seen.as_millis(),
                 enc(&s.agent)?,
+                s.conversation_id,
+                enc(&s.trust_tier)?,
             ],
         )
         .map_err(backend)?;
@@ -88,7 +92,7 @@ impl ManagedSessionStore for Store {
             .execute(
                 "UPDATE managed_session
                  SET title = ?2, phase = ?3, mode = ?4, adopted = ?5, paused = ?6,
-                     phase_pinned = ?7, hidden = ?8, last_seen = ?9
+                     phase_pinned = ?7, hidden = ?8, last_seen = ?9, trust_tier = ?10
                  WHERE id = ?1",
                 params![
                     u.id.as_str(),
@@ -100,7 +104,23 @@ impl ManagedSessionStore for Store {
                     u.phase_pinned as i64,
                     u.hidden as i64,
                     u.last_seen.as_millis(),
+                    enc(&u.trust_tier)?,
                 ],
+            )
+            .map_err(backend)?;
+        Ok(rows > 0)
+    }
+
+    fn set_conversation_id(
+        &self,
+        id: &SessionId,
+        conversation_id: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock();
+        let rows = conn
+            .execute(
+                "UPDATE managed_session SET conversation_id = ?2 WHERE id = ?1",
+                params![id.as_str(), conversation_id],
             )
             .map_err(backend)?;
         Ok(rows > 0)
@@ -110,8 +130,8 @@ impl ManagedSessionStore for Store {
         let conn = self.lock();
         let raw = conn
             .query_row(
-                "SELECT id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen, agent
-                 FROM managed_session WHERE id = ?1",
+                "SELECT id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen, agent, conversation_id, trust_tier
+                 FROM managed_session WHERE id = ?1 OR conversation_id = ?1",
                 [id.as_str()],
                 raw_managed,
             )
@@ -124,7 +144,7 @@ impl ManagedSessionStore for Store {
         let conn = self.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen, agent
+                "SELECT id, root, title, mode, phase, adopted, paused, phase_pinned, hidden, created_at, last_seen, agent, conversation_id, trust_tier
                  FROM managed_session ORDER BY created_at ASC, id ASC",
             )
             .map_err(backend)?;
@@ -202,6 +222,8 @@ struct RawManaged {
     created_at: i64,
     last_seen: i64,
     agent: String,
+    conversation_id: Option<String>,
+    trust_tier: String,
 }
 
 fn raw_managed(row: &Row) -> rusqlite::Result<RawManaged> {
@@ -218,6 +240,8 @@ fn raw_managed(row: &Row) -> rusqlite::Result<RawManaged> {
         created_at: row.get(9)?,
         last_seen: row.get(10)?,
         agent: row.get(11)?,
+        conversation_id: row.get(12)?,
+        trust_tier: row.get(13)?,
     })
 }
 
@@ -235,6 +259,8 @@ fn managed_from_raw(r: RawManaged) -> Result<ManagedSession, StoreError> {
         created_at: Timestamp::from_millis(r.created_at),
         last_seen: Timestamp::from_millis(r.last_seen),
         agent: dec(&r.agent)?,
+        conversation_id: r.conversation_id,
+        trust_tier: dec(&r.trust_tier)?,
     })
 }
 
@@ -289,6 +315,7 @@ mod tests {
     use moonlight_domain::audit::AuditAction;
     use moonlight_domain::phase::Phase;
     use moonlight_domain::session::Mode;
+    use moonlight_domain::trust::TrustTier;
 
     fn managed(id: &str, created: i64) -> ManagedSession {
         ManagedSession {
@@ -298,6 +325,9 @@ mod tests {
             mode: Mode::Plan,
             phase: Phase::Plan,
             agent: AgentKind::ClaudeCode,
+            conversation_id: None,
+            // Non-default so the round-trip test proves trust persists.
+            trust_tier: TrustTier::Trusted,
             adopted: false,
             paused: false,
             phase_pinned: false,
@@ -340,6 +370,61 @@ mod tests {
 
         let got = store.managed(&SessionId::new("agy-1")).unwrap().unwrap();
         assert_eq!(got.agent, AgentKind::Antigravity);
+    }
+
+    #[test]
+    fn conversation_id_persists_and_setter_updates_it() {
+        // AGY correlation: a managed row starts with no conversation id; the discovery
+        // setter stamps it, and it survives a subsequent upsert that carries None
+        // (the COALESCE keeps the discovered value instead of clobbering it back).
+        let store = Store::open_in_memory().unwrap();
+        let mut rec = managed("agy-cid", 1000);
+        rec.agent = AgentKind::Antigravity;
+        store.upsert_managed(&rec).unwrap();
+        assert_eq!(
+            store
+                .managed(&SessionId::new("agy-cid"))
+                .unwrap()
+                .unwrap()
+                .conversation_id,
+            None
+        );
+
+        // Setter stamps the discovered conversation id.
+        assert!(store
+            .set_conversation_id(&SessionId::new("agy-cid"), "conv-xyz")
+            .unwrap());
+        assert_eq!(
+            store
+                .managed(&SessionId::new("agy-cid"))
+                .unwrap()
+                .unwrap()
+                .conversation_id,
+            Some("conv-xyz".to_string())
+        );
+
+        // A refresh-upsert with conversation_id: None must NOT wipe the discovered value.
+        let mut refreshed = managed("agy-cid", 1000);
+        refreshed.agent = AgentKind::Antigravity;
+        refreshed.title = Some("moved on".into());
+        assert_eq!(refreshed.conversation_id, None);
+        store.upsert_managed(&refreshed).unwrap();
+        let got = store.managed(&SessionId::new("agy-cid")).unwrap().unwrap();
+        assert_eq!(
+            got.conversation_id,
+            Some("conv-xyz".to_string()),
+            "kept via COALESCE"
+        );
+        assert_eq!(
+            got.title.as_deref(),
+            Some("moved on"),
+            "other fields still refresh"
+        );
+
+        // The setter is UPDATE-only — a ghost id touches nothing.
+        assert!(!store
+            .set_conversation_id(&SessionId::new("ghost"), "nope")
+            .unwrap());
     }
 
     #[test]
@@ -393,6 +478,7 @@ mod tests {
             title: Some("Renamed in CC".into()),
             phase: Phase::Review,
             mode: Mode::Auto,
+            trust_tier: TrustTier::Standard,
             adopted: true,
             paused: true,
             phase_pinned: true,
@@ -410,6 +496,11 @@ mod tests {
         assert!(got.paused);
         assert!(got.phase_pinned, "pin persisted through update");
         assert!(got.hidden, "hidden persisted through update");
+        assert_eq!(
+            got.trust_tier,
+            TrustTier::Standard,
+            "trust tier persisted through update"
+        );
         assert_eq!(
             got.title.as_deref(),
             Some("Renamed in CC"),
@@ -442,6 +533,22 @@ mod tests {
         assert!(store.managed(&SessionId::new("sess-1")).unwrap().is_none());
         // Removing an absent row is not an error.
         store.remove_managed(&SessionId::new("sess-1")).unwrap();
+    }
+
+    #[test]
+    fn managed_lookup_by_id_or_conversation_id() {
+        let store = Store::open_in_memory().unwrap();
+        let mut sess = managed("sess-1", 1);
+        sess.conversation_id = Some("conv-123".to_string());
+        store.upsert_managed(&sess).unwrap();
+
+        // Should find by launch UUID
+        let res1 = store.managed(&SessionId::new("sess-1")).unwrap().unwrap();
+        assert_eq!(res1.id.as_str(), "sess-1");
+
+        // Should also find by conversation ID
+        let res2 = store.managed(&SessionId::new("conv-123")).unwrap().unwrap();
+        assert_eq!(res2.id.as_str(), "sess-1");
     }
 
     #[test]

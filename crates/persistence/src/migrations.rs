@@ -44,6 +44,16 @@ const MIGRATIONS: &[&str] = &[
     // serde-JSON like the other enum columns; the default `"ClaudeCode"` backfills
     // every pre-existing row (they were all Claude Code).
     "ALTER TABLE managed_session ADD COLUMN agent TEXT NOT NULL DEFAULT '\"ClaudeCode\"';",
+    // 7 — the backend's own conversation id, when it differs from our managed `id`
+    // (Antigravity has no `--session-id`, so its `conversationId` is discovered after
+    // launch and persisted here). Nullable: NULL for Claude and for an AGY session
+    // whose conversation hasn't been correlated yet.
+    "ALTER TABLE managed_session ADD COLUMN conversation_id TEXT;",
+    // 8 — the operator's trust tier for the session, so a manual "trust this session"
+    // (or a project-trust default) survives restart/reset instead of reseeding to the
+    // default-deny `Observed`. Stored as serde-JSON like the other enum columns; the
+    // default `"Observed"` backfills every pre-existing row (matches the old reseed).
+    "ALTER TABLE managed_session ADD COLUMN trust_tier TEXT NOT NULL DEFAULT '\"Observed\"';",
 ];
 
 /// Apply every migration the database hasn't seen yet, in order. Idempotent: a

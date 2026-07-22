@@ -10,6 +10,8 @@
 
 mod agent_backend;
 mod agy_hook;
+// AGY token / context / cost via the `agy` language-server RPC (see the module docs).
+mod agy_ls;
 mod agy_setup;
 mod assets;
 mod docker;
@@ -116,225 +118,226 @@ fn main() {
     gpui_platform::application()
         .with_assets(assets::Assets)
         .run(|cx| {
-        // Brand the macOS Dock with our app icon (runtime call; works for the bare
-        // `cargo run` binary that has no `.app` bundle). Main thread, no-op elsewhere.
-        icon::set_app_icon();
+            // Brand the macOS Dock with our app icon (runtime call; works for the bare
+            // `cargo run` binary that has no `.app` bundle). Main thread, no-op elsewhere.
+            icon::set_app_icon();
 
-        // Must precede any gpui-component usage.
-        gpui_component::init(cx);
-        // Brand the gpui-component chrome (dock tabs, title bar, scrollbars, editor)
-        // to our dark palette — it otherwise initializes in light mode.
-        views::theme::install(cx);
+            // Must precede any gpui-component usage.
+            gpui_component::init(cx);
+            // Brand the gpui-component chrome (dock tabs, title bar, scrollbars, editor)
+            // to our dark palette — it otherwise initializes in light mode.
+            views::theme::install(cx);
 
-        // Engine wiring: the supervisor owns the fleet and publishes facts on the
-        // bus; the UI mirrors it via a bus subscription (single source of truth,
-        // single engineâUI channel). `ObserveOnlyControl` is the L0 control port.
-        let bus = EventBus::new(256);
+            // Engine wiring: the supervisor owns the fleet and publishes facts on the
+            // bus; the UI mirrors it via a bus subscription (single source of truth,
+            // single engineâUI channel). `ObserveOnlyControl` is the L0 control port.
+            let bus = EventBus::new(256);
 
-        // Durable store of managed-session identity + the audit log. Shared between
-        // the supervisor (refreshes managed state + appends audit) and the UI shell
-        // (consults it on layout-restore to re-resume managed sessions embedded).
-        let store = open_store();
-        // Steering channel (Option C): the `SteerControl` adapter queues injected
-        // feedback (rejection-as-feedback, FR18-20) here; `run_steer_drain` writes it
-        // into the target session's embedded terminal — the engine can't reach the
-        // PTY, so delivery stays behind the port but is actuated by the UI.
-        let (steer_tx, steer_rx) = mpsc::unbounded_channel::<Feedback>();
-        let supervisor = SessionSupervisor::with_store(
-            Arc::new(SteerControl::new(steer_tx)),
-            bus.clone(),
-            Some(store.clone()),
-        );
+            // Durable store of managed-session identity + the audit log. Shared between
+            // the supervisor (refreshes managed state + appends audit) and the UI shell
+            // (consults it on layout-restore to re-resume managed sessions embedded).
+            let store = open_store();
+            // Steering channel (Option C): the `SteerControl` adapter queues injected
+            // feedback (rejection-as-feedback, FR18-20) here; `run_steer_drain` writes it
+            // into the target session's embedded terminal — the engine can't reach the
+            // PTY, so delivery stays behind the port but is actuated by the UI.
+            let (steer_tx, steer_rx) = mpsc::unbounded_channel::<Feedback>();
+            let supervisor = SessionSupervisor::with_store(
+                Arc::new(SteerControl::new(steer_tx)),
+                bus.clone(),
+                Some(store.clone()),
+            );
 
-        // Control gate: a shared per-session read-model the hook `ControlServer`
-        // reads. It is kept in sync from the bus below; the server itself runs on
-        // its own tokio runtime thread (Unix-socket I/O needs tokio's reactor,
-        // which GPUI's executor does not provide).
-        let gate_view: GateView = Arc::new(RwLock::new(HashMap::new()));
-        // Held-approval keystone: the server registers pending approvals here and
-        // notifies the app over the bus; the engine loop resolves them when the
-        // operator approves/denies in the cockpit (same registry, both runtimes).
-        let pending = Arc::new(PendingApprovals::new());
-        // One bus-backed notifier shared by the hook server and the MCP approval
-        // gate — both surface their holds through the same cockpit affordance.
-        let notifier: Arc<dyn ApprovalNotifier> = Arc::new(BusNotifier { bus: bus.clone() });
-        // Runtime "always allow" overlay: the control server reads it to vouch a held
-        // external-MCP tool; the command router (below) appends to it when the operator
-        // clicks "always allow". Shared `Arc` so the decision takes effect immediately.
-        let runtime_safe: RuntimeSafeTools = Arc::default();
-        spawn_control_server(
-            gate_view.clone(),
-            pending.clone(),
-            notifier.clone(),
-            runtime_safe.clone(),
-        );
+            // Control gate: a shared per-session read-model the hook `ControlServer`
+            // reads. It is kept in sync from the bus below; the server itself runs on
+            // its own tokio runtime thread (Unix-socket I/O needs tokio's reactor,
+            // which GPUI's executor does not provide).
+            let gate_view: GateView = Arc::new(RwLock::new(HashMap::new()));
+            // Held-approval keystone: the server registers pending approvals here and
+            // notifies the app over the bus; the engine loop resolves them when the
+            // operator approves/denies in the cockpit (same registry, both runtimes).
+            let pending = Arc::new(PendingApprovals::new());
+            // One bus-backed notifier shared by the hook server and the MCP approval
+            // gate — both surface their holds through the same cockpit affordance.
+            let notifier: Arc<dyn ApprovalNotifier> = Arc::new(BusNotifier { bus: bus.clone() });
+            // Runtime "always allow" overlay: the control server reads it to vouch a held
+            // external-MCP tool; the command router (below) appends to it when the operator
+            // clicks "always allow". Shared `Arc` so the decision takes effect immediately.
+            let runtime_safe: RuntimeSafeTools = Arc::default();
+            spawn_control_server(
+                gate_view.clone(),
+                pending.clone(),
+                notifier.clone(),
+                runtime_safe.clone(),
+                store.clone(),
+            );
 
-        // Fold engine facts into the gate read-model (on GPUI's executor).
-        {
-            let mut rx = bus.subscribe();
-            let gate_view = gate_view.clone();
-            cx.spawn(async move |_cx| loop {
-                match rx.recv().await {
-                    Ok(event) => apply_gate_event(&gate_view, &event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            })
-            .detach();
-        }
+            // Fold engine facts into the gate read-model (on GPUI's executor).
+            {
+                let mut rx = bus.subscribe();
+                let gate_view = gate_view.clone();
+                cx.spawn(async move |_cx| loop {
+                    match rx.recv().await {
+                        Ok(event) => apply_gate_event(&gate_view, &event),
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                })
+                .detach();
+            }
 
-        // Operator intents (e.g. adoption) flow UI â supervisor over this channel.
-        // Deliver injected feedback (Option C): drain the steer channel into the
-        // target sessions' embedded terminals. `ShellDeps` (the session→terminal
-        // registry) is installed when the window opens; until then `recv` just waits.
-        cx.spawn(async move |cx| run_steer_drain(steer_rx, cx.clone()).await)
-            .detach();
+            // Operator intents (e.g. adoption) flow UI â supervisor over this channel.
+            // Deliver injected feedback (Option C): drain the steer channel into the
+            // target sessions' embedded terminals. `ShellDeps` (the session→terminal
+            // registry) is installed when the window opens; until then `recv` just waits.
+            cx.spawn(async move |cx| run_steer_drain(steer_rx, cx.clone()).await)
+                .detach();
 
-        // MCP actor host (Slice 3): one embedded HTTP MCP server per managed
-        // session, sharing the single PDP, the durable audit store, and the
-        // held-approval keystone. The policy view is folded from the bus (below)
-        // so the actor always gates against the operator's *current* phase/trust.
-        let mcp_policy = Arc::new(BusPolicyView::new());
-        {
-            let mut rx = bus.subscribe();
-            let policy = mcp_policy.clone();
-            cx.spawn(async move |_cx| loop {
-                match rx.recv().await {
-                    Ok(event) => policy.apply(&event),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            })
-            .detach();
-        }
-        // Seed the policy view from the durable store so the actor can resolve a
-        // managed session immediately — independent of whether the fold above catches
-        // that session's live `SessionUpserted` (it may have been published before the
-        // subscription, or dropped on a `Lagged` burst at boot hydrate). Runs *after*
-        // the subscription so a live upsert during seeding still wins (merge-only).
-        if let Ok(records) = store.all_managed() {
-            mcp_policy.seed_from_managed(&records);
-        }
-        // The run registry backs both the Run console (UI) and the MCP run verbs —
-        // one shared state, so operator- and agent-started runs land in one console.
-        // The executor stack: run verbs hit the registry; everything else falls
-        // through to the shell executor (run_with_coverage).
-        // Operator command channel, built **before** the actor so the MCP phase verb
-        // can emit phase transitions onto the very same channel the cockpit's own phase
-        // controls use (the engine loop drains it below). `commands` is moved into the
-        // shell at window open; the executor keeps a clone.
-        let (commands, command_rx) = mpsc::unbounded_channel::<Command>();
+            // MCP actor host (Slice 3): one embedded HTTP MCP server per managed
+            // session, sharing the single PDP, the durable audit store, and the
+            // held-approval keystone. The policy view is folded from the bus (below)
+            // so the actor always gates against the operator's *current* phase/trust.
+            let mcp_policy = Arc::new(BusPolicyView::new());
+            {
+                let mut rx = bus.subscribe();
+                let policy = mcp_policy.clone();
+                cx.spawn(async move |_cx| loop {
+                    match rx.recv().await {
+                        Ok(event) => policy.apply(&event),
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                })
+                .detach();
+            }
+            // Seed the policy view from the durable store so the actor can resolve a
+            // managed session immediately — independent of whether the fold above catches
+            // that session's live `SessionUpserted` (it may have been published before the
+            // subscription, or dropped on a `Lagged` burst at boot hydrate). Runs *after*
+            // the subscription so a live upsert during seeding still wins (merge-only).
+            if let Ok(records) = store.all_managed() {
+                mcp_policy.seed_from_managed(&records);
+            }
+            // The run registry backs both the Run console (UI) and the MCP run verbs —
+            // one shared state, so operator- and agent-started runs land in one console.
+            // The executor stack: run verbs hit the registry; everything else falls
+            // through to the shell executor (run_with_coverage).
+            // Operator command channel, built **before** the actor so the MCP phase verb
+            // can emit phase transitions onto the very same channel the cockpit's own phase
+            // controls use (the engine loop drains it below). `commands` is moved into the
+            // shell at window open; the executor keeps a clone.
+            let (commands, command_rx) = mpsc::unbounded_channel::<Command>();
 
-        let run_registry = run::RunRegistry::new();
-        // Shared HTTP call history — the `http_request` executor records into it; the
-        // Services view's HTTP summary polls it (same one-state-two-worlds shape as the
-        // run registry).
-        let http_history = http::HttpHistory::new();
-        // Operator's auto-phasing toggle (off by default): a shared flag the main
-        // toolbar flips and the actor reads — when on, a `request_phase` Prompt is
-        // auto-approved instead of waiting on the cockpit gate.
-        let auto_phase = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Executor stack (outer → inner): phase verb (request_phase) → http_request →
-        // run verbs → the shell-backed run_with_coverage. Each layer handles its own
-        // verbs and delegates the rest.
-        let actor: Arc<dyn McpActor> = Arc::new(
-            ActorService::new(
-                Arc::new(DefaultPdp),
-                mcp_policy.clone(),
-                Arc::new(phase_verbs::PhaseVerbExecutor::new(
-                    commands.clone(),
+            let run_registry = run::RunRegistry::new();
+            // Shared HTTP call history — the `http_request` executor records into it; the
+            // Services view's HTTP summary polls it (same one-state-two-worlds shape as the
+            // run registry).
+            let http_history = http::HttpHistory::new();
+            // Operator's auto-phasing toggle (off by default): a shared flag the main
+            // toolbar flips and the actor reads — when on, a `request_phase` Prompt is
+            // auto-approved instead of waiting on the cockpit gate.
+            let auto_phase = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Executor stack (outer → inner): phase verb (request_phase) → http_request →
+            // run verbs → the shell-backed run_with_coverage. Each layer handles its own
+            // verbs and delegates the rest.
+            let actor: Arc<dyn McpActor> = Arc::new(
+                ActorService::new(
+                    Arc::new(DefaultPdp),
                     mcp_policy.clone(),
-                    Arc::new(http_verbs::HttpVerbExecutor::new(
-                        http_history.clone(),
-                        Arc::new(run_verbs::RunVerbExecutor::new(
-                            run_registry.clone(),
-                            Arc::new(ShellVerbExecutor::new(mcp_test_command())),
+                    Arc::new(phase_verbs::PhaseVerbExecutor::new(
+                        commands.clone(),
+                        mcp_policy.clone(),
+                        Arc::new(http_verbs::HttpVerbExecutor::new(
+                            http_history.clone(),
+                            Arc::new(run_verbs::RunVerbExecutor::new(
+                                run_registry.clone(),
+                                Arc::new(ShellVerbExecutor::new(mcp_test_command())),
+                            )),
                         )),
                     )),
-                )),
-                Arc::new(StoreAuditSink::new(store.clone())),
-                // `None` = hold MCP-verb approvals until the operator decides (no auto-deny
-                // — a human approval must not be rushed; see KeystoneApprovalGate).
-                Arc::new(KeystoneApprovalGate::new(
-                    pending.clone(),
-                    notifier.clone(),
-                    None,
-                )),
-            )
-            .with_auto_phase(auto_phase.clone()),
-        );
-        let mcp_host = McpHostHandle::build(McpHost::new(actor, mcp_policy));
+                    Arc::new(StoreAuditSink::new(store.clone())),
+                    // `None` = hold MCP-verb approvals until the operator decides (no auto-deny
+                    // — a human approval must not be rushed; see KeystoneApprovalGate).
+                    Arc::new(KeystoneApprovalGate::new(
+                        pending.clone(),
+                        notifier.clone(),
+                        None,
+                    )),
+                )
+                .with_auto_phase(auto_phase.clone()),
+            );
+            let mcp_host = McpHostHandle::build(McpHost::new(actor, mcp_policy));
 
-        // Clones the engine loop owns: it resolves held approvals against `pending`
-        // and republishes the resumed status on `bus`.
-        let loop_pending = pending.clone();
-        let loop_bus = bus.clone();
-        // The engine loop also owns a handle to the runtime "always allow" overlay so
-        // an `AuthorizeAlwaysTool` command can vouch a pattern (and persist it).
-        let loop_runtime_safe = runtime_safe.clone();
-        // The shell shares the same store so a restored managed-session tab can be
-        // re-resumed (see the SessionMonitor registry arm in `views::workspace`).
-        let shell_store = store.clone();
+            // Clones the engine loop owns: it resolves held approvals against `pending`
+            // and republishes the resumed status on `bus`.
+            let loop_pending = pending.clone();
+            let loop_bus = bus.clone();
+            // The engine loop also owns a handle to the runtime "always allow" overlay so
+            // an `AuthorizeAlwaysTool` command can vouch a pattern (and persist it).
+            let loop_runtime_safe = runtime_safe.clone();
+            // The shell shares the same store so a restored managed-session tab can be
+            // re-resumed (see the SessionMonitor registry arm in `views::workspace`).
+            let shell_store = store.clone();
 
-        cx.spawn(async move |cx| {
-            cx.open_window(window_options(), |window, cx| {
-                // Build the shared UI state and register dockable panels before any
-                // panel is constructed. `ProjectSpace` is what the file-tree/terminal
-                // rails follow when the operator focuses a session.
-                let focus = cx.new(|_| ProjectSpace::load());
-                let center = cx.new(|_| CenterRequests);
-                let edit_gate = cx.new(|cx| EditGate::new(bus.subscribe(), cx));
-                let active_editor = cx.new(|_| ActiveEditor::default());
-                let active_context = cx.new(|_| ActiveContext::default());
-                let notifications = cx.new(|_| Notifications::default());
-                let editor_commands = cx.new(|_| EditorCommands);
-                let obs_store = cx.new(|_| ObsStore::default());
-                init_shell(
-                    cx,
-                    focus,
-                    bus.clone(),
-                    commands,
-                    center,
-                    edit_gate,
-                    active_editor,
-                    active_context,
-                    notifications,
-                    editor_commands,
-                    obs_store,
-                    shell_store,
-                    mcp_host,
-                    run_registry,
-                    http_history,
-                    auto_phase,
-                );
+            cx.spawn(async move |cx| {
+                cx.open_window(window_options(), |window, cx| {
+                    // Build the shared UI state and register dockable panels before any
+                    // panel is constructed. `ProjectSpace` is what the file-tree/terminal
+                    // rails follow when the operator focuses a session.
+                    let focus = cx.new(|_| ProjectSpace::load());
+                    let center = cx.new(|_| CenterRequests);
+                    let edit_gate = cx.new(|cx| EditGate::new(bus.subscribe(), cx));
+                    let active_editor = cx.new(|_| ActiveEditor::default());
+                    let active_context = cx.new(|_| ActiveContext::default());
+                    let notifications = cx.new(|_| Notifications::default());
+                    let editor_commands = cx.new(|_| EditorCommands);
+                    let obs_store = cx.new(|_| ObsStore::default());
+                    init_shell(
+                        cx,
+                        focus,
+                        bus.clone(),
+                        commands,
+                        center,
+                        edit_gate,
+                        active_editor,
+                        active_context,
+                        notifications,
+                        editor_commands,
+                        obs_store,
+                        shell_store,
+                        mcp_host,
+                        run_registry,
+                        http_history,
+                        auto_phase,
+                    );
 
-                let workspace = cx.new(|cx| Workspace::new(window, cx));
-                // The first level inside the window must be a `Root`.
-                cx.new(|cx| Root::new(workspace, window, cx))
+                    let workspace = cx.new(|cx| Workspace::new(window, cx));
+                    // The first level inside the window must be a `Root`.
+                    cx.new(|cx| Root::new(workspace, window, cx))
+                })
+                .expect("failed to open MoonlightCode window");
+
+                // Live data + operator commands: poll the detection adapter and drain the
+                // command channel, driving both through the supervisor (detection/commands
+                // â engine â bus â UI). Reads the operator's real `~/.claude/projects`.
+                run_engine_loop(
+                    supervisor,
+                    // Observe BOTH backends: Claude's `~/.claude/projects` and AGY's
+                    // `~/.gemini/antigravity-cli/brain`.
+                    CompositeDetectionSource::new(vec![
+                        Box::new(JsonlDetectionSource::default()),
+                        Box::new(AntigravityDetectionSource::default()),
+                    ]),
+                    command_rx,
+                    loop_pending,
+                    loop_bus,
+                    loop_runtime_safe,
+                    cx.clone(),
+                )
+                .await;
             })
-            .expect("failed to open MoonlightCode window");
-
-            // Live data + operator commands: poll the detection adapter and drain the
-            // command channel, driving both through the supervisor (detection/commands
-            // â engine â bus â UI). Reads the operator's real `~/.claude/projects`.
-            run_engine_loop(
-                supervisor,
-                // Observe BOTH backends: Claude's `~/.claude/projects` and AGY's
-                // `~/.gemini/antigravity-cli/brain`.
-                CompositeDetectionSource::new(vec![
-                    Box::new(JsonlDetectionSource::default()),
-                    Box::new(AntigravityDetectionSource::default()),
-                ]),
-                command_rx,
-                loop_pending,
-                loop_bus,
-                loop_runtime_safe,
-                cx.clone(),
-            )
-            .await;
-        })
-        .detach();
-    });
+            .detach();
+        });
 }
 
 /// Drive the supervisor from two inbound sources: the detection adapter (polled
@@ -665,6 +668,7 @@ fn spawn_control_server(
     pending: Arc<PendingApprovals>,
     notifier: Arc<dyn ApprovalNotifier>,
     runtime_safe: RuntimeSafeTools,
+    store: Arc<dyn ManagedSessionStore>,
 ) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -694,6 +698,16 @@ fn spawn_control_server(
                     use std::os::unix::fs::PermissionsExt;
                     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
                     tracing::info!(socket = %path.display(), "control server listening");
+                    let store_clone = store.clone();
+                    let resolver = Arc::new(move |conversation_id: &str| {
+                        if let Ok(all) = store_clone.all_managed() {
+                            all.into_iter()
+                                .find(|m| m.conversation_id.as_deref() == Some(conversation_id))
+                                .map(|m| m.id)
+                        } else {
+                            None
+                        }
+                    });
                     Arc::new(
                         ControlServer::with_approvals(
                             gate_view,
@@ -706,7 +720,8 @@ fn spawn_control_server(
                             None,
                         )
                         .with_ai_resolver(ai_workspace_resolver())
-                        .with_runtime_safe(runtime_safe),
+                        .with_runtime_safe(runtime_safe)
+                        .with_id_resolver(resolver),
                     )
                     .serve(listener)
                     .await;

@@ -24,9 +24,9 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use gpui::prelude::*;
 use gpui::{
-    div, px, App, Context, CursorStyle, Edges, Entity, Focusable, FontWeight, Global, KeyBinding,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    PromptLevel, SharedString, WeakEntity, Window,
+    div, px, App, Context, CursorStyle, Edges, Entity, Focusable, FontWeight, Global, Hsla,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, PromptLevel, SharedString, WeakEntity, Window,
 };
 use gpui_component::dock::{
     register_panel, DockArea, DockAreaState, DockItem, DockPlacement, PanelInfo, PanelState,
@@ -58,17 +58,16 @@ use super::open_tabs::{self, OpenTabsState, SpaceTabs};
 use super::panels::activity_rail::{activity_rail, RailSnapshot};
 use super::panels::code_editor::{CodeEditorPanel, FormatDocument, SaveFile};
 use super::panels::code_review::CodeReviewPanel;
+use super::panels::db_add_source::{AddSourceForm, Driver, TestState};
 use super::panels::db_console::DbConsolePanel;
 use super::panels::db_grid::DbGridPanel;
 use super::panels::db_observer::DbObserverPanel;
-use super::panels::db_source::DataSource;
+use super::panels::db_source::{self, DataSource};
 use super::panels::file_tree::FileTreePanel;
 use super::panels::plan_review::PlanReviewPanel;
 use super::panels::session_monitor::{attach_command, SessionMonitor};
 use super::panels::spaces::{space_tab_bar, SpaceTab};
-use super::panels::status_bar::{
-    self, LeftZone, NotifRow, ObsView, QuotaView, StatusSnapshot,
-};
+use super::panels::status_bar::{self, LeftZone, NotifRow, ObsView, QuotaView, StatusSnapshot};
 use super::panels::structure::StructurePanel;
 use super::panels::terminal::TerminalPanel;
 use super::panels::toolbar;
@@ -272,7 +271,13 @@ pub fn init_shell(
                     .or(info_root)
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 let mcp = deps.mcp_host.as_ref().and_then(|h| h.url_for(&id));
-                let command = attach_command(&id, rec.agent, rec.phase, mcp.as_deref());
+                let command = attach_command(
+                    &id,
+                    rec.agent,
+                    rec.phase,
+                    mcp.as_deref(),
+                    rec.conversation_id.as_deref(),
+                );
                 SessionMonitor::new_managed(
                     id,
                     None,
@@ -467,6 +472,8 @@ pub struct Workspace {
     run_config_command_input: Option<Entity<InputState>>,
     /// Selected run kind for the custom run config.
     run_config_kind: RunKind,
+    /// The Add-Data-Source modal's live form state; `Some` while the modal is open.
+    add_source: Option<AddSourceForm>,
     /// Per-session root + status, folded from the engine bus. Drives the space
     /// tabs' attention dots: a space lights up when a session under its root is
     /// Waiting/Errored. (The fleet grid keeps its own richer model; this is just
@@ -977,8 +984,9 @@ impl Workspace {
         // Poll the statusline-fed Claude-obs directory into the read-model on a slow
         // timer (off the engine path); re-render the bar when it changes.
         let obs_store = cx.global::<ShellDeps>().obs_store.clone();
-        // Managed-session store, for resolving each AGY session's model from its own
-        // transcript (keyed by our managed id via a root→conversationId bridge).
+        // Managed-session store, for discovering + persisting each AGY session's own
+        // `conversationId` (launch-time correlation) and then resolving its model from
+        // AGY's transcript, keyed by our managed id.
         let managed_store = cx.global::<ShellDeps>().store.clone();
         cx.observe(&obs_store, |_this, _o, cx| cx.notify()).detach();
         let mut tick: u64 = 0;
@@ -992,24 +1000,54 @@ impl Workspace {
             // (self-fetched from Anthropic), so refresh it on the first tick and every
             // ~2 min thereafter.
             let do_quota = tick % 100 == 0;
-            // Managed AGY sessions `(managed_id, root)` — the bridge input for resolving
-            // each one's model from AGY's own transcript (see `obs::agy_models`).
-            let managed_agy: Vec<(String, String)> = managed_store
+            // AGY token/context usage rides the `agy` RPC (process scan + HTTP), so refresh
+            // it on a slower cadence (~10s); the fast ticks read the write-through cache.
+            let do_agy_usage = tick % 8 == 0;
+            // Managed AGY sessions `(managed_id, root, persisted_cid, launch_ms)` — enough
+            // to discover an as-yet-uncorrelated conversation (root + launch time) and to
+            // resolve each one's model from AGY's own transcript (see `obs::agy_models`).
+            let managed_agy: Vec<(String, String, Option<String>, i64)> = managed_store
                 .all_managed()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|m| m.agent == moonlight_domain::AgentKind::Antigravity)
-                .filter_map(|m| m.root.map(|r| (m.id.as_str().to_string(), r)))
+                .filter_map(|m| {
+                    m.root.clone().map(|r| {
+                        (
+                            m.id.as_str().to_string(),
+                            r,
+                            m.conversation_id.clone(),
+                            m.created_at.as_millis(),
+                        )
+                    })
+                })
                 .collect();
+            let disc_store = managed_store.clone();
             let (loaded, quota) = cx
                 .background_executor()
                 .spawn(async move {
+                    // Discover + persist any AGY conversation id not yet correlated
+                    // (earliest conversation in the session's root created at/after launch),
+                    // so a restart can `agy --conversation <cid>` and keying is exact.
+                    let model_input: Vec<(String, String, Option<String>)> = managed_agy
+                        .iter()
+                        .map(|(id, root, cid, launch_ms)| {
+                            let resolved = cid.clone().or_else(|| {
+                                let found =
+                                    crate::obs::discover_agy_conversation(root, *launch_ms)?;
+                                let _ = disc_store
+                                    .set_conversation_id(&SessionId::new(id.clone()), &found);
+                                Some(found)
+                            });
+                            (id.clone(), root.clone(), resolved)
+                        })
+                        .collect();
                     let q = do_quota.then(crate::obs::quota).flatten();
                     // Claude obs (statusline JSON) + AGY models (from AGY's own transcript,
                     // keyed by our managed id) into the one read-model, so the bar shows
                     // each session's backend-correct model. No third-party cache.
                     let mut loaded = crate::obs::load_all();
-                    loaded.extend(crate::obs::agy_models(&managed_agy));
+                    loaded.extend(crate::obs::agy_models(&model_input, do_agy_usage));
                     (loaded, q)
                 })
                 .await;
@@ -1086,6 +1124,7 @@ impl Workspace {
             run_config_label_input: None,
             run_config_command_input: None,
             run_config_kind: RunKind::Run,
+            add_source: None,
             last_saved_tabs: None,
             restore_done: false,
         };
@@ -1342,6 +1381,99 @@ impl Workspace {
         }
     }
 
+    // ── Add-Data-Source modal (raised by the DB tool's `+`; see `ChromeRequest`) ──────
+
+    /// Open the modal on a fresh Postgres-defaulted form, focusing the first field so the
+    /// keyboard is live immediately (matching the run-config modal).
+    fn open_add_source_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let form = AddSourceForm::new(window, cx);
+        form.host.focus_handle(cx).focus(window, cx);
+        self.add_source = Some(form);
+        cx.notify();
+    }
+
+    pub(crate) fn close_add_source_modal(&mut self, cx: &mut Context<Self>) {
+        self.add_source = None;
+        cx.notify();
+    }
+
+    /// Switch the modal's driver (SQLite ⇄ Postgres); a stale test result is cleared.
+    fn add_source_set_driver(&mut self, driver: Driver, cx: &mut Context<Self>) {
+        if let Some(form) = self.add_source.as_mut() {
+            form.driver = driver;
+            form.test = TestState::Idle;
+        }
+        cx.notify();
+    }
+
+    /// Pick the SQLite file via the native picker and stash it on the form.
+    fn add_source_browse(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(SharedString::from("Choose SQLite Database")),
+        });
+        cx.spawn(async move |weak, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(form) = this.add_source.as_mut() {
+                            form.sqlite_path = Some(path);
+                            form.test = TestState::Idle;
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// "Test Connection": open a throwaway connection off the UI thread and report the version.
+    fn add_source_test(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.add_source.as_ref().and_then(|f| f.current_source(cx)) else {
+            if let Some(form) = self.add_source.as_mut() {
+                form.test = TestState::Err("Fill in the connection details first".into());
+            }
+            cx.notify();
+            return;
+        };
+        if let Some(form) = self.add_source.as_mut() {
+            form.test = TestState::Testing;
+        }
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { db_source::test_connection(&source) })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(form) = this.add_source.as_mut() {
+                    form.test = match result {
+                        Ok(v) => TestState::Ok(v),
+                        Err(e) => TestState::Err(e),
+                    };
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "Save": persist the source into the overview and close the modal.
+    fn add_source_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = self.add_source.as_ref().and_then(|f| f.current_source(cx)) else {
+            if let Some(form) = self.add_source.as_mut() {
+                form.test = TestState::Err("Fill in the connection details first".into());
+            }
+            cx.notify();
+            return;
+        };
+        self.add_source = None;
+        self.add_db_source(source, window, cx);
+    }
+
     /// Apply a tool-window header's hide request (the uniform "✕" — see
     /// [`ChromeRequest`]). Hides are idempotent: a stale ✕ on an already-hidden
     /// tool is a no-op, never a re-open.
@@ -1362,6 +1494,10 @@ impl Workspace {
                 if let Some(dock) = self.dock_area.read(cx).right_dock().cloned() {
                     dock.update(cx, |d, cx| d.set_open(false, window, cx));
                 }
+            }
+            ChromeRequest::OpenAddDataSource => {
+                self.open_add_source_modal(window, cx);
+                return; // open_add_source_modal already notifies
             }
         }
         cx.notify();
@@ -2147,22 +2283,60 @@ impl Workspace {
                     session: id.clone(),
                     adopted: true,
                 });
-                // Take over an observed session: resume it in a terminal (gated to
-                // idle/done inside `new_observed`). Needs the session's repo to root
-                // the terminal; without one, the read-only transcript is shown.
-                match session.attached_path.as_deref().map(expand_home) {
-                    Some(root) => Arc::new(cx.new(|cx| {
-                        SessionMonitor::new_observed(
-                            id,
-                            Some(session),
-                            root,
-                            deps.bus.subscribe(),
-                            cx,
-                        )
-                    })),
-                    None => Arc::new(cx.new(|cx| {
-                        SessionMonitor::new(id, Some(session), deps.bus.subscribe(), cx)
-                    })),
+                // Selecting a session from the fleet grid must resume it the same way
+                // the notification (`SessionById`) and restart-restore paths do — via the
+                // managed store. An **app-launched (managed)** session resumes as a managed
+                // terminal with *its own* backend + conversation; only a genuinely external
+                // session falls back to the observed monitor. Routing every grid click
+                // through `new_observed` (as before) mis-resumed managed sessions: it
+                // hardcoded Claude + no conversation (breaking AGY resume) and gated on
+                // `resumable(status)`, so a managed session left reading `Running` (no
+                // Stop/PTY-exit detection) opened read-only with resume disabled.
+                match deps.store.managed(&id).ok().flatten() {
+                    Some(rec) => {
+                        let root = rec
+                            .root
+                            .map(PathBuf::from)
+                            .or_else(|| session.attached_path.as_deref().map(expand_home))
+                            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                        let mcp = deps.mcp_host.as_ref().and_then(|h| h.url_for(&id));
+                        let command = attach_command(
+                            &id,
+                            rec.agent,
+                            rec.phase,
+                            mcp.as_deref(),
+                            rec.conversation_id.as_deref(),
+                        );
+                        Arc::new(cx.new(|cx| {
+                            SessionMonitor::new_managed(
+                                id,
+                                Some(session),
+                                root,
+                                command,
+                                rec.agent,
+                                rec.phase,
+                                deps.bus.subscribe(),
+                                cx,
+                            )
+                        }))
+                    }
+                    // External / observed session: resume in a terminal (gated to
+                    // idle/done inside `new_observed`). Needs the session's repo to root
+                    // the terminal; without one, the read-only transcript is shown.
+                    None => match session.attached_path.as_deref().map(expand_home) {
+                        Some(root) => Arc::new(cx.new(|cx| {
+                            SessionMonitor::new_observed(
+                                id,
+                                Some(session),
+                                root,
+                                deps.bus.subscribe(),
+                                cx,
+                            )
+                        })),
+                        None => Arc::new(cx.new(|cx| {
+                            SessionMonitor::new(id, Some(session), deps.bus.subscribe(), cx)
+                        })),
+                    },
                 }
             }
             OpenRequest::PlanReview { session, plan, .. } => Arc::new(cx.new(|cx| {
@@ -2206,6 +2380,17 @@ impl Workspace {
                     }),
                 );
                 let root = deps.focus.read(cx).root();
+                // Seed the record at the project's remembered trust tier, so a session
+                // launched under an already-entrusted project is trusted at rest even if
+                // its monitor is never opened (the engine otherwise seeds `Observed`, and
+                // `maybe_apply_project_trust` only re-aligns an *opened* monitor). Defaults
+                // to `Observed` when the project's trust hasn't been decided yet — the
+                // launch prompt then records the answer and `SetTrust`s this session.
+                let trust_tier = deps
+                    .focus
+                    .read(cx)
+                    .project_trust(&root)
+                    .unwrap_or(TrustTier::Observed);
                 // Record managed identity so a restart re-resumes this as a MANAGED
                 // session (embedded terminal), not a read-only observed one.
                 let now = now_ms();
@@ -2217,6 +2402,11 @@ impl Workspace {
                     mode,
                     phase,
                     agent,
+                    // AGY mints its own conversationId only after launch; discovery
+                    // correlates + persists it later (obs poll). Claude's id is its
+                    // conversation, so this stays None there too.
+                    conversation_id: None,
+                    trust_tier,
                     // App-created sessions are auto-adopted: the cockpit launched them,
                     // so they're governed from the first tool call (the engine seeds
                     // `adopted` from this record when detection discovers the session).
@@ -2277,7 +2467,13 @@ impl Workspace {
                             .or(root)
                             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                         let mcp = deps.mcp_host.as_ref().and_then(|h| h.url_for(&id));
-                        let command = attach_command(&id, rec.agent, rec.phase, mcp.as_deref());
+                        let command = attach_command(
+                            &id,
+                            rec.agent,
+                            rec.phase,
+                            mcp.as_deref(),
+                            rec.conversation_id.as_deref(),
+                        );
                         Arc::new(cx.new(|cx| {
                             SessionMonitor::new_managed(
                                 id,
@@ -2386,7 +2582,13 @@ fn build_center_panel(
                         .or_else(|| space_root.clone())
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                     let mcp = deps.mcp_host.as_ref().and_then(|h| h.url_for(&id));
-                    let command = attach_command(&id, rec.agent, rec.phase, mcp.as_deref());
+                    let command = attach_command(
+                        &id,
+                        rec.agent,
+                        rec.phase,
+                        mcp.as_deref(),
+                        rec.conversation_id.as_deref(),
+                    );
                     // Arm the restart auto-resume nudge for a restored managed session whose
                     // project opted in — it fires once the session comes back up stalled.
                     let arm = restoring && deps.focus.read(cx).project_auto_resume(&root);
@@ -2960,6 +3162,7 @@ impl Render for Workspace {
                         time: crate::obs::fmt_dur(o.session_ms),
                         ctx_pct: o.ctx_pct(),
                         persona: blank_dash(&o.persona),
+                        tokens: o.total_tokens,
                     })
                 });
                 (quota, obs)
@@ -3032,6 +3235,13 @@ impl Render for Workspace {
             .child(status_bar::status_bar(status, cx))
             .when(self.show_create_run_config, |d| {
                 if let Some(modal) = self.render_create_run_config_modal(window, cx) {
+                    d.child(modal)
+                } else {
+                    d
+                }
+            })
+            .when(self.add_source.is_some(), |d| {
+                if let Some(modal) = self.render_add_source_modal(window, cx) {
                     d.child(modal)
                 } else {
                     d
@@ -3223,6 +3433,437 @@ impl Workspace {
         Some(backdrop)
     }
 
+    /// The **Add Data Source** modal — driver toggle, connection form, and a Test action.
+    /// Hosted here (not in the narrow right dock) so it centers over the whole window.
+    fn render_add_source_modal(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<impl IntoElement> {
+        let form = self.add_source.as_ref()?;
+        let driver = form.driver;
+
+        // Body differs by driver.
+        let body = match driver {
+            Driver::Sqlite => {
+                let has_file = form.sqlite_path.is_some();
+                let chosen = form
+                    .sqlite_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "No file chosen".to_string());
+                labeled_field(
+                    "Database file",
+                    // A file-picker field: reads as an input, Browse sits flush on the right.
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(0.))
+                        .h(px(30.))
+                        .rounded(theme::radius_sm())
+                        .border_1()
+                        .border_color(theme::border_subtle())
+                        .bg(theme::surface_base())
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .px_2p5()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .font_family(theme::mono_font())
+                                .text_size(theme::text_xs())
+                                .text_color(if has_file {
+                                    theme::text_secondary()
+                                } else {
+                                    theme::text_muted()
+                                })
+                                .child(chosen),
+                        )
+                        .child(
+                            div()
+                                .id("db-add-browse")
+                                .flex_none()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .px_3()
+                                .border_l_1()
+                                .border_color(theme::border_subtle())
+                                .cursor_pointer()
+                                .text_size(theme::text_sm())
+                                .text_color(theme::text_secondary())
+                                .hover(|d| {
+                                    d.bg(theme::row_hover()).text_color(theme::text_primary())
+                                })
+                                .child("Browse…")
+                                .on_click(
+                                    cx.listener(|this, _ev, _w, cx| this.add_source_browse(cx)),
+                                ),
+                        ),
+                )
+                .into_any_element()
+            }
+            Driver::Postgres => div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(labeled_field("Name", Input::new(&form.name)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2p5()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(labeled_field("Host", Input::new(&form.host))),
+                        )
+                        .child(
+                            div()
+                                .w(px(88.))
+                                .flex_none()
+                                .child(labeled_field("Port", Input::new(&form.port))),
+                        ),
+                )
+                .child(labeled_field("Database", Input::new(&form.database)))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2p5()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(labeled_field("User", Input::new(&form.user))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(labeled_field("Password", Input::new(&form.password))),
+                        ),
+                )
+                // The URL row is set off by a hairline — it's the "or paste a DSN" alternative.
+                .child(
+                    div()
+                        .mt_1()
+                        .pt_3()
+                        .border_t_1()
+                        .border_color(theme::border_subtle())
+                        .flex()
+                        .flex_col()
+                        .gap_1p5()
+                        .child(field_label("Connection URL"))
+                        .child(Input::new(&form.url))
+                        .child(
+                            div()
+                                .text_size(theme::text_2xs())
+                                .text_color(theme::text_muted())
+                                .child("Overrides the fields above when set"),
+                        ),
+                )
+                .into_any_element(),
+        };
+
+        // The test result rendered as a status chip (icon + colour keyed to the outcome).
+        let test_chip = match &form.test {
+            TestState::Idle => None,
+            TestState::Testing => {
+                Some(("◌", "Testing connection…".to_string(), theme::text_muted()))
+            }
+            TestState::Ok(v) => Some((
+                "✓",
+                format!("Connected — {v}"),
+                theme::status_color(SessionStatus::Done),
+            )),
+            TestState::Err(e) => Some(("✕", e.clone(), theme::git_deleted())),
+        };
+
+        let backdrop = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            // Capture events at the backdrop so nothing behind the modal reacts, and clicking
+            // the dimmed area closes it (like a standard modal).
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _w, cx| this.close_add_source_modal(cx)),
+            )
+            .bg(theme::tint(theme::surface_void(), 0.7))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(480.))
+                    // Clicks inside the card must not bubble to the backdrop's close handler.
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .p_5()
+                    .rounded(theme::radius_lg())
+                    .bg(theme::surface_overlay())
+                    .border_1()
+                    .border_color(theme::border_strong())
+                    .shadow(theme::overlay_shadow())
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    // Header: icon badge + title/subtitle, close on the right.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_start()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .size(px(30.))
+                                            .rounded(theme::radius_sm())
+                                            .bg(theme::tint(theme::accent(), 0.16))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_size(theme::text_lg())
+                                            .text_color(theme::accent())
+                                            .child("⛁"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(1.))
+                                            .child(
+                                                div()
+                                                    .text_size(theme::text_lg())
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(theme::text_primary())
+                                                    .child("Add Data Source"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(theme::text_xs())
+                                                    .text_color(theme::text_muted())
+                                                    .child(
+                                                        "Connect a SQLite file or Postgres server",
+                                                    ),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("db-add-close")
+                                    .flex_none()
+                                    .size(px(22.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(theme::radius_sm())
+                                    .cursor_pointer()
+                                    .text_size(theme::text_sm())
+                                    .text_color(theme::text_muted())
+                                    .hover(|d| {
+                                        d.bg(theme::row_hover()).text_color(theme::text_primary())
+                                    })
+                                    .child("✕")
+                                    .on_click(cx.listener(|this, _ev, _w, cx| {
+                                        this.close_add_source_modal(cx)
+                                    })),
+                            ),
+                    )
+                    // Driver toggle — a segmented control.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(3.))
+                            .p(px(3.))
+                            .rounded(theme::radius_sm())
+                            .bg(theme::surface_base())
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .child(self.render_driver_seg(
+                                Driver::Postgres,
+                                "Postgres",
+                                theme::accent(),
+                                driver == Driver::Postgres,
+                                cx,
+                            ))
+                            .child(self.render_driver_seg(
+                                Driver::Sqlite,
+                                "SQLite",
+                                theme::status_color(SessionStatus::Done),
+                                driver == Driver::Sqlite,
+                                cx,
+                            )),
+                    )
+                    .child(body)
+                    .when_some(test_chip, |d, (icon, msg, color)| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1p5()
+                                .px_2p5()
+                                .py_1p5()
+                                .rounded(theme::radius_sm())
+                                .bg(theme::tint(color, 0.12))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(theme::text_xs())
+                                        .text_color(color)
+                                        .child(icon),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_size(theme::text_xs())
+                                        .text_color(color)
+                                        .child(msg),
+                                ),
+                        )
+                    })
+                    // Footer: Test (left) · Cancel / Save (right), set off by a hairline.
+                    .child(
+                        div()
+                            .mt_1()
+                            .pt_4()
+                            .border_t_1()
+                            .border_color(theme::border_subtle())
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .id("db-add-test")
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded(theme::radius_sm())
+                                    .border_1()
+                                    .border_color(theme::border_subtle())
+                                    .text_size(theme::text_sm())
+                                    .text_color(theme::text_secondary())
+                                    .hover(|d| {
+                                        d.bg(theme::tint(theme::accent(), 0.12))
+                                            .border_color(theme::accent())
+                                            .text_color(theme::accent())
+                                    })
+                                    .child("Test Connection")
+                                    .on_click(
+                                        cx.listener(|this, _ev, _w, cx| this.add_source_test(cx)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("db-add-cancel")
+                                            .cursor_pointer()
+                                            .px_3()
+                                            .py_1p5()
+                                            .rounded(theme::radius_sm())
+                                            .text_size(theme::text_sm())
+                                            .text_color(theme::text_secondary())
+                                            .hover(|d| d.bg(theme::row_hover()))
+                                            .child("Cancel")
+                                            .on_click(cx.listener(|this, _ev, _w, cx| {
+                                                this.close_add_source_modal(cx)
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("db-add-save")
+                                            .cursor_pointer()
+                                            .px_4()
+                                            .py_1p5()
+                                            .rounded(theme::radius_sm())
+                                            .bg(theme::accent())
+                                            .shadow(theme::glow(theme::tint(theme::accent(), 0.5)))
+                                            .hover(|d| d.bg(theme::accent_hover()))
+                                            .text_size(theme::text_sm())
+                                            .text_color(theme::on_accent())
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Save")
+                                            .on_click(cx.listener(|this, _ev, w, cx| {
+                                                this.add_source_save(w, cx)
+                                            })),
+                                    ),
+                            ),
+                    ),
+            );
+
+        Some(backdrop)
+    }
+
+    /// One segment of the driver toggle: a coloured dot + label. Active reads as a lifted
+    /// pill; inactive is a quiet, hoverable label.
+    fn render_driver_seg(
+        &self,
+        driver: Driver,
+        label: &'static str,
+        dot: Hsla,
+        active: bool,
+        cx: &mut Context<Workspace>,
+    ) -> impl IntoElement {
+        div()
+            .id(SharedString::from(format!("db-driver-{label}")))
+            .flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap_1p5()
+            .py_1p5()
+            .rounded(px(3.))
+            .when(active, |d| d.bg(theme::surface_overlay()))
+            .text_size(theme::text_sm())
+            .font_weight(if active {
+                FontWeight::SEMIBOLD
+            } else {
+                FontWeight::MEDIUM
+            })
+            .text_color(if active {
+                theme::text_primary()
+            } else {
+                theme::text_muted()
+            })
+            .cursor_pointer()
+            .hover(|d| {
+                if !active {
+                    d.text_color(theme::text_secondary())
+                } else {
+                    d
+                }
+            })
+            .child(div().flex_none().size(px(6.)).rounded_full().bg(if active {
+                dot
+            } else {
+                theme::tint(dot, 0.5)
+            }))
+            .child(label)
+            .on_click(cx.listener(move |this, _ev, _w, cx| this.add_source_set_driver(driver, cx)))
+    }
+
     fn render_kind_btn(
         &self,
         kind: RunKind,
@@ -3267,4 +3908,23 @@ impl Workspace {
             }))
             .child(label)
     }
+}
+
+/// A small field caption above a modal input.
+fn field_label(text: &'static str) -> impl IntoElement {
+    div()
+        .text_size(theme::text_xs())
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::text_secondary())
+        .child(text)
+}
+
+/// A labelled input row (caption over the field) for the Add-Data-Source modal.
+fn labeled_field(label: &'static str, input: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(field_label(label))
+        .child(input)
 }

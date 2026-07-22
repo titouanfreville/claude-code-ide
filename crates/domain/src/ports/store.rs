@@ -59,6 +59,19 @@ pub struct ManagedSession {
     /// relaunches the same backend. Defaults to [`AgentKind::ClaudeCode`] for records
     /// written before backend selection existed (the migration backfills them).
     pub agent: AgentKind,
+    /// The backend's own conversation id, when it differs from [`id`](Self::id).
+    /// Claude pins our chosen id (`--session-id`), so its conversation *is* `id` and
+    /// this stays `None`. Antigravity has no such flag — it mints its own
+    /// `conversationId` after launch — so we discover it (root + launch-time
+    /// correlation) and persist it here. That makes a restart resume the right AGY
+    /// conversation (`agy --conversation <cid>`) and lets per-session data (model /
+    /// usage) key exactly instead of guessing by root. `None` until observed.
+    pub conversation_id: Option<String>,
+    /// The operator's trust tier for this session, persisted so a manual "trust this
+    /// session" (or a project-trust default seeded at launch) survives restart/reset
+    /// instead of reseeding to the default-deny [`TrustTier::Observed`]. Backfilled to
+    /// `Observed` for records written before trust was persisted.
+    pub trust_tier: TrustTier,
     pub adopted: bool,
     pub paused: bool,
     /// Whether the operator pinned the phase (manual override of auto-advance).
@@ -77,9 +90,9 @@ impl ManagedSession {
     /// single source of truth for fleet rehydration (the engine supervisor on boot
     /// and the UI grid's pull-seed both use it, so they can't drift). Restored **at
     /// rest**: status [`SessionStatus::Idle`] (detection promotes it to `Running` if
-    /// the session is actually live) and the default-deny [`TrustTier::Observed`]
-    /// (trust isn't persisted). The operator-set fields — phase, mode, adopted,
-    /// paused, the phase pin, root, last-seen — come straight from the record.
+    /// the session is actually live). The operator-set fields — phase, mode, trust
+    /// tier, adopted, paused, the phase pin, root, last-seen — come straight from the
+    /// record.
     pub fn to_session(&self) -> Session {
         Session {
             id: self.id.clone(),
@@ -87,7 +100,7 @@ impl ManagedSession {
             status: SessionStatus::Idle,
             phase: self.phase,
             mode: self.mode,
-            trust_tier: TrustTier::Observed,
+            trust_tier: self.trust_tier,
             attached_path: self.root.clone(),
             pinned: false,
             adopted: self.adopted,
@@ -109,6 +122,8 @@ pub struct ManagedStateUpdate {
     pub title: Option<String>,
     pub phase: Phase,
     pub mode: Mode,
+    /// Operator trust tier (see [`ManagedSession::trust_tier`]).
+    pub trust_tier: TrustTier,
     pub adopted: bool,
     pub paused: bool,
     pub phase_pinned: bool,
@@ -128,6 +143,14 @@ pub trait ManagedSessionStore: Send + Sync {
     /// Refresh the mutable state of an *existing* managed row. Returns whether a row
     /// was updated (`false` ⇒ the session is not managed, so nothing was written).
     fn update_managed_state(&self, update: &ManagedStateUpdate) -> Result<bool, StoreError>;
+    /// Persist the backend's discovered conversation id on an *existing* managed row
+    /// (Antigravity correlation — see [`ManagedSession::conversation_id`]). UPDATE-only:
+    /// returns whether a row was touched (`false` ⇒ the session is not managed).
+    fn set_conversation_id(
+        &self,
+        id: &SessionId,
+        conversation_id: &str,
+    ) -> Result<bool, StoreError>;
     /// Fetch the managed record for `id`, if the session is managed.
     fn managed(&self, id: &SessionId) -> Result<Option<ManagedSession>, StoreError>;
     /// All managed sessions, oldest first (`created_at`).

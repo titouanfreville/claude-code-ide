@@ -29,9 +29,7 @@ pub fn classify(tool_name: &str, tool_input: &Value) -> DangerClass {
         // until that's confirmed.)
         "Read" | "Grep" | "Glob" | "LS" | "NotebookRead" | "TodoWrite" | "Task" | "WebSearch"
         | "WebFetch" | "ExitPlanMode" | "BashOutput" | "SlashCommand" | "AskUserQuestion"
-        | "Agent" | "Skill" | "ToolSearch" | "SendMessage" | "ScheduleWakeup" => {
-            DangerClass::Safe
-        }
+        | "Agent" | "Skill" | "ToolSearch" | "SendMessage" | "ScheduleWakeup" => DangerClass::Safe,
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => DangerClass::Risky,
         // MoonlightCode's own actor verbs (`mcp__moonlight__*`) are independently
         // policy-gated + audited by the embedded MCP server and its PDP. Several are

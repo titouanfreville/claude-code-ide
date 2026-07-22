@@ -270,7 +270,8 @@ impl SessionMonitor {
                 .map(|s| s.phase)
                 .unwrap_or_else(Phase::on_done);
             let mcp = crate::views::mcp_host::url_for_session(&id, cx);
-            let command = attach_command(&id, AgentKind::ClaudeCode, phase, mcp.as_deref());
+            // Observed sessions are external Claude — no AGY conversation to resume.
+            let command = attach_command(&id, AgentKind::ClaudeCode, phase, mcp.as_deref(), None);
             cx.new(|cx| TerminalPanel::new_running_in(root.clone(), &command, cx).embedded())
         });
         // Observed sessions are external `claude` — see [`new`].
@@ -457,6 +458,23 @@ impl SessionMonitor {
         }
     }
 
+    /// The persisted Antigravity `conversationId` for this session, read **fresh** from
+    /// the managed store each call (so a conversation correlated after launch is picked
+    /// up on the next relaunch). `None` for Claude (its managed id *is* its conversation)
+    /// and for an AGY session whose conversation hasn't been discovered yet. Feeds
+    /// [`attach_command`]'s AGY resume target.
+    fn agy_conversation(&self, cx: &Context<Self>) -> Option<String> {
+        if self.agent != AgentKind::Antigravity {
+            return None;
+        }
+        cx.try_global::<ShellDeps>()?
+            .store
+            .managed(&self.id)
+            .ok()
+            .flatten()?
+            .conversation_id
+    }
+
     /// Take over an observed session in a terminal (`claude --resume <id>`), if it
     /// is currently idle/done and has a known repo. No-op otherwise.
     fn try_resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -472,7 +490,14 @@ impl SessionMonitor {
             .map(|s| s.phase)
             .unwrap_or_else(Phase::on_done);
         let mcp = crate::views::mcp_host::url_for_session(&self.id, cx);
-        let command = attach_command(&self.id, self.agent, phase, mcp.as_deref());
+        let agy_cid = self.agy_conversation(cx);
+        let command = attach_command(
+            &self.id,
+            self.agent,
+            phase,
+            mcp.as_deref(),
+            agy_cid.as_deref(),
+        );
         let terminal = cx.new(|cx| TerminalPanel::new_running_in(root, &command, cx).embedded());
         if let Some(io) = cx.try_global::<ShellDeps>().map(|d| d.session_io.clone()) {
             io.register(self.id.clone(), terminal.downgrade());
@@ -567,17 +592,33 @@ impl SessionMonitor {
         let Some(current) = self.session.as_ref().map(|s| s.trust_tier) else {
             return; // no row yet — try again on the next upsert
         };
-        // We have a row: this is our one shot to align trust (mark done either way).
-        self.applied_project_trust = true;
         let Some(deps) = cx.try_global::<ShellDeps>().cloned() else {
             return;
         };
+        // A managed session carries its own persisted trust — seeded at launch from the
+        // project default, then possibly overridden by the operator's Trust selector — and
+        // the engine restores it on discovery/hydrate. That per-session value is
+        // authoritative: never re-impose the project default on it, or a session-scoped
+        // override would be clobbered every time its monitor reopens. Only discovered /
+        // observed sessions (no managed record) inherit the project default live here.
+        if deps.store.managed(&self.id).ok().flatten().is_some() {
+            self.applied_project_trust = true;
+            return;
+        }
         let Some(root) = self.space_root() else {
             return;
         };
         let Some(tier) = deps.focus.read(cx).project_trust(&root) else {
-            return; // project trust not decided yet — the launch prompt will SetTrust
+            // Project trust isn't decided yet — do NOT mark applied, so a session opened
+            // *before* the operator entrusts the project still picks the decision up on a
+            // later event (rather than being stuck at `Observed` for its whole lifetime).
+            // The launch prompt also `SetTrust`s the launching session directly.
+            return;
         };
+        // We have a decision: align this session to it, exactly once. Marking applied
+        // only now means a manual Trust-selector change (which sets this flag itself) and
+        // a restored per-session tier are never clobbered by a later project default.
+        self.applied_project_trust = true;
         if current != tier {
             let _ = deps.commands.send(Command::SetTrust {
                 session: self.id.clone(),
@@ -698,7 +739,14 @@ impl SessionMonitor {
             .map(|s| s.phase)
             .unwrap_or_else(Phase::on_done);
         let mcp = crate::views::mcp_host::url_for_session(&self.id, cx);
-        let command = attach_command(&self.id, self.agent, phase, mcp.as_deref());
+        let agy_cid = self.agy_conversation(cx);
+        let command = attach_command(
+            &self.id,
+            self.agent,
+            phase,
+            mcp.as_deref(),
+            agy_cid.as_deref(),
+        );
         let terminal = cx.new(|cx| TerminalPanel::new_running_in(root, &command, cx).embedded());
         deps.session_io
             .register(self.id.clone(), terminal.downgrade());
@@ -921,15 +969,31 @@ pub fn attach_command(
     agent: AgentKind,
     phase: Phase,
     mcp_url: Option<&str>,
+    agy_conversation: Option<&str>,
 ) -> String {
     use crate::agent_backend::{backend_for, LaunchSpec, SessionSelector};
-    // Resume the existing conversation when a transcript exists; otherwise start fresh
-    // pinned to the same id (see the ghost-session note above). Backend-agnostic: the
-    // command shape is the backend's job (ClaudeCode is byte-identical to before).
-    let (selector, permission_mode) = if crate::transcript::transcript_path(id.as_str()).is_some() {
-        (SessionSelector::Resume(id), None)
-    } else {
-        (SessionSelector::Fresh(id), Some(phase.cc_permission_mode()))
+    // Resume the existing conversation when one is known; otherwise start fresh
+    // (see the ghost-session note above). Backend-agnostic: the command shape is the
+    // backend's job (ClaudeCode is byte-identical to before).
+    //
+    // The resume *target* differs by backend. Claude pins our managed id, so its
+    // conversation IS `id` — resume when a transcript for it exists. Antigravity has no
+    // `--session-id`; it mints its own `conversationId` (discovered + persisted post-
+    // launch, passed in as `agy_conversation`) — resume *that*, and only when it's known;
+    // otherwise launch fresh and let discovery correlate the new conversation.
+    let agy_cid = agy_conversation.map(SessionId::new);
+    let (selector, permission_mode) = match agent {
+        AgentKind::Antigravity => match &agy_cid {
+            Some(cid) => (SessionSelector::Resume(cid), None),
+            None => (SessionSelector::Fresh(id), Some(phase.cc_permission_mode())),
+        },
+        AgentKind::ClaudeCode => {
+            if crate::transcript::transcript_path(id.as_str()).is_some() {
+                (SessionSelector::Resume(id), None)
+            } else {
+                (SessionSelector::Fresh(id), Some(phase.cc_permission_mode()))
+            }
+        }
     };
     let backend = backend_for(agent);
     // Backend-specific pre-launch side effects (AGY writes its mcp_config; Claude no-op).
@@ -2342,13 +2406,20 @@ impl SessionMonitor {
                 session: self.id.clone(),
                 tier,
             });
-            // Persist the operator's choice as this project's remembered trust, so new
-            // sessions and restarts come up at this tier (and we don't re-prompt). The
-            // alignment is already done for this session, so block the one-shot re-apply.
+            // The alignment is already done for this session, so block the one-shot re-apply.
             self.applied_project_trust = true;
+            // Trust scope: the *project* default is only established once. When no global
+            // trust exists yet, this first pick sets it (so later sessions and restarts
+            // inherit it and we don't re-prompt). But when a global already exists, a
+            // per-session change is a **session-scoped override** — it must NOT rewrite the
+            // project default (that would flip every other session under this root). The
+            // override persists on its own via the engine's per-session trust store.
             if let Some(root) = self.space_root() {
-                deps.focus
-                    .update(cx, |ps, _cx| ps.set_project_trust(&root, tier));
+                let has_global = deps.focus.read(cx).project_trust(&root).is_some();
+                if !has_global {
+                    deps.focus
+                        .update(cx, |ps, _cx| ps.set_project_trust(&root, tier));
+                }
             }
         }
         cx.notify();
@@ -2370,12 +2441,21 @@ impl SessionMonitor {
             return;
         };
         let mcp = crate::views::mcp_host::url_for_session(&self.id, cx);
+        // Resume the right conversation: Claude's is our managed id; AGY's is its own
+        // discovered `conversationId`. If AGY hasn't been correlated yet there's nothing
+        // safe to resume (a bare managed id isn't a valid `--conversation`), so skip the
+        // relaunch and leave the live TUI running — phase is enforced by the hook anyway.
+        let agy_cid = self.agy_conversation(cx).map(SessionId::new);
+        if self.agent == AgentKind::Antigravity && agy_cid.is_none() {
+            return;
+        }
+        let resume_id = agy_cid.as_ref().unwrap_or(&self.id);
         let backend = crate::agent_backend::backend_for(self.agent);
         backend.prepare_launch(mcp.as_deref());
         let command = crate::agent_backend::wrap_statusline(
             self.agent,
             backend.launch_command(&crate::agent_backend::LaunchSpec {
-                selector: crate::agent_backend::SessionSelector::Resume(&self.id),
+                selector: crate::agent_backend::SessionSelector::Resume(resume_id),
                 permission_mode: Some(native_mode),
                 mcp_url: mcp.as_deref(),
             }),
@@ -2659,9 +2739,15 @@ mod tests {
 
     #[test]
     fn server_glob_covers_the_whole_server() {
-        assert_eq!(server_glob("mcp__phoenix__run_select_query"), "mcp__phoenix__*");
+        assert_eq!(
+            server_glob("mcp__phoenix__run_select_query"),
+            "mcp__phoenix__*"
+        );
         // A tool with extra `__` in its leaf still globs at the server boundary.
-        assert_eq!(server_glob("mcp__phoenix__open_snowflake_request"), "mcp__phoenix__*");
+        assert_eq!(
+            server_glob("mcp__phoenix__open_snowflake_request"),
+            "mcp__phoenix__*"
+        );
         // A non-MCP-shaped name falls back to itself (never an over-broad glob).
         assert_eq!(server_glob("weird"), "weird");
         assert_eq!(server_glob("mcp__only"), "mcp__only");

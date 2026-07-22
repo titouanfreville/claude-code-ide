@@ -63,6 +63,9 @@ pub fn normalize(payload: &Value) -> HookRequest {
 fn map_tool(agy_name: &str, args: &Value) -> (String, Value) {
     let file_path = args
         .get("filePath")
+        .or_else(|| args.get("TargetFile"))
+        .or_else(|| args.get("AbsolutePath"))
+        .or_else(|| args.get("DirectoryPath"))
         .and_then(Value::as_str)
         .unwrap_or_default();
     match agy_name {
@@ -76,8 +79,10 @@ fn map_tool(agy_name: &str, args: &Value) -> (String, Value) {
         }
         // Project-mutating tools → Claude write vocabulary, so the phase write-freeze
         // (`paths.rs::scope_of` on `file_path`) applies identically to AGY.
-        "write_file" | "create_file" => ("Write".into(), json!({ "file_path": file_path })),
-        "edit_file" | "replace_file_content" | "propose_code" => {
+        "write_file" | "create_file" | "write_to_file" => {
+            ("Write".into(), json!({ "file_path": file_path }))
+        }
+        "edit_file" | "replace_file_content" | "multi_replace_file_content" | "propose_code" => {
             ("Edit".into(), json!({ "file_path": file_path }))
         }
         // Read-only tools — Safe in every phase.
@@ -130,16 +135,18 @@ mod tests {
     fn write_and_edit_tools_map_to_claude_write_vocab() {
         // These must become Write/Edit so the phase write-freeze (scope_of on file_path)
         // fires for AGY exactly as for Claude.
-        for (agy, claude) in [
-            ("write_file", "Write"),
-            ("create_file", "Write"),
-            ("edit_file", "Edit"),
-            ("replace_file_content", "Edit"),
-            ("propose_code", "Edit"),
+        for (agy, claude, key) in [
+            ("write_file", "Write", "filePath"),
+            ("create_file", "Write", "filePath"),
+            ("write_to_file", "Write", "TargetFile"),
+            ("edit_file", "Edit", "filePath"),
+            ("replace_file_content", "Edit", "filePath"),
+            ("multi_replace_file_content", "Edit", "TargetFile"),
+            ("propose_code", "Edit", "filePath"),
         ] {
             let payload = json!({
                 "conversationId": "c",
-                "toolCall": { "name": agy, "args": { "filePath": "/repo/src/lib.rs" } },
+                "toolCall": { "name": agy, "args": { key: "/repo/src/lib.rs" } },
             });
             let req = normalize(&payload);
             assert_eq!(req.tool_name, claude, "{agy} → {claude}");

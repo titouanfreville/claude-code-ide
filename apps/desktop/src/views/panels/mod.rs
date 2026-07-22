@@ -22,6 +22,7 @@ pub mod activity_rail;
 pub mod code_editor;
 pub mod code_review;
 pub mod commit;
+pub mod db_add_source;
 pub mod db_console;
 pub mod db_grid;
 pub mod db_observer;
