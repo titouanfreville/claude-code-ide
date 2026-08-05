@@ -130,7 +130,7 @@ mod tests {
     fn sess(id: &str, phase: Phase) -> SpaceSession {
         SpaceSession {
             id: SessionId::new(id),
-            mode: Mode::Plan,
+            mode: Mode::Auto,
             phase,
             label: None,
         }

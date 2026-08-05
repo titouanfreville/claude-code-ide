@@ -352,6 +352,17 @@ impl HttpPanel {
             .collect();
 
         let mut manifest = Self::manifest(cx);
+        // This editor doesn't surface the gRPC `.proto` fields, and the insert below
+        // replaces the whole entry — so carry them across. Without this, editing an
+        // environment from the HTTP tab would silently wipe the gRPC tool's schema
+        // configuration. Read before the rename-remove, so a rename keeps them too.
+        let carried = self
+            .env_editing
+            .as_ref()
+            .and_then(|old| manifest.environments.get(old))
+            .or_else(|| manifest.environments.get(&name))
+            .cloned()
+            .unwrap_or_default();
         if let Some(old) = &self.env_editing {
             if old != &name {
                 manifest.environments.remove(old);
@@ -362,6 +373,8 @@ impl HttpPanel {
             http::HttpEnv {
                 vars,
                 allowed_hosts,
+                proto_files: carried.proto_files,
+                proto_includes: carried.proto_includes,
             },
         );
         manifest.active = name.clone();

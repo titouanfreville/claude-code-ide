@@ -45,6 +45,14 @@ serde.workspace = true
 serde_json.workspace = true
 # Blocking HTTP client behind the `http_request` MCP verb (run via spawn_blocking).
 ureq.workspace = true
+# gRPC request builder (center tab): tonic for the HTTP/2 transport, prost-reflect for
+# messages built from descriptors at runtime, protox for the .proto fallback when a
+# server has reflection turned off. See `src/grpc.rs`.
+tonic.workspace = true
+prost.workspace = true
+prost-reflect.workspace = true
+protox.workspace = true
+tokio-stream.workspace = true
 # SQLite + Postgres drivers for the DB-observer panel (read-only browse). Postgres
 # queries run on the background executor (blocking driver), like SQLite.
 rusqlite.workspace = true

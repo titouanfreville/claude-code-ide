@@ -98,6 +98,10 @@ impl HttpHistory {
 }
 
 /// One named environment in the manifest: its variables + the hosts it may reach.
+///
+/// Shared by the HTTP **and** gRPC tools — one place for `base_url` / tokens / the host
+/// scope, so widening access is a single deliberate edit rather than two. The gRPC-only
+/// fields are inert for HTTP.
 #[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpEnv {
     #[serde(default)]
@@ -106,6 +110,14 @@ pub struct HttpEnv {
     /// only (the safe default).
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// **gRPC:** `.proto` files to compile when a server has reflection disabled. Empty
+    /// (the default) means the gRPC tool relies on server reflection alone.
+    #[serde(default)]
+    pub proto_files: Vec<String>,
+    /// **gRPC:** import roots for `proto_files`. Empty defaults to each file's own
+    /// directory, so a single self-contained `.proto` needs no configuration.
+    #[serde(default)]
+    pub proto_includes: Vec<String>,
 }
 
 /// `.moonlight/http/environments.json`: the active environment name + the set.
@@ -518,7 +530,7 @@ mod tests {
             "local".to_string(),
             HttpEnv {
                 vars: vars(&[("base", "http://localhost")]),
-                allowed_hosts: vec![],
+                ..Default::default()
             },
         );
         let m = HttpManifest {

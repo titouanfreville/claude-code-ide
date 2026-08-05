@@ -43,4 +43,10 @@ pub enum FeedbackOrigin {
     /// Free-form operator redirection mid-flight (the `Steer` command). Not tied
     /// to a rejected hunk or a denied gate — the operator is nudging direction.
     OperatorSteer,
+    /// The aim of a phase the session just entered — today only
+    /// [`PLAN_AIM`](crate::phase::PLAN_AIM), told to a session moving into
+    /// `Phase::Plan`. Every phase runs CC in `auto`, so this text is what makes the
+    /// agent plan; the launch-time system prompt covers a fresh session, this covers
+    /// one that enters Plan mid-conversation.
+    PhaseAim,
 }

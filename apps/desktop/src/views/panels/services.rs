@@ -89,6 +89,7 @@ const IC_IMAGE: Ico = Ico::Svg("icons/docker.svg");
 const IC_NETWORK: Ico = Ico::Svg("icons/network.svg");
 const IC_VOLUME: Ico = Ico::Svg("icons/hard-drive.svg");
 const IC_HTTP: Ico = Ico::Glyph("⇅");
+const IC_GRPC: Ico = Ico::Glyph("⇄");
 
 /// One audit row, pre-classified for the verb-call log (kept timestamp-raw so the
 /// snapshot only changes when real rows do — relative "ago" is computed at render).
@@ -136,6 +137,10 @@ struct Snapshot {
     http_total: usize,
     /// The most recent HTTP calls (newest first) for the compact summary.
     http_calls: Vec<crate::http::HttpCall>,
+    /// Total recorded gRPC calls.
+    grpc_total: usize,
+    /// The most recent gRPC calls (newest first) for the compact summary.
+    grpc_calls: Vec<crate::grpc::GrpcCall>,
 }
 
 /// Which resource the detail pane is inspecting. Identifiers are stable across polls
@@ -151,6 +156,7 @@ enum Selection {
     DockerNetwork(String),
     DockerVolume(String),
     Http,
+    Grpc,
 }
 
 /// The active tab of the Docker container inspector.
@@ -495,6 +501,9 @@ fn build_snapshot(socket: &Path, cx: &gpui::App) -> Snapshot {
     let (http_total, http_calls) = deps
         .map(|d| (d.http_history.len(), d.http_history.recent(8)))
         .unwrap_or((0, Vec::new()));
+    let (grpc_total, grpc_calls) = deps
+        .map(|d| (d.grpc_history.len(), d.grpc_history.recent(8)))
+        .unwrap_or((0, Vec::new()));
 
     Snapshot {
         socket_ok: probe_socket(socket),
@@ -503,6 +512,8 @@ fn build_snapshot(socket: &Path, cx: &gpui::App) -> Snapshot {
         http_env,
         http_total,
         http_calls,
+        grpc_total,
+        grpc_calls,
     }
 }
 
@@ -1173,6 +1184,27 @@ impl ServicesPanel {
         ))
     }
 
+    /// gRPC — a top-level selectable leaf, beside HTTP (its detail holds the call
+    /// history and the way into the request builder).
+    fn grpc_leaf(&self, snap: &Snapshot, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = snap.grpc_total;
+        nav_leaf(
+            "svc-nav-grpc".into(),
+            0,
+            true,
+            self.selected == Selection::Grpc,
+            IC_GRPC,
+            theme::accent(),
+            cx.listener(|this, _e, _w, cx| this.select(Selection::Grpc, cx)),
+        )
+        .child(group_label("gRPC"))
+        .child(div().flex_1())
+        .child(chip(
+            format!("{count} call{}", if count == 1 { "" } else { "s" }),
+            theme::text_muted(),
+        ))
+    }
+
     // ── Detail pane (the inspector for the selected resource) ──────────────────
 
     fn detail_pane(&self, snap: &Snapshot, now: i64, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1215,6 +1247,7 @@ impl ServicesPanel {
                 }
             }
             Selection::Http => scroll_detail("svc-d-http", self.detail_http(snap, now, cx)),
+            Selection::Grpc => scroll_detail("svc-d-grpc", self.detail_grpc(snap, now, cx)),
         };
         div()
             .id("svc-detail")
@@ -1753,6 +1786,65 @@ impl ServicesPanel {
         )
     }
 
+    fn detail_grpc(&self, snap: &Snapshot, now: i64, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = snap.grpc_total;
+
+        let open_btn = div()
+            .id("svc-grpc-open")
+            .flex_none()
+            .self_start()
+            .px(px(8.))
+            .py(px(3.))
+            .rounded(theme::radius_sm())
+            .border_1()
+            .border_color(theme::tint(theme::accent(), 0.5))
+            .text_size(theme::text_xs())
+            .text_color(theme::accent())
+            .cursor_pointer()
+            .hover(|d| {
+                d.bg(theme::tint(theme::accent(), 0.16))
+                    .text_color(theme::text_primary())
+            })
+            .on_click(cx.listener(|_this, _ev, _w, cx| {
+                if let Some(deps) = cx.try_global::<ShellDeps>() {
+                    let center = deps.center.clone();
+                    center.update(cx, |_, cx| cx.emit(OpenRequest::Grpc));
+                }
+            }))
+            .child("↗ open the gRPC builder");
+
+        let mut calls = div().flex().flex_col().child(detail_sub("Recent calls"));
+        if snap.grpc_calls.is_empty() {
+            calls = calls.child(hint_row(
+                0,
+                "no calls yet — connect to a server in the gRPC builder",
+            ));
+        } else {
+            calls = calls.children(snap.grpc_calls.iter().map(|c| grpc_row(c, now)));
+        }
+
+        detail_body(
+            detail_head(
+                IC_GRPC,
+                theme::accent(),
+                count > 0,
+                "gRPC".into(),
+                Some("gRPC call history for the active space.".into()),
+                format!("{count} call{}", if count == 1 { "" } else { "s" }),
+            ),
+            div()
+                .flex()
+                .flex_col()
+                .child(field_text(
+                    "total",
+                    format!("{count}"),
+                    theme::text_secondary(),
+                ))
+                .child(div().pt_1().child(open_btn))
+                .child(calls),
+        )
+    }
+
     fn detail_http(&self, snap: &Snapshot, now: i64, cx: &mut Context<Self>) -> impl IntoElement {
         let env = snap.http_env.clone().unwrap_or_else(|| "local only".into());
         let count = snap.http_total;
@@ -1876,7 +1968,8 @@ impl Render for ServicesPanel {
                             .child(self.control_leaf(snap.socket_ok, cx))
                             .child(self.mcp_group(cx))
                             .child(self.docker_group(cx))
-                            .child(self.http_leaf(&snap, cx)),
+                            .child(self.http_leaf(&snap, cx))
+                            .child(self.grpc_leaf(&snap, cx)),
                     )
                     .child(self.detail_pane(&snap, now, cx)),
             )
@@ -2320,6 +2413,52 @@ fn http_row(c: &crate::http::HttpCall, now: i64) -> impl IntoElement {
                 .flex_none()
                 .w(px(34.))
                 .text_size(theme::text_xs())
+                .text_color(ok_color)
+                .child(status_text),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(theme::text_2xs())
+                .text_color(theme::text_muted())
+                .child(format!("{}ms", c.ms)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(theme::text_2xs())
+                .text_color(theme::text_muted())
+                .child(rel_ago(now, c.at_millis)),
+        )
+}
+
+/// One gRPC call in the summary. Shows the status **code name** rather than a number:
+/// `NOT_FOUND` carries the meaning that `5` does not.
+fn grpc_row(c: &crate::grpc::GrpcCall, now: i64) -> impl IntoElement {
+    let ok_color = if c.ok {
+        theme::status_color(SessionStatus::Done)
+    } else {
+        theme::status_color(SessionStatus::Errored)
+    };
+    let status_text = match (&c.code, &c.error) {
+        (Some(code), _) => code.clone(),
+        (None, Some(_)) => "ERR".to_string(),
+        (None, None) => "—".to_string(),
+    };
+    row(0)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .font_family(theme::mono_font())
+                .text_size(theme::text_xs())
+                .text_color(theme::text_secondary())
+                .child(clip(&format!("{} {}", c.target, c.method), 60)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_size(theme::text_2xs())
                 .text_color(ok_color)
                 .child(status_text),
         )

@@ -14,7 +14,7 @@ pub fn classify(tool_name: &str, tool_input: &Value) -> DangerClass {
         // Read, planning, interaction, and meta tools — never writes. `ExitPlanMode`
         // is how CC presents/exits a plan; gating it would trap a plan-mode session.
         // `AskUserQuestion` only asks the operator to clarify (a read of the human,
-        // not a repo write) — denying it traps a Discovery/Plan session whose whole
+        // not a repo write) — denying it traps a Plan-phase session whose whole
         // job is to gather info and ask. `Agent`/`Skill`/`ToolSearch` are this
         // harness's names for `Task`/`SlashCommand`/(tool-schema loading): a launched
         // subagent or slash command has its *own* tool calls independently gated by
@@ -22,7 +22,7 @@ pub fn classify(tool_name: &str, tool_input: &Value) -> DangerClass {
         // schemas — it cannot mutate anything). `SendMessage` continues/steers an
         // already-running subagent — the messaged agent's own calls stay independently
         // gated, so the message itself mutates nothing (same rationale as `Agent`/`Task`;
-        // denying it would trap a Discovery/Plan session that fans work out to subagents).
+        // denying it would trap a Plan-phase session that fans work out to subagents).
         // `ScheduleWakeup` only arms a timer to resume the loop — no workspace effect.
         // (`Workflow` is deliberately *not* here: it launches a fleet of writer subagents,
         // and we haven't verified those are re-gated by this hook — so it stays mutating
@@ -59,7 +59,7 @@ pub fn classify(tool_name: &str, tool_input: &Value) -> DangerClass {
         }
         // MCP tools (`mcp__<server>__<tool>`): classify by the tool's leading verb —
         // the read-only ones (search/get/list/…) must stay usable in frozen phases
-        // (Discovery/Plan are exactly when the agent explores via IDE/LSP MCP tools).
+        // (Plan is exactly when the agent explores via IDE/LSP MCP tools).
         name if name.starts_with("mcp__") => classify_mcp_tool(name),
         // Unknown tools: assume mutating.
         _ => DangerClass::Risky,
@@ -348,7 +348,7 @@ fn leading_program(tokens: &[&str]) -> String {
         // command in (`rtk git push`, `rtk cargo build`, `rtk proxy <cmd>`). Skip it —
         // and the `proxy` subcommand right after it — so the *real* program is what
         // gets classified; otherwise every command reads as the unknown mutator `rtk`
-        // and a read-only phase (Discovery/Plan) would deny all of them.
+        // and a read-only phase (Plan) would deny all of them.
         if basename(tok) == "rtk" {
             after_rtk = true;
             continue;
@@ -581,7 +581,7 @@ mod tests {
 
     #[test]
     fn read_only_mcp_tools_are_safe_mutating_stay_risky() {
-        // Read-verb-led MCP tools must survive frozen phases (Discovery/Plan is
+        // Read-verb-led MCP tools must survive frozen phases (Plan is
         // exactly when the agent explores via IDE/LSP MCP tools).
         for tool in [
             "mcp__rustrover__search_in_files_by_regex",
@@ -676,7 +676,7 @@ mod tests {
     #[test]
     fn interaction_and_harness_meta_tools_are_safe() {
         // The harness's interaction/meta tools never mutate the workspace, so a
-        // read-only phase (Discovery/Plan/Commit) must not deny them. `AskUserQuestion`
+        // read-only phase (Plan/Commit) must not deny them. `AskUserQuestion`
         // asks the operator to clarify; `ToolSearch` only loads tool schemas; `Agent`
         // and `Skill` are this harness's names for `Task`/`SlashCommand` (the launched
         // subagent/command is independently re-gated by the same hook).

@@ -3,7 +3,7 @@
 //!
 //! "Read-only" phases protect *project state*, not the agent's own scratch: a write
 //! under a known AI-workspace root (`.ai/`, `.bmad-output/`, …) is `AiWorkspace` and
-//! stays permitted in Discovery/Plan; everything else is `Project` and frozen. Only
+//! stays permitted in Plan; everything else is `Project` and frozen. Only
 //! path-attributable tools (`Edit`/`Write`/`MultiEdit`/`NotebookEdit`) get a scope —
 //! Bash and friends return `None` (the PDP then treats them as `Project`).
 //!

@@ -100,6 +100,20 @@ pub enum Command {
     ApproveAction {
         session: SessionId,
     },
+    /// The **workflow hand-off** half of approving a plan: a session sitting in
+    /// `Phase::Plan` advances to `Phase::AutoImplement` so the agent can implement
+    /// what was just approved. This is the plan keystone — no phase runs CC in native
+    /// plan mode any more, so nothing else moves a session off the read-only Plan
+    /// phase.
+    ///
+    /// Sent by the plan-review panel *after* [`Command::ApproveAction`], which owns
+    /// unblocking the held `present_plan` / `ExitPlanMode` call. The two stay separate
+    /// because the composition root **swallows** an `ApproveAction` that resolved a
+    /// held hook (it never reaches the supervisor), and because approving a *danger*
+    /// action must not touch the workflow.
+    ApprovePlan {
+        session: SessionId,
+    },
     DenyAction {
         session: SessionId,
         reason: String,
@@ -144,7 +158,7 @@ pub enum Command {
         hidden: bool,
     },
     /// Set a session's workflow phase — the operator's authority over the state
-    /// machine. The selector picks Plan / Discovery / Auto; this can also set the
+    /// machine. The selector picks Plan / Auto; this can also set the
     /// engine-only Test/Review/Commit that no automatic transition reaches today. An
     /// operator pick takes precedence over any future automatic progression.
     SetPhase {

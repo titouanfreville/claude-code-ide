@@ -801,7 +801,7 @@ impl SessionMonitor {
                 id: self.id.clone(),
                 label: self.title_text(),
                 status: SessionStatus::Idle,
-                phase: Phase::Discovery,
+                phase: Phase::Plan,
             },
         };
         ac.update(cx, |a, cx| {
@@ -2119,7 +2119,7 @@ impl SessionMonitor {
     }
 
     /// The **Phase** row: the six-stage workflow as a clickable pipeline
-    /// (Discovery › Plan › Auto › Test › Review › Commit) with the current stage
+    /// (Plan › Auto › Test › Review › Commit) with the current stage
     /// lit and a trailing "→ next" hint (the *incoming* phase). Distinct from the
     /// Mode row: Mode is CC's coarse permission substrate, Phase is **our**
     /// fine-grained workflow authority — and the operator may jump to any stage,
@@ -2178,7 +2178,7 @@ impl SessionMonitor {
         }
 
         // The "incoming phase" hint — the suggested forward step (cyclic: after
-        // Commit it loops back to Discovery).
+        // Commit it loops back to Plan).
         let next_hint = div()
             .text_size(theme::text_xs())
             .text_color(theme::text_muted())
@@ -2287,14 +2287,16 @@ impl SessionMonitor {
         Some(div().flex().flex_row().child(btn).into_any_element())
     }
 
-    /// Set the session's workflow phase (operator authority, any of the six).
+    /// Set the session's workflow phase (operator authority, any of the five).
     /// Routed to the engine via [`Command::SetPhase`] + an optimistic card flip.
-    /// Relaunches CC **only** when the native permission-mode substrate changes
-    /// (crossing the plan↔auto boundary); moving among the auto-substrate phases
-    /// (Discovery/Auto/Test/Review/Commit) is a PDP-only flip with no relaunch.
-    fn request_phase(&mut self, target: Phase, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.session.as_ref().map(|s| s.phase);
-        if current == Some(target) {
+    ///
+    /// **No relaunch, ever.** Every phase runs the agent in the same native `auto`
+    /// substrate ([`Phase::cc_permission_mode`] is constant), so a phase change is a
+    /// PDP-only flip — nothing about the running process has to change. The engine
+    /// tells the agent what a new phase *means* (the Plan aim) by injecting it into
+    /// the live session, not by restarting it.
+    fn request_phase(&mut self, target: Phase, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.as_ref().map(|s| s.phase) == Some(target) {
             return;
         }
 
@@ -2304,29 +2306,9 @@ impl SessionMonitor {
                 phase: target,
             });
         }
-        // Compute whether CC's native mode changes *before* the optimistic flip.
-        let prev_native = current.map(|p| p.cc_permission_mode());
         if let Some(s) = self.session.as_mut() {
             s.phase = target;
             s.mode = target.operator_mode();
-        }
-        if prev_native != Some(target.cc_permission_mode()) {
-            match self.agent {
-                // Claude re-pins its native `--permission-mode` by relaunching (`--resume`).
-                AgentKind::ClaudeCode => {
-                    self.relaunch_terminal(target.cc_permission_mode(), window, cx)
-                }
-                // AGY has no `--permission-mode` and can't be relaunched into a mode — and a
-                // restart would lose the conversation (no `--session-id`). The moonlight
-                // `PreToolUse` hook already enforces the new phase (the `SetPhase` above), so
-                // instead of restarting we toggle AGY's own plan mode in the running TUI via
-                // `/plan` (the boundary fires on entering *and* leaving Plan).
-                AgentKind::Antigravity => {
-                    if let Some(term) = &self.terminal {
-                        let _ = term.update(cx, |t, _| t.send_text("/plan\r"));
-                    }
-                }
-            }
         }
         cx.notify();
     }
@@ -2422,57 +2404,6 @@ impl SessionMonitor {
                 }
             }
         }
-        cx.notify();
-    }
-
-    /// Relaunch the embedded session with an explicit `--permission-mode`, so CC's
-    /// native mode matches the operator's pick. No-op for a session with no embedded
-    /// terminal (observed/external) or no known repo root.
-    fn relaunch_terminal(
-        &mut self,
-        native_mode: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.terminal.is_none() {
-            return; // not a session we own a PTY for — nothing to relaunch
-        }
-        let Some(root) = self.resume_root.clone() else {
-            return;
-        };
-        let mcp = crate::views::mcp_host::url_for_session(&self.id, cx);
-        // Resume the right conversation: Claude's is our managed id; AGY's is its own
-        // discovered `conversationId`. If AGY hasn't been correlated yet there's nothing
-        // safe to resume (a bare managed id isn't a valid `--conversation`), so skip the
-        // relaunch and leave the live TUI running — phase is enforced by the hook anyway.
-        let agy_cid = self.agy_conversation(cx).map(SessionId::new);
-        if self.agent == AgentKind::Antigravity && agy_cid.is_none() {
-            return;
-        }
-        let resume_id = agy_cid.as_ref().unwrap_or(&self.id);
-        let backend = crate::agent_backend::backend_for(self.agent);
-        backend.prepare_launch(mcp.as_deref());
-        let command = crate::agent_backend::wrap_statusline(
-            self.agent,
-            backend.launch_command(&crate::agent_backend::LaunchSpec {
-                selector: crate::agent_backend::SessionSelector::Resume(resume_id),
-                permission_mode: Some(native_mode),
-                mcp_url: mcp.as_deref(),
-            }),
-        );
-        let terminal = cx.new(|cx| TerminalPanel::new_running_in(root, &command, cx).embedded());
-        if let Some(io) = cx.try_global::<ShellDeps>().map(|d| d.session_io.clone()) {
-            io.register(self.id.clone(), terminal.downgrade());
-        }
-        // Overwriting the field drops the old terminal entity → its `Emulator::drop`
-        // shuts the PTY down, terminating the previous `claude` before the new one.
-        self.terminal = Some(terminal);
-        // The fresh terminal carries no armed injection — re-sync the policy state
-        // (the obs observer re-arms on its next change if usage is still high).
-        self.compact_armed = false;
-        // Relaunch swaps the terminal on the already-active tab (no activation event),
-        // so move the caret into the fresh CC TUI ourselves.
-        self.focus_terminal(window, cx);
         cx.notify();
     }
 

@@ -92,7 +92,7 @@ impl McpVerb {
     /// Whether this verb is a **control-plane** action — it changes MoonlightCode's own
     /// workflow state (the phase the PDP gates on) rather than acting on the project or
     /// a runner. Control-plane verbs are not file writes, so the frozen-phase project
-    /// freeze must not deny them (a session has to be able to *ask* to leave Discovery /
+    /// freeze must not deny them (a session has to be able to *ask* to leave
     /// Plan / Commit); the PDP routes them straight to operator approval instead.
     pub fn is_phase_control(self) -> bool {
         matches!(self, McpVerb::RequestPhase)
@@ -131,7 +131,7 @@ pub enum DangerClass {
     DangerZone,
 }
 
-/// Which part of the working tree a write touches. Frozen phases (Discovery, Plan,
+/// Which part of the working tree a write touches. Frozen phases (Plan,
 /// Commit) freeze **project** state — source, configs, committed deliverables — so a
 /// session can't change the product while looking around or planning. They still let
 /// the agent write its own **AI-workspace** scratch (plan docs, BMad entries,

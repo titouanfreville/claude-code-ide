@@ -1,5 +1,5 @@
 //! The [`VerbExecutor`] behind the MCP **`request_phase`** verb — the bridge that lets
-//! a CC session *ask* to move its workflow phase (Discovery → Plan → Auto → Test →
+//! a CC session *ask* to move its workflow phase (Plan → Auto → Test →
 //! Review → Commit), the gate the PDP enforces.
 //!
 //! Composition: wraps the rest of the executor stack (run verbs, `run_with_coverage`)
@@ -376,14 +376,11 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         // A tracked session in a read-only phase: every verb result must re-ground the
         // agent in the real phase + write policy.
-        let ex = PhaseVerbExecutor::new(
-            tx,
-            Arc::new(FixedPolicy(Phase::Discovery)),
-            Arc::new(EchoInner),
-        );
+        let ex =
+            PhaseVerbExecutor::new(tx, Arc::new(FixedPolicy(Phase::Plan)), Arc::new(EchoInner));
         let out = run(&ex, McpVerb::RunWithCoverage, "").unwrap();
         assert!(out.starts_with("inner:RunWithCoverage"), "{out}");
-        assert!(out.contains("Discovery"), "{out}");
+        assert!(out.contains("Plan"), "{out}");
         assert!(out.contains("denied"), "{out}");
     }
 
@@ -411,19 +408,16 @@ mod tests {
     #[test]
     fn phase_status_reports_the_current_phase_and_its_write_policy() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        // Discovery is read-only for project files but allows AI-workspace notes.
-        let ex = PhaseVerbExecutor::new(
-            tx,
-            Arc::new(FixedPolicy(Phase::Discovery)),
-            Arc::new(EchoInner),
-        );
+        // Plan is read-only for project files but allows AI-workspace notes.
+        let ex =
+            PhaseVerbExecutor::new(tx, Arc::new(FixedPolicy(Phase::Plan)), Arc::new(EchoInner));
 
         let out = run(&ex, McpVerb::PhaseStatus, "").unwrap();
-        assert!(out.contains("Discovery"), "{out}");
-        // Project edits denied, AI-workspace notes allowed, and `next` → Plan.
+        assert!(out.contains("Plan"), "{out}");
+        // Project edits denied, AI-workspace notes allowed, and `next` → Auto.
         assert!(out.contains("Project-file edits: denied"), "{out}");
         assert!(out.contains("AI-workspace notes (.ai/): allowed"), "{out}");
-        assert!(out.contains("Plan"), "{out}");
+        assert!(out.contains("Auto"), "{out}");
         // A pure read: it must not emit any engine command.
         assert!(rx.try_recv().is_err());
     }

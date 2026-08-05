@@ -24,7 +24,7 @@ impl PolicyDecisionPoint for DefaultPdp {
         // 1b. Control-plane verbs (a session asking to change its workflow phase) are
         //     not file writes — they move the gate this very PDP enforces — so the
         //     frozen-phase project freeze (step 2) must NOT deny them, or a session
-        //     could never request its way out of Discovery / Plan / Commit. They always
+        //     could never request its way out of Plan / Commit. They always
         //     route to operator approval instead: the agent may *ask*, never decide.
         //     (A future per-session "auto-phasing" opt-in would relax this to Allow; the
         //     branch is the seam.)
@@ -182,26 +182,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_phase_denies_writes() {
+    fn plan_denies_edits_but_allows_reads_and_commands() {
         let pdp = DefaultPdp;
-        let out = pdp
-            .decide(&req(
-                Phase::Plan,
-                TrustTier::Trusted,
-                None,
-                DangerClass::Risky,
-            ))
-            .unwrap();
-        assert!(matches!(out, PermissionOutcome::Deny { .. }));
-    }
-
-    #[test]
-    fn discovery_denies_edits_but_allows_reads_and_commands() {
-        let pdp = DefaultPdp;
-        // Discovery = look around freely (CC `auto`) but never touch files.
+        // Plan = investigate freely (CC `auto`) but never touch project files.
         let deny = pdp
             .decide(&req(
-                Phase::Discovery,
+                Phase::Plan,
                 TrustTier::Trusted,
                 None,
                 DangerClass::Risky,
@@ -210,7 +196,7 @@ mod tests {
         assert!(matches!(deny, PermissionOutcome::Deny { .. }));
         let allow = pdp
             .decide(&req(
-                Phase::Discovery,
+                Phase::Plan,
                 TrustTier::Trusted,
                 None,
                 DangerClass::Safe,
@@ -249,35 +235,31 @@ mod tests {
     }
 
     #[test]
-    fn frozen_phases_allow_ai_workspace_writes_but_deny_project_writes() {
+    fn plan_allows_ai_workspace_writes_but_denies_project_writes() {
         let pdp = DefaultPdp;
-        // Discovery & Plan freeze project files...
-        for phase in [Phase::Discovery, Phase::Plan] {
-            let project = pdp
-                .decide(&req_scoped(
-                    phase,
-                    TrustTier::Trusted,
-                    None,
-                    DangerClass::Risky,
-                    Some(WriteScope::Project),
-                ))
-                .unwrap();
-            assert!(
-                matches!(project, PermissionOutcome::Deny { .. }),
-                "{phase:?} project"
-            );
-            // ...but still let the agent write its own plans / BMad entries / handoffs.
-            let ai = pdp
-                .decide(&req_scoped(
-                    phase,
-                    TrustTier::Trusted,
-                    None,
-                    DangerClass::Risky,
-                    Some(WriteScope::AiWorkspace),
-                ))
-                .unwrap();
-            assert_eq!(ai, PermissionOutcome::Allow, "{phase:?} ai-workspace");
-        }
+        // Plan freezes project files...
+        let project = pdp
+            .decide(&req_scoped(
+                Phase::Plan,
+                TrustTier::Trusted,
+                None,
+                DangerClass::Risky,
+                Some(WriteScope::Project),
+            ))
+            .unwrap();
+        assert!(matches!(project, PermissionOutcome::Deny { .. }));
+        // ...but still lets the agent write its own plans / BMad entries / handoffs.
+        // (Commit is the one frozen phase that denies these too — covered separately.)
+        let ai = pdp
+            .decide(&req_scoped(
+                Phase::Plan,
+                TrustTier::Trusted,
+                None,
+                DangerClass::Risky,
+                Some(WriteScope::AiWorkspace),
+            ))
+            .unwrap();
+        assert_eq!(ai, PermissionOutcome::Allow);
     }
 
     #[test]
@@ -320,7 +302,7 @@ mod tests {
         let pdp = DefaultPdp;
         // An external MCP tool the freeze would block is offered to the operator
         // (once / always) rather than hard-denied — in every frozen phase.
-        for phase in [Phase::Discovery, Phase::Plan, Phase::Commit] {
+        for phase in [Phase::Plan, Phase::Commit] {
             let out = pdp.decide(&mcp_prompt_req(phase)).unwrap();
             assert!(
                 matches!(out, PermissionOutcome::Prompt { .. }),
@@ -344,7 +326,7 @@ mod tests {
         // frozen phase — the freeze on the product is absolute.
         let out = pdp
             .decide(&req_scoped(
-                Phase::Discovery,
+                Phase::Plan,
                 TrustTier::Trusted,
                 None,
                 DangerClass::Risky,
@@ -360,7 +342,7 @@ mod tests {
         // A write with no attributable path (e.g. Bash) must not slip past the freeze.
         let out = pdp
             .decide(&req_scoped(
-                Phase::Discovery,
+                Phase::Plan,
                 TrustTier::Trusted,
                 None,
                 DangerClass::Risky,

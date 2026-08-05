@@ -107,10 +107,7 @@ impl ControlServer {
     }
 
     /// Wire the external conversation ID resolver (e.g. for Antigravity).
-    pub fn with_id_resolver(
-        mut self,
-        id_resolver: IdResolver,
-    ) -> Self {
+    pub fn with_id_resolver(mut self, id_resolver: IdResolver) -> Self {
         self.id_resolver = Some(id_resolver);
         self
     }

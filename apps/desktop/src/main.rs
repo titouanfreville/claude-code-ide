@@ -16,6 +16,7 @@ mod agy_setup;
 mod assets;
 mod docker;
 mod git;
+mod grpc;
 mod hook_install;
 mod http;
 mod http_verbs;

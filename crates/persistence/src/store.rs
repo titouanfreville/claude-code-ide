@@ -322,7 +322,7 @@ mod tests {
             id: SessionId::new(id),
             root: Some("/repo/api".into()),
             title: Some("Refactor auth".into()),
-            mode: Mode::Plan,
+            mode: Mode::Auto,
             phase: Phase::Plan,
             agent: AgentKind::ClaudeCode,
             conversation_id: None,
@@ -428,10 +428,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_rows_backfill_to_claude_code() {
+    fn legacy_rows_backfill_to_claude_code_and_the_merged_plan_phase() {
         // A row inserted without the `agent` column (the pre-migration record shape)
         // gets the schema DEFAULT, which decodes to ClaudeCode — old sessions stay
-        // Claude on restart rather than failing to decode.
+        // Claude on restart rather than failing to decode. Its `phase` is the literal
+        // "Discovery" from before Discovery and Plan merged: it must decode as Plan
+        // (the serde alias), or every pre-merge session would come back Corrupt.
         let store = Store::open_in_memory().unwrap();
         store
             .lock()
@@ -445,6 +447,11 @@ mod tests {
 
         let got = store.managed(&SessionId::new("legacy")).unwrap().unwrap();
         assert_eq!(got.agent, AgentKind::ClaudeCode);
+        assert_eq!(
+            got.phase,
+            Phase::Plan,
+            "a persisted Discovery phase rehydrates as its successor, Plan"
+        );
     }
 
     #[test]

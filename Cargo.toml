@@ -37,6 +37,27 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "proce
 # reuses the rustls already in the tree. Small dep surface for a gated dev tool.
 ureq = "2"
 
+# gRPC client stack for the gRPC request builder (center tab). ureq is HTTP/1.1-only,
+# so gRPC needs its own HTTP/2 transport — but hyper 1.x / h2 0.4 / tower 0.5 / rustls
+# are ALREADY in the lockfile (the MCP server's `serve_http`), and tonic 0.14 pins
+# exactly those, so this unifies with the existing tree rather than duplicating it.
+# We deliberately skip `codegen`/`router`/`server` and the `tonic-prost` codec: the
+# panel calls methods discovered at RUNTIME, so it carries its own dynamic codec
+# (`grpc::DynamicCodec`) instead of build-time-generated stubs.
+tonic = { version = "0.14", default-features = false, features = ["channel", "tls-ring", "tls-native-roots"] }
+prost = "0.14"
+# Runtime protobuf reflection: builds messages from descriptors discovered over gRPC
+# server reflection (or from .proto), and converts them to/from JSON. Ships NO default
+# features — `serde` is what provides the JSON bridge both directions.
+prost-reflect = { version = "0.16", features = ["serde"] }
+# Pure-Rust .proto compiler for the fallback when a server has reflection disabled.
+# Replaces the `protoc` binary entirely, so no external toolchain is required.
+protox = "0.9"
+# `ReceiverStream` for the request side of the reflection call (`ServerReflectionInfo`
+# is bidi-streaming, so tonic needs a `Stream` to feed it). Already in the lockfile via
+# the existing tower/hyper stack — this pins no new version.
+tokio-stream = "0.1"
+
 # GPUI desktop UI stack. `gpui`/`gpui_platform` are declared branchless to match
 # how `gpui-component` declares them — this keeps a SINGLE zed git source so all
 # zed crates unify on one checkout. The exact commit is pinned in Cargo.lock

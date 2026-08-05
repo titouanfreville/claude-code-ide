@@ -164,7 +164,7 @@ impl McpActor for ActorService {
             PermissionOutcome::Prompt { .. } => {
                 if req.verb.is_phase_control() {
                     // Auto-approve routine phase changes inline; only a move that GAINS
-                    // project-write access from a frozen phase (Discovery/Plan/Commit →
+                    // project-write access from a frozen phase (Plan/Commit →
                     // Auto/Test/Review) waits on the operator. The operator's global
                     // auto-phasing toggle pre-authorizes even the sensitive ones. Either
                     // way the change runs inline (fast — no hold), audited as an
@@ -292,7 +292,7 @@ impl ApprovalGate for DenyingApprovalGate {
 
 /// The danger class of a verb (its baseline; a per-payload escalation — e.g. an
 /// `HttpRequest` to a prod host — is a later refinement). Read verbs are `Safe`;
-/// side-effecting ones are `Risky` so a frozen phase (Plan/Discovery/Commit) gates
+/// side-effecting ones are `Risky` so a frozen phase (Plan/Commit) gates
 /// them like any other write.
 fn danger_class(verb: McpVerb) -> DangerClass {
     match verb {
@@ -305,7 +305,7 @@ fn danger_class(verb: McpVerb) -> DangerClass {
         // side effects.
         McpVerb::RunStatus | McpVerb::RunLogs | McpVerb::RunListTargets => DangerClass::Safe,
         // Launching/killing the project's run is side-effecting — a frozen phase
-        // (Plan/Discovery/Commit) gates it like any other write.
+        // (Plan/Commit) gates it like any other write.
         McpVerb::RunStart | McpVerb::RunStop => DangerClass::Risky,
         McpVerb::HttpRequest | McpVerb::StartDebug => DangerClass::Risky,
         // Control-plane: not a file write, so `Safe` keeps it clear of the project-write
@@ -322,7 +322,7 @@ fn danger_class(verb: McpVerb) -> DangerClass {
 /// Whether a `request_phase` needs the operator's explicit OK, or may auto-approve.
 ///
 /// The only sensitive move is one that **gains project-write access from a frozen
-/// phase** — Discovery/Plan/Commit (no writes) → Auto/Test/Review (writes). Every other
+/// phase** — Plan/Commit (no writes) → Auto/Test/Review (writes). Every other
 /// transition (staying frozen, staying writable, or dropping back to a frozen phase)
 /// auto-approves so the agent isn't blocked stepping through the routine workflow. The
 /// target is read from the payload (empty / `next` ⇒ the next phase); an unparseable
@@ -668,15 +668,15 @@ mod tests {
     #[test]
     fn phase_change_needs_operator_only_when_gaining_writes_from_frozen() {
         // Gaining project-write access from a frozen phase = sensitive.
-        assert!(phase_change_needs_operator(Phase::Discovery, "auto"));
         assert!(phase_change_needs_operator(Phase::Plan, "auto"));
         assert!(phase_change_needs_operator(Phase::Plan, "test"));
         assert!(phase_change_needs_operator(Phase::Commit, "auto"));
         // `next` from Plan lands in AutoImplement (writable) — still sensitive.
         assert!(phase_change_needs_operator(Phase::Plan, "next"));
-        // Frozen → frozen (Discovery → Plan, or `next` from Discovery) = fine.
-        assert!(!phase_change_needs_operator(Phase::Discovery, "plan"));
-        assert!(!phase_change_needs_operator(Phase::Discovery, "next"));
+        // Frozen → frozen (Plan ↔ Commit, or `next` from Commit) = fine.
+        assert!(!phase_change_needs_operator(Phase::Plan, "commit"));
+        assert!(!phase_change_needs_operator(Phase::Commit, "plan"));
+        assert!(!phase_change_needs_operator(Phase::Commit, "next"));
         // Writable → writable, and dropping back to a frozen phase = fine.
         assert!(!phase_change_needs_operator(Phase::AutoImplement, "test"));
         assert!(!phase_change_needs_operator(Phase::Review, "commit"));
@@ -686,12 +686,12 @@ mod tests {
 
     #[tokio::test]
     async fn non_sensitive_phase_change_auto_approves_without_operator() {
-        // Discovery → Plan stays frozen (no new write access), so it must NOT wait on
+        // Commit → Plan stays frozen (no new write access), so it must NOT wait on
         // the operator even behind a default-deny gate: it auto-approves inline and runs.
         let exec = Arc::new(FakeExecutor::ok("now in the Plan phase"));
         let audit = Arc::new(FakeAudit::default());
         let svc = service(
-            Some(snapshot(Phase::Discovery, TrustTier::Observed)),
+            Some(snapshot(Phase::Commit, TrustTier::Observed)),
             exec.clone(),
             audit.clone(),
         );

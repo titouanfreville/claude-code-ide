@@ -29,6 +29,7 @@ pub mod db_observer;
 pub mod db_source;
 pub mod file_tree;
 pub mod git_panel;
+pub mod grpc_panel;
 pub mod http_panel;
 pub mod outline;
 pub mod plan_review;

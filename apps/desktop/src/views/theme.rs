@@ -262,7 +262,6 @@ pub fn attention_color(k: AttentionKind) -> Hsla {
 /// Phase accent — the tile's appearance teaches the workflow state machine.
 pub fn phase_color(p: Phase) -> Hsla {
     match p {
-        Phase::Discovery => c(0x3fb6a8),
         Phase::Plan => c(0x6e8bff),
         Phase::AutoImplement => c(0x4da3ff),
         Phase::Test => c(0xc792ea),

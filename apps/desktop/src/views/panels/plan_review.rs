@@ -155,6 +155,16 @@ impl PlanReviewPanel {
             },
             cx,
         );
+        // …and the workflow keystone: hand a Plan-phase session off to Auto so the
+        // agent can implement what was just approved. Separate from the unblock above
+        // because the composition root swallows an `ApproveAction` that resolved a held
+        // hook — it never reaches the engine. No phase runs CC in native plan mode any
+        // more, so nothing else would move the session off read-only Plan.
+        if let Some(tx) = &self.commands {
+            let _ = tx.send(Command::ApprovePlan {
+                session: self.session.clone(),
+            });
+        }
         // Approving = CC's native option 1 (accept + auto). See [`select_native_option`].
         // (Spawned before we close the tab — the task drives the session's terminal
         // independently of this panel's lifetime.)

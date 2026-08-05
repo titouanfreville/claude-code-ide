@@ -289,12 +289,12 @@ mod tests {
 
     #[test]
     fn frozen_phase_threads_write_scope_to_pdp() {
-        // An adopted Discovery session: a project-scoped write is denied, but an
+        // An adopted Plan-phase session: a project-scoped write is denied, but an
         // AI-workspace write (the scope the server resolves from the path) is allowed
         // — proving evaluate() carries write_scope into the PDP.
         let gate = GateState {
             adopted: true,
-            phase: Phase::Discovery,
+            phase: Phase::Plan,
             ..Default::default()
         };
         let project = decide(
@@ -516,10 +516,10 @@ mod tests {
     #[test]
     fn external_mcp_in_frozen_phase_holds_for_authorization_not_deny() {
         // End-to-end through evaluate(): a non-read-verb phoenix tool (classify → Risky)
-        // in a frozen Discovery phase becomes an authorize hold, not a hard deny.
+        // in a frozen Plan phase becomes an authorize hold, not a hard deny.
         let discovery = GateState {
             adopted: true,
-            phase: Phase::Discovery,
+            phase: Phase::Plan,
             trust: TrustTier::Standard,
             ..Default::default()
         };

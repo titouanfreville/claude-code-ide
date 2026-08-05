@@ -16,6 +16,7 @@
 use std::io::Write as _;
 use std::path::PathBuf;
 
+use moonlight_domain::phase::PLAN_AIM;
 use serde_json::{json, Value};
 
 /// AGY per-hook timeout (**milliseconds** — AGY's unit; Claude's is seconds). The control
@@ -25,10 +26,27 @@ use serde_json::{json, Value};
 const HOOK_TIMEOUT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// The IDE context delivered to AGY sessions via the plugin's `GEMINI.md` (AGY's
-/// `contextFileName`) — the AGY analogue of Claude's `--append-system-prompt` IDE_CONTEXT.
-/// Teaches the workflow-phase gate + the `moonlight` MCP verbs. Plain prose (a context
-/// file, not shell-parsed), so apostrophes/newlines are fine.
-const GEMINI_MD: &str = "# MoonlightCode\n\nYou are running inside MoonlightCode, an IDE that governs this Antigravity (`agy`) session. Your tools are gated by a workflow phase, one of: Discovery, Plan, Auto, Test, Review, Commit. In Discovery, Plan, and Commit, edits to project files are denied; you can still read, search, run commands, and (except during Commit) write notes under .ai/. In Auto, Test, and Review, file writes are allowed. In **Plan**, do not implement: outline your approach and ask the operator any clarifying questions first — file edits are blocked (the hook will reject them) until the operator moves the session to Auto. If you are unsure which phase you are in or what it allows, call the moonlight MCP tool `phase_status` first (read-only, no approval) — never guess. You cannot switch phase on your own; call the moonlight MCP tool `request_phase` (target discovery|plan|auto|test|review|commit|next) and the operator approves or denies it — never assume the phase changed until the tool result confirms it. Prefer the moonlight MCP verbs (run_list_targets, run_start, run_stop, run_status, run_logs, run_with_coverage) over ad-hoc shell when they fit. All verbs are policy-gated and audited; if a tool is denied, read the reason and adapt instead of retrying.\n";
+/// `contextFileName`) — the AGY analogue of Claude's `--append-system-prompt` IDE context.
+/// Teaches the workflow-phase gate, the Plan aim, and the `moonlight` MCP verbs. Plain
+/// prose (a context file, not shell-parsed), so apostrophes/newlines are fine.
+fn gemini_md() -> String {
+    format!(
+        "# MoonlightCode\n\nYou are running inside MoonlightCode, an IDE that governs \
+         this Antigravity (`agy`) session. Your tools are gated by a workflow phase, one \
+         of: Plan, Auto, Test, Review, Commit. In Plan and Commit, edits to project files \
+         are denied; you can still read, search, run commands, and (except during Commit) \
+         write notes under .ai/. In Auto, Test, and Review, file writes are allowed. \
+         {PLAN_AIM} If you are unsure which phase you are in or what it allows, call the \
+         moonlight MCP tool `phase_status` first (read-only, no approval) — never guess. \
+         You cannot switch phase on your own; call the moonlight MCP tool `request_phase` \
+         (target plan|auto|test|review|commit|next) and the operator approves or denies \
+         it — never assume the phase changed until the tool result confirms it. Prefer \
+         the moonlight MCP verbs (run_list_targets, run_start, run_stop, run_status, \
+         run_logs, run_with_coverage) over ad-hoc shell when they fit. All verbs are \
+         policy-gated and audited; if a tool is denied, read the reason and adapt instead \
+         of retrying.\n"
+    )
+}
 
 // ---- paths ---------------------------------------------------------------
 
@@ -279,7 +297,7 @@ fn install() {
         // binary or an updated context propagate on re-run — no confirm (it's our content).
         let _ = write_json(&hooks_path, &hooks_json(&command));
         let _ = write_json(&manifest_file, &plugin_manifest());
-        let _ = std::fs::write(dir.join("GEMINI.md"), GEMINI_MD);
+        let _ = std::fs::write(dir.join("GEMINI.md"), gemini_md());
         println!(
             "refreshed the MoonlightCode AGY plugin at {}",
             dir.display()
@@ -305,7 +323,7 @@ fn install() {
         return;
     }
     // Ship the IDE phase/verb guidance as the plugin's GEMINI.md context file.
-    if let Err(e) = std::fs::write(dir.join("GEMINI.md"), GEMINI_MD) {
+    if let Err(e) = std::fs::write(dir.join("GEMINI.md"), gemini_md()) {
         eprintln!("write GEMINI.md failed: {e}");
         return;
     }
@@ -471,11 +489,15 @@ mod tests {
 
     #[test]
     fn gemini_md_teaches_the_phase_gate_and_verbs() {
-        // The context file must surface the two affordances an AGY session needs to
-        // work with the gate: how to check its phase and how to request a change.
-        assert!(GEMINI_MD.contains("phase_status"));
-        assert!(GEMINI_MD.contains("request_phase"));
-        assert!(GEMINI_MD.contains("Antigravity"));
+        // The context file must surface the affordances an AGY session needs to work
+        // with the gate: how to check its phase, how to request a change, and — since
+        // no phase has a native plan mode behind it — how to land a plan.
+        let md = gemini_md();
+        assert!(md.contains("phase_status"));
+        assert!(md.contains("request_phase"));
+        assert!(md.contains("present_plan"));
+        assert!(md.contains("Antigravity"));
+        assert!(!md.contains("Discovery"));
     }
 
     #[test]

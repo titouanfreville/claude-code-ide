@@ -151,6 +151,13 @@ pub struct ShellDeps {
     /// HTTP summary (the executor records; the panel polls). Same shared-handle shape
     /// as `run_registry`.
     pub http_history: crate::http::HttpHistory,
+    /// Shared gRPC call history behind the gRPC panel and the Services view's gRPC
+    /// summary — the sibling of `http_history`.
+    pub grpc_history: crate::grpc::GrpcHistory,
+    /// Tokio reactor for gRPC calls (tonic needs one; GPUI's executor is not one).
+    /// `None` when it failed to start — the gRPC panel reports that rather than the app
+    /// failing to launch, exactly as `mcp_host` does.
+    pub grpc_rt: Option<crate::grpc::GrpcRuntime>,
     /// Operator's auto-phasing toggle (shared with the MCP actor): when on, the agent's
     /// `request_phase` is auto-approved instead of waiting on the cockpit gate. The
     /// main toolbar flips it; the actor reads it.
@@ -190,6 +197,11 @@ pub fn init_shell(
     let chrome = cx.new(|_| ChromeRequests);
     let lsp_pool = Arc::new(crate::lsp::LspPool::new());
     let git_console = super::git_console::GitConsole::default();
+    // Owned here rather than threaded from the composition root: unlike `http_history`
+    // (shared with the MCP executor behind `http_request`) the gRPC tool has no verb yet,
+    // so the panel is its only consumer.
+    let grpc_history = crate::grpc::GrpcHistory::new();
+    let grpc_rt = crate::grpc::GrpcRuntime::build();
     cx.set_global(ShellDeps {
         focus,
         bus,
@@ -209,6 +221,8 @@ pub fn init_shell(
         mcp_host,
         run_registry,
         http_history,
+        grpc_history,
+        grpc_rt,
         auto_phase,
         lsp_pool,
         git_console,
@@ -330,6 +344,10 @@ pub fn init_shell(
     });
     register_panel(cx, "Http", |_, _, info, _window, cx| {
         let view = cx.new(|cx| super::panels::http_panel::HttpPanel::restore(info, cx));
+        Box::new(view) as Box<dyn PanelView>
+    });
+    register_panel(cx, "Grpc", |_, _, info, _window, cx| {
+        let view = cx.new(|cx| super::panels::grpc_panel::GrpcPanel::restore(info, cx));
         Box::new(view) as Box<dyn PanelView>
     });
     register_panel(cx, "PlanReview", |_, _, info, _window, cx| {
@@ -2189,15 +2207,16 @@ impl Workspace {
     }
 
     /// "＋ Session": quick-launch a managed CC session from the tab bar (no trip to
-    /// the Sessions grid). Mints a fresh id and opens it in the **Discovery** mode (the
-    /// safe default; switch live from the session card). Mirrors GridHome's ＋New.
+    /// the Sessions grid). Mints a fresh id and opens it in the **Plan** phase (the
+    /// safe default — read-only for project files; switch live from the session card).
+    /// Mirrors GridHome's ＋New.
     pub(crate) fn new_session(&mut self, cx: &mut Context<Self>) {
         let center = cx.global::<ShellDeps>().center.clone();
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
         center.update(cx, |_center, cx| {
             cx.emit(OpenRequest::NewManagedSession {
                 id,
-                phase: Phase::Discovery,
+                phase: Phase::Plan,
                 agent: moonlight_domain::AgentKind::ClaudeCode,
             });
         });
@@ -2359,10 +2378,11 @@ impl Workspace {
                 CodeReviewPanel::new(session, root, summary, Some(deps.commands.clone()), cx)
             })),
             OpenRequest::NewManagedSession { id, phase, agent } => {
-                // Launch the agent in the phase's permission mode: Plan ⇒ `--permission-mode
-                // plan`, everything else ⇒ `auto` (Discovery's no-edit posture is our
-                // PDP's job, not the CLI's). `mode` is the derived native binary, stored
-                // on the record/roster. The backend (`claude` / `agy`) owns the command shape.
+                // Launch the agent in the phase's permission mode — always `auto`. The
+                // read-only posture of Plan/Commit is our PDP's job, not the CLI's, and
+                // what makes a Plan session *plan* is the aim in its system prompt.
+                // `mode` is the derived native binary, stored on the record/roster. The
+                // backend (`claude` / `agy`) owns the command shape.
                 let mode = phase.operator_mode();
                 // Stand the session's embedded MCP endpoint up so the agent gets the
                 // `moonlight` actor verbs from its very first turn.
@@ -2506,6 +2526,7 @@ impl Workspace {
                 Arc::new(cx.new(|cx| DbConsolePanel::new(source, cx)))
             }
             OpenRequest::Http => Arc::new(cx.new(super::panels::http_panel::HttpPanel::new)),
+            OpenRequest::Grpc => Arc::new(cx.new(super::panels::grpc_panel::GrpcPanel::new)),
         };
 
         dock.update(cx, |area, cx| {

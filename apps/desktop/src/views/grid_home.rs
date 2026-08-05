@@ -492,9 +492,9 @@ impl Render for GridHome {
             })
             .collect();
 
-        // Starting-phase toggle beside the button: the new session launches CC with
-        // the phase's `--permission-mode` (Plan ⇒ plan, Discovery/Auto ⇒ auto; the
-        // no-edit posture of Discovery is the PDP's job). Default Plan (safe).
+        // Starting-phase toggle beside the button. Both phases launch CC in `auto`;
+        // what differs is our PDP (Plan denies project writes) and the aim in the
+        // system prompt (Plan asks for a plan via `present_plan`). Default Plan (safe).
         let chosen = self.new_session_phase;
         let seg = |phase: Phase, text: &'static str, id: &'static str, cx: &mut Context<Self>| {
             let active = chosen == phase;
@@ -526,12 +526,6 @@ impl Render for GridHome {
             .rounded(theme::radius_sm())
             .bg(theme::surface_raised())
             .child(seg(Phase::Plan, "Plan", "new-phase-plan", _cx))
-            .child(seg(
-                Phase::Discovery,
-                "Discovery",
-                "new-phase-discovery",
-                _cx,
-            ))
             .child(seg(Phase::AutoImplement, "Auto", "new-phase-auto", _cx));
 
         // Backend toggle beside the phase toggle: which agent CLI the new session runs

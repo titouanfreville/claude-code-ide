@@ -44,7 +44,8 @@ pub enum OpenRequest {
     /// Start a new **managed session**: open a focus tab whose embedded terminal runs
     /// the chosen `agent` CLI (`claude --session-id <id> …` / `agy …`) in the focused
     /// project (the "＋ Session" action). `phase` is the operator's chosen starting phase
-    /// (Plan / Discovery / Auto); its `cc_permission_mode()` drives the launch flag.
+    /// (Plan / Auto); every phase launches CC in `auto`, so the starting phase picks
+    /// the PDP posture and the system-prompt aim, not the CLI mode.
     /// `agent` selects the backend (`claude` / `agy`). The pinned `id` means the tab and
     /// the grid tile (discovered from JSONL) are the same session, so clicking the tile
     /// later reuses this tab.
@@ -73,6 +74,8 @@ pub enum OpenRequest {
     DbConsole { source: DataSource },
     /// Open the HTTP request builder (Postman-style center tab; one shared tab).
     Http,
+    /// Open the gRPC request builder (one shared tab, beside the HTTP one).
+    Grpc,
 }
 
 impl OpenRequest {
@@ -96,6 +99,7 @@ impl OpenRequest {
                 super::panels::db_console::DbConsolePanel::tab_key(source)
             }
             OpenRequest::Http => super::panels::http_panel::HttpPanel::tab_key().to_string(),
+            OpenRequest::Grpc => super::panels::grpc_panel::GrpcPanel::tab_key().to_string(),
         }
     }
 

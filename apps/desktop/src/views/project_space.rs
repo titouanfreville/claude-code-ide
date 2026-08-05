@@ -616,7 +616,7 @@ mod tests {
 
         let rec = SpaceSession {
             id: SessionId::new("m1"),
-            mode: Mode::Plan,
+            mode: Mode::Auto,
             phase: Phase::Plan,
             label: Some("Build the thing".into()),
         };

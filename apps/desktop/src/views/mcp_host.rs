@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 
 use gpui::App;
 use moonlight_domain::ids::SessionId;
+use moonlight_domain::phase::PLAN_AIM;
 use moonlight_mcp_server::McpHost;
 
 use super::workspace::ShellDeps;
@@ -107,7 +108,8 @@ pub fn mcp_config_flag(url: &str) -> String {
 
 /// The default context every IDE-managed session is launched with: the workflow-phase
 /// gate and how to work with it (esp. `request_phase`, the agent's only way to ask for
-/// a phase change), plus the `moonlight` MCP verbs it should prefer.
+/// a phase change), the [`PLAN_AIM`] the Plan phase steers on, plus the `moonlight` MCP
+/// verbs the agent should prefer.
 ///
 /// **Delivered via a file**, not inline: the launch command is *typed into the embedded
 /// terminal's shell* as one line (`<cmd>\n`), and a ~1 KB inline `--append-system-prompt`
@@ -117,20 +119,41 @@ pub fn mcp_config_flag(url: &str) -> String {
 /// keeping the typed line short. The file content may be multi-line / contain
 /// apostrophes (it is not shell-parsed), but we keep it apostrophe-free for the inline
 /// fallback used when the file can't be written.
-const IDE_CONTEXT: &str = "You are running inside MoonlightCode, an IDE that governs this Claude Code session. Your tools are gated by a workflow phase, one of: Discovery, Plan, Auto, Test, Review, Commit. In Discovery, Plan, and Commit, edits to project files are denied; you can still read, search, run commands, and (except during Commit) write notes under .ai/. In Auto, Test, and Review, file writes are allowed. If you are unsure which phase you are in or what it allows, call the moonlight MCP tool phase_status first (read-only, no approval) — never guess your phase. You cannot switch phase on your own. When you need a different phase (for example: done exploring and ready to plan, you need write access to implement, tests pass and you want review, or you are ready to commit), call the moonlight MCP tool request_phase with a target of discovery, plan, auto, test, review, commit, or next. Every request is approved or denied by the operator, so never assume the phase changed until the tool result confirms it. Prefer the moonlight MCP verbs over ad-hoc shell when they fit: run_list_targets, run_start, run_stop, run_status, and run_logs drive the shared IDE Run console, and run_with_coverage runs the tests with a compact summary. All verbs are policy-gated and audited; if one is denied, read the reason and adapt instead of retrying.";
+fn ide_context() -> String {
+    format!(
+        "You are running inside MoonlightCode, an IDE that governs this Claude Code \
+         session. Your tools are gated by a workflow phase, one of: Plan, Auto, Test, \
+         Review, Commit. Every phase runs you in auto permission mode — what differs is \
+         what the IDE policy allows. In Plan and Commit, edits to project files are \
+         denied; you can still read, search, run commands, and (except during Commit) \
+         write notes under .ai/. In Auto, Test, and Review, file writes are allowed. \
+         {PLAN_AIM} If you are unsure which phase you are in or what it allows, call the \
+         moonlight MCP tool phase_status first (read-only, no approval) — never guess \
+         your phase. You cannot switch phase on your own. When you need a different phase \
+         (for example: your plan is approved and you need write access to implement, \
+         tests pass and you want review, or you are ready to commit), call the moonlight \
+         MCP tool request_phase with a target of plan, auto, test, review, commit, or \
+         next. Every request is approved or denied by the operator, so never assume the \
+         phase changed until the tool result confirms it. Prefer the moonlight MCP verbs \
+         over ad-hoc shell when they fit: run_list_targets, run_start, run_stop, \
+         run_status, and run_logs drive the shared IDE Run console, and run_with_coverage \
+         runs the tests with a compact summary. All verbs are policy-gated and audited; \
+         if one is denied, read the reason and adapt instead of retrying."
+    )
+}
 
 /// Short inline fallback used only when the context file can't be written. Must stay a
 /// single apostrophe-free line that is comfortably under the terminal's line limit.
-const IDE_CONTEXT_SHORT: &str = "You are inside MoonlightCode, an IDE that gates your tools by a workflow phase (Discovery/Plan/Commit are read-only for project files; Auto/Test/Review allow writes). Call phase_status (read-only) when unsure which phase you are in. You cannot change phase yourself: call the moonlight MCP tool request_phase (target discovery|plan|auto|test|review|commit|next; operator-approved). Prefer the moonlight run_* verbs over ad-hoc shell.";
+const IDE_CONTEXT_SHORT: &str = "You are inside MoonlightCode, an IDE that gates your tools by a workflow phase (Plan/Commit are read-only for project files; Auto/Test/Review allow writes). In Plan, investigate freely and then propose your plan with the moonlight MCP tool present_plan, which the operator reviews in the IDE plan panel. Call phase_status (read-only) when unsure which phase you are in. You cannot change phase yourself: call the moonlight MCP tool request_phase (target plan|auto|test|review|commit|next; operator-approved). Prefer the moonlight run_* verbs over ad-hoc shell.";
 
-/// Write [`IDE_CONTEXT`] to the support dir and return its path (best-effort; `None`
+/// Write [`ide_context`] to the support dir and return its path (best-effort; `None`
 /// when the support dir is unavailable). Idempotent — rewritten on each launch, like
 /// the statusline settings file.
 fn write_context_file() -> Option<std::path::PathBuf> {
     let dir = crate::obs::support_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("session-context.txt");
-    std::fs::write(&path, IDE_CONTEXT).ok()?;
+    std::fs::write(&path, ide_context()).ok()?;
     Some(path)
 }
 
@@ -230,10 +253,28 @@ mod tests {
             !IDE_CONTEXT_SHORT.contains('\''),
             "short context must have no apostrophes"
         );
-        // Both forms teach the key affordance.
-        assert!(IDE_CONTEXT.contains("request_phase"), "{IDE_CONTEXT}");
+        // Both forms teach the key affordances: how to ask for a phase, and how to
+        // land a plan (the Plan phase has no CC-native behavior backing it — the
+        // prompt is what makes the agent plan and call present_plan).
+        let long = ide_context();
+        assert!(long.contains("request_phase"), "{long}");
+        assert!(long.contains("present_plan"), "{long}");
+        assert!(
+            long.contains(PLAN_AIM),
+            "the long form carries the plan aim"
+        );
         assert!(
             IDE_CONTEXT_SHORT.contains("request_phase"),
+            "{IDE_CONTEXT_SHORT}"
+        );
+        assert!(
+            IDE_CONTEXT_SHORT.contains("present_plan"),
+            "{IDE_CONTEXT_SHORT}"
+        );
+        // The merged workflow has no Discovery phase left to name.
+        assert!(!long.contains("Discovery"), "{long}");
+        assert!(
+            !IDE_CONTEXT_SHORT.contains("Discovery"),
             "{IDE_CONTEXT_SHORT}"
         );
     }

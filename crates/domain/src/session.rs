@@ -134,14 +134,18 @@ impl AttentionKind {
     }
 }
 
-/// Operator-controlled execution mode, toggled with one key (FR14).
+/// The CC-native execution mode a session is running in.
+///
+/// **Derived, not a dial.** [`Phase::operator_mode`](crate::phase::Phase::operator_mode)
+/// is always [`Mode::Auto`] — no phase launches CC in its native plan mode. `Plan`
+/// therefore only ever appears as an *observed* state: the operator shift-tabbed a
+/// live session into CC plan mode and detection saw it. The workflow distinctions
+/// (Plan's no-edit posture, Test/Review/Commit) live on [`Phase`](crate::phase::Phase).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
-    /// Human-gated: the session plans and waits for approval to act (CC `plan`).
+    /// CC's own plan mode, observed from the transcript.
     Plan,
-    /// Autonomous within the session's trust tier (CC `auto`). The binary CC-native
-    /// counterpart to `Plan` — the richer workflow distinctions (Discovery's
-    /// no-edit posture, Test/Review/Commit) live on [`Phase`], not here.
+    /// Autonomous within the session's trust tier (CC `auto`) — every phase's mode.
     Auto,
 }
 

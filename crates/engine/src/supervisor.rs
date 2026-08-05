@@ -195,6 +195,7 @@ impl SessionSupervisor {
                 self.inject(feedback, "steered").await;
             }
             Command::ApproveAction { session } => self.approve_action(session).await,
+            Command::ApprovePlan { session } => self.approve_plan(session).await,
             Command::ToggleAdoption { session } => self.toggle_adoption(session),
             Command::SetAdopted { session, adopted } => self.set_adopted(session, adopted),
             Command::SetTrust { session, tier } => self.set_trust(session, tier),
@@ -350,8 +351,9 @@ impl SessionSupervisor {
                     title: None,
                     status: SessionStatus::Running,
                     phase: starting_phase,
-                    // Default-deny posture: new sessions start human-gated and untrusted.
-                    mode: Mode::Plan,
+                    // Default-deny posture: new sessions start in the read-only Plan
+                    // phase (CC `auto`, project writes denied by the PDP) and untrusted.
+                    mode: starting_phase.operator_mode(),
                     trust_tier: TrustTier::Observed,
                     attached_path,
                     pinned: false,
@@ -375,7 +377,7 @@ impl SessionSupervisor {
 
     /// The single workflow-phase transition. Sets the phase the PDP gates on + the
     /// derived mode + the **pin** flag (`pinned` = is this an operator override?),
-    /// persists, audits, nudges CC's native mode when entering Plan, fires
+    /// persists, audits, tells the agent the aim when entering Plan, fires
     /// `ReviewReady` when entering Review (opens the code-review gate), and
     /// republishes the full session row. Callers choose `pinned`: a manual
     /// [`Command::SetPhase`] pins (A ≫ B); auto-advance and [`advance_phase`] don't.
@@ -384,10 +386,11 @@ impl SessionSupervisor {
             tracing::warn!(session = %session, "apply_phase for unknown session");
             return;
         };
+        let previous = s.phase;
         // Phase is our authority; the displayed mode is derived from it so the two
-        // can never drift. Discovery/Auto/Test/Review/Commit are all CC `auto` and
-        // differ only in our write policy, so switching among them needs no CC
-        // interaction — just the phase the PDP gates on.
+        // can never drift. Every phase is CC `auto` and they differ only in our write
+        // policy, so switching between them needs no CC interaction — just the phase
+        // the PDP gates on.
         s.phase = phase;
         s.mode = phase.operator_mode();
         s.phase_pinned = pinned;
@@ -396,19 +399,25 @@ impl SessionSupervisor {
         self.persist(&updated);
         self.audit(&session, AuditAction::PhaseChanged { to: phase }, false);
 
-        // Entering Plan also nudges CC's native mode (its plan *behavior* — the
-        // agent producing a plan — isn't expressible by our gate). `set_phase` is a
-        // no-op on observe-only control; the PDP read-only enforcement is what
-        // actually guarantees safety, so a failed nudge degrades cleanly.
-        if phase == Phase::Plan {
-            if let Err(err) = self.control.set_phase(&session, Phase::Plan).await {
-                self.surface_control_error(&session, "set_phase(Plan)", err);
-            }
-        }
         // Full row so the UI + gate fold pick up phase, mode, and the pin together
         // (a thin `PhaseTransitioned` wouldn't carry the pin).
         self.bus
             .publish(EngineEvent::SessionUpserted { session: updated });
+
+        // *Entering* Plan tells the agent the aim. CC runs `auto` in every phase, so
+        // nothing about the phase itself makes it plan — `PLAN_AIM` is what does. A
+        // fresh session gets the same text from its launch system prompt; this covers
+        // the session that enters Plan mid-conversation. Injection is a no-op on
+        // observe-only control (logged quietly) — the PDP read-only enforcement is
+        // what guarantees safety, so a failed nudge degrades cleanly.
+        if phase == Phase::Plan && previous != Phase::Plan {
+            let feedback = Feedback {
+                session_id: session.clone(),
+                message: moonlight_domain::phase::PLAN_AIM.to_string(),
+                origin: FeedbackOrigin::PhaseAim,
+            };
+            self.inject(feedback, "plan aim").await;
+        }
         // Entering Review opens the code-review gate — replaces the old FR13
         // always-on-Done announcement; now ReviewReady fires when the workflow
         // actually reaches Review.
@@ -418,7 +427,7 @@ impl SessionSupervisor {
     }
 
     /// Operator-confirmed advance to the next workflow phase ([`Phase::next`],
-    /// cyclic: Commit→Discovery), returning the session to **auto** mode (clears the
+    /// cyclic: Commit→Plan), returning the session to **auto** mode (clears the
     /// pin). Drives the Test/Commit advance buttons, code-review Approve
     /// (Review→Commit), and the pinned-advance approval.
     async fn advance_phase(&mut self, session: SessionId) {
@@ -488,6 +497,35 @@ impl SessionSupervisor {
         }
     }
 
+    /// A plan was approved: hand the session off to [`Phase::AutoImplement`] so it can
+    /// implement what was just approved. Unblocking the held call is
+    /// [`Command::ApproveAction`]'s job (see [`Command::ApprovePlan`]).
+    ///
+    /// This is the **plan keystone**. It used to happen implicitly — CC left its
+    /// native plan mode, detection observed `auto`, and `PhaseObserved` flipped the
+    /// phase. Plan now runs CC in `auto` like every other phase, so that signal is
+    /// gone and the advance has to be explicit. A session that is *not* in Plan (a
+    /// native plan proposed from, say, Review) keeps its phase — that is the
+    /// operator's business. A **pinned** phase is never moved silently: it raises
+    /// `PhaseAdvanceRequested` instead (A ≫ B), same as the done-path.
+    async fn approve_plan(&mut self, session: SessionId) {
+        let Some(s) = self.fleet.get(&session) else {
+            tracing::warn!(session = %session, "ApprovePlan for unknown session");
+            return;
+        };
+        if s.phase != Phase::Plan {
+            return;
+        }
+        if s.phase_pinned {
+            self.bus.publish(EngineEvent::PhaseAdvanceRequested {
+                session,
+                to: Phase::Plan.next(),
+            });
+        } else {
+            self.apply_phase(session, Phase::Plan.next(), false).await;
+        }
+    }
+
     // ---- Inbound: detection ---------------------------------------------
 
     /// React to one observed [`DetectionEvent`]: update the session's status or
@@ -508,20 +546,22 @@ impl SessionSupervisor {
                 };
                 // Detection can only see CC's **plan vs non-plan** mode from the
                 // transcript (`phase_from_mode` emits Plan or AutoImplement). It must
-                // NOT clobber our richer phase: Discovery/Auto/Test/Review/Commit are
-                // all CC `auto`, so observing `auto` is consistent with whichever one
-                // the operator/engine already chose. Only reconcile the boundary:
-                //   • CC entered plan  ⇒ adopt Plan.
-                //   • CC left plan (now auto) while we still think it's Plan ⇒ AutoImplement.
-                //   • CC is auto and we already hold a non-plan phase ⇒ keep it.
+                // NOT clobber our richer phase: **every** phase now runs CC in `auto`,
+                // so observing `auto` says nothing at all — it is consistent with
+                // whichever phase the operator/engine already chose, Plan included.
+                // The one signal left is the operator shift-tabbing a live session into
+                // CC's own plan mode, which we adopt as Phase::Plan.
                 let reconciled = if s.phase_pinned {
                     // Operator pinned the phase — detection must not clobber it (A ≫ B).
                     None
                 } else {
-                    match (phase, s.phase) {
-                        (Phase::Plan, _) => Some(Phase::Plan),
-                        (_, Phase::Plan) => Some(Phase::AutoImplement),
-                        (_, _) => None, // already a non-plan phase — don't overwrite
+                    match phase {
+                        Phase::Plan => Some(Phase::Plan),
+                        // `auto` observed: no information — never overwrite our phase.
+                        // (Dropping this used to kick a Plan session into AutoImplement,
+                        // which would now fire on the first transcript line of *every*
+                        // Plan session, since Plan itself runs CC in auto.)
+                        _ => None,
                     }
                 };
                 s.last_activity = now();
@@ -649,9 +689,9 @@ impl SessionSupervisor {
         });
 
         // Workflow advancement on a done-checkpoint (replaces the old FR13
-        // revert-to-Plan). CC's own done-signal advances only the phases CC owns
-        // (Discovery, AutoImplement); the operator-confirmed gates (Plan via the
-        // plan keystone, Test/Review/Commit via their buttons) hold here. A pinned
+        // revert-to-Plan). CC's own done-signal advances only the phase CC owns
+        // (AutoImplement); the operator-confirmed gates (Plan via the plan-approval
+        // keystone, Test/Review/Commit via their buttons) hold here. A pinned
         // session never auto-moves — it raises a request instead (A ≫ B).
         if status == SessionStatus::Done {
             let Some(s) = self.fleet.get(&session) else {
@@ -719,7 +759,7 @@ fn discovered_session(id: SessionId) -> Session {
         title: None,
         status: SessionStatus::Idle,
         phase: Phase::Plan,
-        mode: Mode::Plan,
+        mode: Mode::Auto,
         trust_tier: TrustTier::Observed,
         attached_path: None,
         pinned: false,
@@ -896,7 +936,7 @@ mod tests {
                 root: Some("/repo".into()),
                 title: None,
                 mode: Mode::Auto,
-                phase: Phase::Discovery,
+                phase: Phase::Review,
                 adopted: true,
                 paused: false,
                 phase_pinned: false,
@@ -918,7 +958,7 @@ mod tests {
             s.adopted,
             "an app-managed record must auto-adopt on discovery"
         );
-        assert_eq!(s.phase, Phase::Discovery, "phase seeded from the record");
+        assert_eq!(s.phase, Phase::Review, "phase seeded from the record");
         assert_eq!(s.mode, Mode::Auto, "mode seeded from the record");
         assert_eq!(
             s.trust_tier,
@@ -976,7 +1016,7 @@ mod tests {
                     trust_tier: TrustTier::Observed,
                     root: Some("/repo/b".into()),
                     title: None,
-                    mode: Mode::Plan,
+                    mode: Mode::Auto,
                     phase: Phase::Plan,
                     adopted: false,
                     paused: false,
@@ -1025,7 +1065,7 @@ mod tests {
                 trust_tier: TrustTier::Observed,
                 root: Some("/repo".into()),
                 title: None,
-                mode: Mode::Plan,
+                mode: Mode::Auto,
                 phase: Phase::Plan,
                 adopted: false,
                 paused: false,
@@ -1218,10 +1258,11 @@ mod tests {
             session: SessionId::new("s"),
         })
         .await;
-        // Move to AutoImplement via detection (unpinned, the auto-advancing phase).
-        sup.on_detection(DetectionEvent::PhaseObserved {
+        // Move to AutoImplement by advancing the workflow (unpinned, the
+        // auto-advancing phase). Detection can't put us here any more: every phase
+        // runs CC in `auto`, so an observed mode never implies a phase.
+        sup.handle_command(Command::AdvancePhase {
             session: SessionId::new("s"),
-            phase: Phase::AutoImplement,
         })
         .await;
         let _ = drain(&mut rx);
@@ -1236,6 +1277,148 @@ mod tests {
             sup.session(&SessionId::new("s")).unwrap().phase,
             Phase::Test,
             "CC's done-signal auto-advances AutoImplement → Test"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_does_not_auto_advance_on_done() {
+        let (mut sup, _control, mut rx) = fixture();
+        sup.on_detection(DetectionEvent::Discovered {
+            session: SessionId::new("s"),
+        })
+        .await;
+        sup.on_detection(DetectionEvent::PhaseObserved {
+            session: SessionId::new("s"),
+            phase: Phase::Plan,
+        })
+        .await;
+        let _ = drain(&mut rx);
+
+        sup.on_detection(DetectionEvent::StatusChanged {
+            session: SessionId::new("s"),
+            status: SessionStatus::Done,
+        })
+        .await;
+
+        assert_eq!(
+            sup.session(&SessionId::new("s")).unwrap().phase,
+            Phase::Plan,
+            "Plan waits for the plan-approval keystone, not CC's done-signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn observing_cc_auto_never_moves_a_plan_session() {
+        // Plan runs CC in `auto` like every other phase, so an observed `auto` carries
+        // no information. Acting on it would kick every Plan session into AutoImplement
+        // on its first transcript line — and silently unfreeze project writes.
+        let (mut sup, _control, mut rx) = fixture();
+        sup.on_detection(DetectionEvent::Discovered {
+            session: SessionId::new("s"),
+        })
+        .await;
+        sup.on_detection(DetectionEvent::PhaseObserved {
+            session: SessionId::new("s"),
+            phase: Phase::Plan,
+        })
+        .await;
+        let _ = drain(&mut rx);
+
+        sup.on_detection(DetectionEvent::PhaseObserved {
+            session: SessionId::new("s"),
+            phase: Phase::AutoImplement,
+        })
+        .await;
+
+        assert_eq!(
+            sup.session(&SessionId::new("s")).unwrap().phase,
+            Phase::Plan,
+            "observed `auto` must not move a session off Plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_a_plan_hands_the_session_off_to_auto() {
+        let (mut sup, _control, mut rx) = fixture();
+        sup.on_detection(DetectionEvent::Discovered {
+            session: SessionId::new("s"),
+        })
+        .await;
+        sup.on_detection(DetectionEvent::PhaseObserved {
+            session: SessionId::new("s"),
+            phase: Phase::Plan,
+        })
+        .await;
+        let _ = drain(&mut rx);
+
+        sup.handle_command(Command::ApprovePlan {
+            session: SessionId::new("s"),
+        })
+        .await;
+
+        assert_eq!(
+            sup.session(&SessionId::new("s")).unwrap().phase,
+            Phase::AutoImplement,
+            "approving the plan is the keystone that moves Plan → Auto"
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_a_plan_on_a_pinned_session_only_requests_the_advance() {
+        let (mut sup, _control, mut rx) = fixture();
+        sup.on_detection(DetectionEvent::Discovered {
+            session: SessionId::new("s"),
+        })
+        .await;
+        // A manual pick pins Plan (A ≫ B).
+        sup.handle_command(Command::SetPhase {
+            session: SessionId::new("s"),
+            phase: Phase::Plan,
+        })
+        .await;
+        let _ = drain(&mut rx);
+
+        sup.handle_command(Command::ApprovePlan {
+            session: SessionId::new("s"),
+        })
+        .await;
+
+        assert_eq!(
+            sup.session(&SessionId::new("s")).unwrap().phase,
+            Phase::Plan,
+            "a pinned phase is never moved silently"
+        );
+        assert!(
+            drain(&mut rx).iter().any(|e| matches!(e,
+                EngineEvent::PhaseAdvanceRequested { to, .. } if *to == Phase::AutoImplement)),
+            "pinned + plan approved raises a PhaseAdvanceRequested(Auto) instead"
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_a_plan_outside_plan_leaves_the_phase_alone() {
+        // A native plan proposed from, say, Review: the phase is the operator's
+        // business — never jump the workflow backwards into implementation.
+        let (mut sup, _control, mut rx) = fixture();
+        sup.on_detection(DetectionEvent::Discovered {
+            session: SessionId::new("s"),
+        })
+        .await;
+        sup.handle_command(Command::SetPhase {
+            session: SessionId::new("s"),
+            phase: Phase::Review,
+        })
+        .await;
+        let _ = drain(&mut rx);
+
+        sup.handle_command(Command::ApprovePlan {
+            session: SessionId::new("s"),
+        })
+        .await;
+
+        assert_eq!(
+            sup.session(&SessionId::new("s")).unwrap().phase,
+            Phase::Review
         );
     }
 
@@ -1335,7 +1518,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_advance_loops_back_to_discovery() {
+    async fn commit_advance_loops_back_to_plan() {
         let (mut sup, _control, mut rx) = fixture();
         sup.on_detection(DetectionEvent::Discovered {
             session: SessionId::new("s"),
@@ -1355,8 +1538,8 @@ mod tests {
 
         assert_eq!(
             sup.session(&SessionId::new("s")).unwrap().phase,
-            Phase::Discovery,
-            "Commit → Discovery starts the next cycle"
+            Phase::Plan,
+            "Commit → Plan starts the next cycle"
         );
     }
 
@@ -1381,7 +1564,7 @@ mod tests {
         let s = sup.session(&id).expect("session inserted");
         assert_eq!(s.status, SessionStatus::Running);
         assert_eq!(s.phase, Phase::Plan);
-        assert_eq!(s.mode, Mode::Plan);
+        assert_eq!(s.mode, Mode::Auto, "every phase runs CC in auto");
 
         // And the right fact landed on the bus: a full-row upsert (so the UI can
         // build a tile), carrying the spawned defaults.
@@ -1391,7 +1574,7 @@ mod tests {
                 if session.id == id
                     && session.status == SessionStatus::Running
                     && session.phase == Phase::Plan
-                    && session.mode == Mode::Plan),
+                    && session.mode == Mode::Auto),
             "got {events:?}"
         );
     }
@@ -1557,9 +1740,8 @@ mod tests {
             attached_path: None,
         })
         .await;
-        sup.on_detection(DetectionEvent::PhaseObserved {
+        sup.handle_command(Command::AdvancePhase {
             session: id.clone(),
-            phase: Phase::AutoImplement,
         })
         .await;
         assert_eq!(sup.session(&id).unwrap().phase, Phase::AutoImplement);
@@ -1607,11 +1789,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn toggle_to_plan_forces_phase_and_publishes() {
+    async fn entering_plan_injects_the_aim_and_publishes() {
         let (mut sup, control, mut rx) = fixture();
         let id = SessionId::new("sess-1");
 
-        // Spawn then move to Auto mode + AutoImplement phase.
+        // Spawn then move to the AutoImplement phase.
         sup.handle_command(Command::SpawnSession {
             prompt: "x".into(),
             attached_path: None,
@@ -1629,20 +1811,21 @@ mod tests {
         .await;
         let _ = drain(&mut rx);
 
-        // Switching back to Plan forces the next turn into Plan.
+        // Switching back to Plan tells the agent the aim — CC is in `auto` either
+        // way, so this injection is the only thing that makes it plan.
         sup.handle_command(Command::SetPhase {
             session: id.clone(),
             phase: Phase::Plan,
         })
         .await;
 
-        assert_eq!(sup.session(&id).unwrap().mode, Mode::Plan);
+        assert_eq!(sup.session(&id).unwrap().mode, Mode::Auto);
         assert_eq!(sup.session(&id).unwrap().phase, Phase::Plan);
         assert!(
             control
                 .calls()
                 .iter()
-                .any(|c| c.contains("set_phase") && c.contains("phase=Plan")),
+                .any(|c| c.contains("inject_feedback") && c.contains("origin=PhaseAim")),
             "got {:?}",
             control.calls()
         );
@@ -1664,15 +1847,14 @@ mod tests {
         let mut sup = SessionSupervisor::with_store(control, bus, Some(store.clone() as Arc<_>));
         let id = SessionId::new("sess-1");
 
-        // Spawn (Plan), then observe a phase change → should persist + audit.
+        // Spawn (Plan), then move the phase → should persist + audit.
         sup.handle_command(Command::SpawnSession {
             prompt: "x".into(),
             attached_path: None,
         })
         .await;
-        sup.on_detection(DetectionEvent::PhaseObserved {
+        sup.handle_command(Command::AdvancePhase {
             session: id.clone(),
-            phase: Phase::AutoImplement,
         })
         .await;
 
@@ -1709,14 +1891,14 @@ mod tests {
             attached_path: None,
         })
         .await;
-        sup.on_detection(DetectionEvent::PhaseObserved {
+        sup.handle_command(Command::AdvancePhase {
             session: SessionId::new("sess-1"),
-            phase: Phase::AutoImplement,
         })
         .await;
         let events = drain(&mut rx);
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, EngineEvent::PhaseTransitioned { .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            EngineEvent::SessionUpserted { session } if session.phase == Phase::AutoImplement
+        )));
     }
 }

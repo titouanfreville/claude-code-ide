@@ -62,8 +62,8 @@ pub struct RunStopParams {
 /// Parameters for the `request_phase` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RequestPhaseParams {
-    /// The workflow phase to move to — one of `discovery`, `plan`, `auto`, `test`,
-    /// `review`, `commit`, or `next` to advance one step. Empty also means `next`.
+    /// The workflow phase to move to — one of `plan`, `auto`, `test`, `review`,
+    /// `commit`, or `next` to advance one step. Empty also means `next`.
     #[serde(default)]
     pub phase: String,
 }
@@ -181,7 +181,7 @@ impl VerbToolServer {
     /// agent asks; the human in the cockpit approves or denies.
     #[tool(
         name = "request_phase",
-        description = "Request a workflow-phase change (the IDE's Discovery → Plan → Auto → Test → Review → Commit gate). `phase` = a target phase (`discovery`, `plan`, `auto`, `test`, `review`, `commit`) or `next` (empty = next) to advance one step. The operator must approve every request — use it when you need write access, are done gathering context, or want to move the workflow forward; you cannot change phase on your own."
+        description = "Request a workflow-phase change (the IDE's Plan → Auto → Test → Review → Commit gate). `phase` = a target phase (`plan`, `auto`, `test`, `review`, `commit`) or `next` (empty = next) to advance one step. The operator must approve every request — use it when you need write access, are done gathering context, or want to move the workflow forward; you cannot change phase on your own."
     )]
     async fn request_phase(&self, params: Parameters<RequestPhaseParams>) -> String {
         self.dispatch(McpVerb::RequestPhase, params.0.phase).await
@@ -211,7 +211,7 @@ impl VerbToolServer {
     /// Report the current workflow phase and what it allows — read-only, no approval.
     #[tool(
         name = "phase_status",
-        description = "Report your current workflow phase (Discovery / Plan / Auto / Test / Review / Commit) and exactly what it allows: whether project-file edits and AI-workspace notes are permitted, and what `next` would advance to. Read-only — no approval, no side effect, works in any phase. Call this first when unsure which phase you are in, before deciding whether to request_phase, so you never act on the wrong phase."
+        description = "Report your current workflow phase (Plan / Auto / Test / Review / Commit) and exactly what it allows: whether project-file edits and AI-workspace notes are permitted, and what `next` would advance to. Read-only — no approval, no side effect, works in any phase. Call this first when unsure which phase you are in, before deciding whether to request_phase, so you never act on the wrong phase."
     )]
     async fn phase_status(&self) -> String {
         self.dispatch(McpVerb::PhaseStatus, String::new()).await
