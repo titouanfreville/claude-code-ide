@@ -42,7 +42,8 @@ const RUN_CONTEXT: &str = "RunConsole";
 /// Bind the Run window's keys. Called once from `init_shell`.
 pub fn init_keybindings(cx: &mut App) {
     cx.bind_keys(vec![
-        KeyBinding::new("cmd-f", ToggleSearch, Some(RUN_CONTEXT)),
+        // `secondary-` is ⌘ on macOS, Ctrl elsewhere (see `init_shell`).
+        KeyBinding::new("secondary-f", ToggleSearch, Some(RUN_CONTEXT)),
         KeyBinding::new("escape", CloseSearch, Some(RUN_CONTEXT)),
     ]);
 }

@@ -75,6 +75,14 @@ tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-java = "0.23"
 
+# Two-pane diff alignment for the review surface (see `src/pair_diff.rs`).
+similar.workspace = true
+
+# Decodes the embedded app icon into the `RgbaImage` GPUI wants for the X11
+# `_NET_WM_ICON`. Same version gpui already resolves (0.25.x in the lockfile), so
+# depending on it directly adds no build — only the PNG decoder is needed.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 # macOS Dock icon set at runtime (AppKit). Already in the lockfile transitively via
 # gpui, so this pins no new versions. Feature-gated to the classes we touch.
 [target.'cfg(target_os = "macos")'.dependencies]

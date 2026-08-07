@@ -66,7 +66,13 @@ tokio-stream = "0.1"
 # `rev` source and gpui-component's branchless source would NOT unify, pulling two
 # incompatible `gpui` builds (API drift breaks gpui-component's own code).
 gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+# `wayland`/`x11` are REQUIRED on Linux: zed's workspace pulls `gpui_linux` with
+# `default-features = false`, so neither backend compiles unless re-enabled here
+# (gpui_platform forwards these features to gpui_linux). Without them
+# `current_platform()` hits `unreachable!()` in gpui_linux/src/linux.rs —
+# `guess_compositor()` reports X11/Wayland but only the `Headless` arm exists.
+# Harmless elsewhere: the gpui_linux dep is `cfg(target_os = "linux")`-gated.
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "wayland", "x11"] }
 # `tree-sitter-languages` enables the bundled grammars so the code-editor panel
 # actually syntax-highlights (rust/ts/go/py/json/…); without it `code_editor(lang)`
 # resolves to no grammar (langs are `#[cfg(feature)]`-gated) and renders plain.
@@ -77,6 +83,11 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "
 # compatible with the pinned gpui ecosystem. alacritty_terminal is Apache-2.0 — we
 # use ONLY its public API; Zed's GPL terminal/terminal_view crates are not used.
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "9d9640d4" }
+
+# Line-level diffing for the review surface's two-pane view. `git/diff.rs` only
+# *parses* diffs git produced; a before/after pane alignment has to be computed
+# from two full texts, which git's unified output can't express. Pure Rust.
+similar = "3"
 
 # SQLite driver for the DB-observer panel (read-only browse). `bundled` compiles
 # SQLite in-tree so there's no system libsqlite dependency.
@@ -100,6 +111,14 @@ moonlight-mcp-server = { path = "crates/mcp-server" }
 [profile.dev]
 # Faster incremental dev builds; GPUI is heavy so keep opt-level low for our crates.
 opt-level = 0
+
+# …but NOT for dependencies. GPUI, wgpu and the terminal core do the per-frame
+# layout, shaping and grid work, and unoptimized they saturate the UI thread — a
+# dev build renders on the GPU perfectly well and still feels slow to type in.
+# Dependencies are compiled once and rarely change, so paying for -O3 here costs a
+# single long build and leaves `cargo run` on our own crates as fast as before.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

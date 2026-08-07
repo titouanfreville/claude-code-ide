@@ -469,10 +469,9 @@ pub(crate) fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// macOS-first state file location under Application Support.
+/// The recent-projects list, in the platform state directory.
 fn state_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/MoonlightCode/projects.json"))
+    crate::support::support_path("projects.json")
 }
 
 fn load_from(path: &Path) -> Option<PersistState> {

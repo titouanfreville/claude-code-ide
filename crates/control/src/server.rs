@@ -8,19 +8,26 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use moonlight_domain::ids::SessionId;
-use moonlight_domain::ports::PolicyDecisionPoint;
+use moonlight_domain::changes::{Baseline, BaselineGap, ChangeTool, FileTouch};
+use moonlight_domain::ids::{SessionId, Timestamp};
+use moonlight_domain::ports::{PolicyDecisionPoint, SessionChangeStore};
+use moonlight_domain::trust::DangerClass;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::config::AiWorkspaceResolver;
 use crate::gate::{evaluate, GateDecision, GateState, HoldKind};
 use crate::ipc::{HookRequest, HookResponse};
-use crate::paths::{classify_write_scope, AiWorkspace};
+use crate::paths::{absolutize, classify_write_scope, write_target, AiWorkspace};
 use crate::pending::{ApprovalNotifier, Decision, PendingApprovals};
+use crate::probe::{NoProbe, SharedProbe};
+use crate::shell_scan::Fingerprint;
+
+/// The tool whose writes have to be inferred rather than read off the call.
+const SHELL_TOOL: &str = "Bash";
 
 /// The shared per-session gate read-model. The app keeps this in sync by folding
 /// engine events; the server only ever reads it.
@@ -81,6 +88,20 @@ pub struct ControlServer {
     runtime_safe: RuntimeSafeTools,
     /// Resolves an external session ID / conversation ID back to the launch UUID.
     id_resolver: Option<IdResolver>,
+    /// Records which files a session writes, so the review surface can diff *this
+    /// session's* changes rather than whatever is dirty in the tree. `None` (tests,
+    /// the degraded standalone server) simply skips capture — the ledger is an
+    /// observation, never a gate.
+    changes: Option<Arc<dyn SessionChangeStore>>,
+    /// Reads the workspace's VCS to find and explain writes made through the shell
+    /// (see [`crate::shell_scan`]). Defaults to [`NoProbe`]: shell writes then go
+    /// unattributed rather than blocking anything.
+    probe: SharedProbe,
+    /// Per-session workspace fingerprint taken at `PreToolUse(Bash)` and consumed at
+    /// the matching `PostToolUse`. One entry per session: Claude Code runs a
+    /// session's tools one at a time, so a pending fingerprint always belongs to the
+    /// command now finishing.
+    shell_pre: Mutex<HashMap<SessionId, Fingerprint>>,
 }
 
 impl ControlServer {
@@ -96,6 +117,9 @@ impl ControlServer {
             ai: AiWorkspaceResolver::default(),
             runtime_safe: RuntimeSafeTools::default(),
             id_resolver: None,
+            changes: None,
+            probe: Arc::new(NoProbe),
+            shell_pre: Mutex::new(HashMap::new()),
         }
     }
 
@@ -103,6 +127,20 @@ impl ControlServer {
     /// restart (the cockpit appends to the same `Arc`; the server reads it per request).
     pub fn with_runtime_safe(mut self, runtime_safe: RuntimeSafeTools) -> Self {
         self.runtime_safe = runtime_safe;
+        self
+    }
+
+    /// Wire the per-session file-change ledger. Without it the server gates exactly
+    /// as before; it just records nothing.
+    pub fn with_change_ledger(mut self, changes: Arc<dyn SessionChangeStore>) -> Self {
+        self.changes = Some(changes);
+        self
+    }
+
+    /// Wire the workspace probe that makes shell writes attributable. Without it
+    /// only the path-declaring tools (`Edit`/`Write`/…) reach the ledger.
+    pub fn with_workspace_probe(mut self, probe: SharedProbe) -> Self {
+        self.probe = probe;
         self
     }
 
@@ -147,6 +185,9 @@ impl ControlServer {
             ai: AiWorkspaceResolver::default(),
             runtime_safe: RuntimeSafeTools::default(),
             id_resolver: None,
+            changes: None,
+            probe: Arc::new(NoProbe),
+            shell_pre: Mutex::new(HashMap::new()),
         }
     }
 
@@ -191,17 +232,19 @@ impl ControlServer {
         let Ok(req) = serde_json::from_slice::<HookRequest>(request_bytes) else {
             return HookResponse::fail_open();
         };
-        // We only gate `PreToolUse`. Any other hook event (Stop, Notification, …)
-        // is observe-only → allow, so registering us on a different event can never
-        // wrongly block a tool. (Empty event = our own internal/test messages.)
+        // We only gate `PreToolUse`. `PostToolUse` is observe-only: it closes the
+        // shell-write scan opened before the command ran. Any other hook event
+        // (Stop, Notification, …) is allowed untouched, so registering us on a
+        // different event can never wrongly block a tool. (Empty event = our own
+        // internal/test messages.)
         if !req.event.is_empty() && req.event != "PreToolUse" {
+            if req.event == "PostToolUse" {
+                let session = self.resolve_session(&req);
+                self.close_shell_scan(&session, &req);
+            }
             return HookResponse::Allow;
         }
-        let session = if let Some(resolver) = &self.id_resolver {
-            resolver(&req.session_id).unwrap_or_else(|| SessionId::new(req.session_id.clone()))
-        } else {
-            SessionId::new(req.session_id.clone())
-        };
+        let session = self.resolve_session(&req);
 
         // Resolve which part of the tree a file write touches (path + cwd vs the
         // cwd's effective AI-workspace allowlist) so a frozen phase freezes project
@@ -225,10 +268,120 @@ impl ControlServer {
             )
         };
 
+        // Record only when the tool is actually about to run — a denied write never
+        // happened, and a held one only happens if the operator lets it through.
         match decision {
-            GateDecision::Allow => HookResponse::Allow,
+            GateDecision::Allow => {
+                self.record_touch(&session, &req);
+                self.open_shell_scan(&session, &req);
+                HookResponse::Allow
+            }
             GateDecision::Deny { reason } => HookResponse::Deny { reason },
-            GateDecision::Hold(kind) => self.hold(session, kind).await,
+            GateDecision::Hold(kind) => {
+                let response = self.hold(session.clone(), kind).await;
+                if matches!(response, HookResponse::Allow) {
+                    self.record_touch(&session, &req);
+                    self.open_shell_scan(&session, &req);
+                }
+                response
+            }
+        }
+    }
+
+    /// The launch id behind a request's session id (Antigravity reports its own
+    /// conversation id).
+    fn resolve_session(&self, req: &HookRequest) -> SessionId {
+        match &self.id_resolver {
+            Some(resolve) => {
+                resolve(&req.session_id).unwrap_or_else(|| SessionId::new(req.session_id.clone()))
+            }
+            None => SessionId::new(req.session_id.clone()),
+        }
+    }
+
+    /// Whether this request is a shell command that could write, and so is worth
+    /// fingerprinting the workspace around. Read-only commands (`ls`, `grep`,
+    /// `git status`) are already classified `Safe`, and skipping them keeps two
+    /// `git status` calls off the hot path of every shell invocation.
+    fn is_scannable_shell(&self, req: &HookRequest) -> bool {
+        self.changes.is_some()
+            && req.tool_name == SHELL_TOOL
+            && crate::classify(&req.tool_name, &req.tool_input) != DangerClass::Safe
+    }
+
+    /// Fingerprint the workspace before a shell command runs, so the matching
+    /// `PostToolUse` can tell what it wrote.
+    fn open_shell_scan(&self, session: &SessionId, req: &HookRequest) {
+        if !self.is_scannable_shell(req) {
+            return;
+        }
+        let before = Fingerprint::of(&self.probe.dirty_paths(&req.cwd));
+        let mut pre = self.shell_pre.lock().unwrap_or_else(|p| p.into_inner());
+        pre.insert(session.clone(), before);
+    }
+
+    /// Compare the workspace against the fingerprint taken before the command and
+    /// record everything it wrote. Without a matching open scan (a read-only
+    /// command, a server that started mid-command) there is nothing to close.
+    fn close_shell_scan(&self, session: &SessionId, req: &HookRequest) {
+        let Some(changes) = &self.changes else {
+            return;
+        };
+        let before = {
+            let mut pre = self.shell_pre.lock().unwrap_or_else(|p| p.into_inner());
+            pre.remove(session)
+        };
+        let Some(before) = before else {
+            return;
+        };
+        let after = Fingerprint::of(&self.probe.dirty_paths(&req.cwd));
+        let at = now();
+        for path in after.written_since(&before) {
+            // `HEAD` is the only "before" available for a file nobody read: exact
+            // when it was committed-clean, and flagged as HEAD-derived either way.
+            // A file this session already touched keeps its earlier, exact baseline
+            // — the store is first-touch-wins.
+            let baseline = match self.probe.head_blob(&req.cwd, &path) {
+                Some(content) => Baseline::FromHead(content),
+                None => Baseline::Created,
+            };
+            let touch = FileTouch {
+                session_id: session.clone(),
+                path,
+                at,
+                tool: ChangeTool::Shell,
+                baseline,
+            };
+            if let Err(error) = changes.record_touch(&touch) {
+                tracing::warn!(session = %session, error = %error, "recording a shell write failed");
+            }
+        }
+    }
+
+    /// Note that `session` is about to write a file, capturing the file's current
+    /// content as the baseline the first time this session touches it.
+    ///
+    /// This runs while Claude Code blocks on our verdict, which is exactly what makes
+    /// it correct: the write hasn't landed, so what's on disk *is* the pre-image.
+    /// Every failure is swallowed — capture is an observation and must never turn
+    /// into a gate.
+    fn record_touch(&self, session: &SessionId, req: &HookRequest) {
+        let Some(changes) = &self.changes else {
+            return;
+        };
+        let Some((path, tool)) = write_target(&req.tool_name, &req.tool_input) else {
+            return;
+        };
+        let path = absolutize(path, &req.cwd);
+        let touch = FileTouch {
+            session_id: session.clone(),
+            baseline: read_baseline(&path),
+            path,
+            at: now(),
+            tool,
+        };
+        if let Err(error) = changes.record_touch(&touch) {
+            tracing::warn!(session = %session, error = %error, "recording a file touch failed");
         }
     }
 
@@ -286,6 +439,63 @@ impl ControlServer {
 /// Client side (the `moonlight hook` CLI): forward `request` to the server at
 /// `socket` and return its verdict. Any error or a timeout yields
 /// [`HookResponse::fail_open`] — Claude Code must never be blocked by us.
+/// Capture cap for a baseline snapshot. Matches the code editor's own file cap:
+/// past this the diff is unreadable anyway, and the ledger shouldn't grow without
+/// bound on generated files.
+const MAX_BASELINE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// How much of a file to sniff for NUL before deciding it isn't text.
+const BINARY_SNIFF_BYTES: usize = 8192;
+
+/// The pre-image of `path` for the change ledger, read while the writing tool is
+/// still blocked on our verdict. A missing file means the agent is creating it.
+fn read_baseline(path: &str) -> Baseline {
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        // No file (or no access to stat it): treat as a creation. The review pane
+        // then shows the whole file as added, which is what happened.
+        Err(_) => return Baseline::Created,
+    };
+    if !meta.is_file() {
+        return Baseline::Unavailable {
+            reason: BaselineGap::Unreadable,
+        };
+    }
+    if meta.len() > MAX_BASELINE_BYTES {
+        return Baseline::Unavailable {
+            reason: BaselineGap::TooLarge,
+        };
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Baseline::Unavailable {
+                reason: BaselineGap::Unreadable,
+            }
+        }
+    };
+    if bytes.iter().take(BINARY_SNIFF_BYTES).any(|b| *b == 0) {
+        return Baseline::Unavailable {
+            reason: BaselineGap::Binary,
+        };
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Baseline::Content(text),
+        Err(_) => Baseline::Unavailable {
+            reason: BaselineGap::Binary,
+        },
+    }
+}
+
+/// Wall-clock now as epoch millis (the domain has no clock).
+fn now() -> Timestamp {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Timestamp::from_millis(ms)
+}
+
 pub async fn query_hook(socket: &Path, request: &HookRequest, timeout: Duration) -> HookResponse {
     match tokio::time::timeout(timeout, query_inner(socket, request)).await {
         Ok(Ok(resp)) => resp,
@@ -306,7 +516,11 @@ async fn query_inner(socket: &Path, request: &HookRequest) -> std::io::Result<Ho
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moonlight_domain::errors::TrustError;
+    use std::sync::Mutex;
+
+    use crate::probe::WorkspaceProbe;
+    use moonlight_domain::changes::{ReviewComment, TouchedPath};
+    use moonlight_domain::errors::{StoreError, TrustError};
     use moonlight_domain::phase::Phase;
     use moonlight_domain::ports::PermissionRequest;
     use moonlight_domain::trust::{DangerClass, PermissionOutcome, WriteScope};
@@ -346,6 +560,385 @@ mod tests {
             tool_input: json!({ "file_path": "/x" }),
             cwd: "/repo".into(),
         }
+    }
+
+    /// Records what the server captured, so a test can assert on the ledger without
+    /// a database.
+    #[derive(Default)]
+    struct FakeChanges {
+        touches: Mutex<Vec<FileTouch>>,
+    }
+
+    impl SessionChangeStore for FakeChanges {
+        fn record_touch(&self, touch: &FileTouch) -> Result<bool, StoreError> {
+            let mut touches = self.touches.lock().unwrap_or_else(|p| p.into_inner());
+            touches.push(touch.clone());
+            Ok(true)
+        }
+        fn baseline(&self, _: &SessionId, _: &str) -> Result<Option<Baseline>, StoreError> {
+            Ok(None)
+        }
+        fn touched_paths(&self, _: &SessionId) -> Result<Vec<TouchedPath>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn touched_counts(&self) -> Result<Vec<(SessionId, u32)>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn forget_session_changes(&self, _: &SessionId) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn mark_reviewed(
+            &self,
+            _: &SessionId,
+            _: &str,
+            _: Option<Timestamp>,
+        ) -> Result<bool, StoreError> {
+            Ok(true)
+        }
+        fn ignored_paths(&self, _: &SessionId) -> Result<Vec<String>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn set_ignored(&self, _: &SessionId, _: &str, _: bool) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn clear_ignored(&self, _: &SessionId) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn add_comment(&self, _: &ReviewComment) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn comments(&self, _: &SessionId) -> Result<Vec<ReviewComment>, StoreError> {
+            Ok(Vec::new())
+        }
+        fn update_comment(&self, _: &ReviewComment) -> Result<bool, StoreError> {
+            Ok(true)
+        }
+        fn delete_comment(&self, _: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn mark_comments_sent(&self, _: &[String], _: Timestamp) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    impl FakeChanges {
+        fn recorded(&self) -> Vec<FileTouch> {
+            self.touches
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+    }
+
+    /// A gate that lets writes through (Auto phase, adopted).
+    fn writable_gate(session: &str) -> GateView {
+        gates_with(
+            session,
+            GateState {
+                adopted: true,
+                phase: Phase::AutoImplement,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Decide directly, skipping the socket — capture is what's under test here.
+    async fn decide_json(server: &ControlServer, request: &HookRequest) -> HookResponse {
+        server
+            .decide(&serde_json::to_vec(request).expect("serialize hook request"))
+            .await
+    }
+
+    #[tokio::test]
+    async fn an_allowed_write_records_the_files_pre_image() {
+        // A real file on disk: the point of capturing at PreToolUse is that what's
+        // there right now is the "before" side of the review.
+        let path = std::env::temp_dir().join(format!("ml-baseline-{}.txt", std::process::id()));
+        std::fs::write(&path, "before the edit\n").unwrap();
+
+        let changes = Arc::new(FakeChanges::default());
+        let server = ControlServer::new(writable_gate("s1"), Arc::new(TestPdp))
+            .with_change_ledger(changes.clone());
+
+        let mut request = req("s1", "Edit");
+        request.tool_input = json!({ "file_path": path.to_str().unwrap() });
+        let resp = decide_json(&server, &request).await;
+
+        assert!(matches!(resp, HookResponse::Allow));
+        let recorded = changes.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].path, path.to_string_lossy());
+        assert_eq!(recorded[0].tool, ChangeTool::Edit);
+        assert_eq!(
+            recorded[0].baseline,
+            Baseline::Content("before the edit\n".into()),
+            "the baseline is the content BEFORE the tool runs"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_denied_write_records_nothing() {
+        let changes = Arc::new(FakeChanges::default());
+        // Adopted + Plan = project writes are frozen, so this Edit is denied.
+        let gates = gates_with(
+            "s2",
+            GateState {
+                adopted: true,
+                phase: Phase::Plan,
+                ..Default::default()
+            },
+        );
+        let server =
+            ControlServer::new(gates, Arc::new(TestPdp)).with_change_ledger(changes.clone());
+
+        let resp = decide_json(&server, &req("s2", "Edit")).await;
+
+        assert!(matches!(resp, HookResponse::Deny { .. }));
+        assert!(
+            changes.recorded().is_empty(),
+            "a write that never happened must not enter the ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_write_tools_are_not_ledger_entries() {
+        let changes = Arc::new(FakeChanges::default());
+        let server = ControlServer::new(writable_gate("s3"), Arc::new(TestPdp))
+            .with_change_ledger(changes.clone());
+
+        for tool in ["Read", "Bash", "Grep"] {
+            let resp = decide_json(&server, &req("s3", tool)).await;
+            assert!(matches!(resp, HookResponse::Allow));
+        }
+        assert!(
+            changes.recorded().is_empty(),
+            "only path-attributable writes are attributable to a file"
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_a_new_file_records_it_as_created() {
+        let changes = Arc::new(FakeChanges::default());
+        let server = ControlServer::new(writable_gate("s4"), Arc::new(TestPdp))
+            .with_change_ledger(changes.clone());
+
+        let mut request = req("s4", "Write");
+        let missing = std::env::temp_dir().join(format!("ml-absent-{}.txt", std::process::id()));
+        std::fs::remove_file(&missing).ok();
+        request.tool_input = json!({ "file_path": missing.to_str().unwrap() });
+
+        let resp = decide_json(&server, &request).await;
+
+        assert!(matches!(resp, HookResponse::Allow));
+        let recorded = changes.recorded();
+        assert_eq!(recorded[0].baseline, Baseline::Created);
+        assert_eq!(recorded[0].tool, ChangeTool::Write);
+    }
+
+    #[tokio::test]
+    async fn a_relative_tool_path_is_recorded_against_the_session_cwd() {
+        let changes = Arc::new(FakeChanges::default());
+        let server = ControlServer::new(writable_gate("s5"), Arc::new(TestPdp))
+            .with_change_ledger(changes.clone());
+
+        let mut request = req("s5", "Edit");
+        request.tool_input = json!({ "file_path": "./src/main.rs" });
+        request.cwd = "/repo".into();
+        decide_json(&server, &request).await;
+
+        // Absolute, so the review surface can find the file regardless of its own cwd.
+        assert_eq!(changes.recorded()[0].path, "/repo/src/main.rs");
+    }
+
+    /// A probe over a fixed set of paths, standing in for a real repo.
+    struct FakeProbe {
+        dirty: Mutex<Vec<String>>,
+        head: Option<String>,
+    }
+
+    impl WorkspaceProbe for FakeProbe {
+        fn dirty_paths(&self, _cwd: &str) -> Vec<String> {
+            self.dirty.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+        fn head_blob(&self, _cwd: &str, _path: &str) -> Option<String> {
+            self.head.clone()
+        }
+    }
+
+    /// A `Bash` request whose command mutates (so it is worth scanning around).
+    fn bash(session: &str, command: &str) -> HookRequest {
+        HookRequest {
+            event: "PreToolUse".into(),
+            session_id: session.into(),
+            tool_name: "Bash".into(),
+            tool_input: json!({ "command": command }),
+            cwd: "/repo".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_shell_write_is_attributed_by_comparing_the_workspace() {
+        // A file the command rewrites: dirty before *and* after, so only its stamp
+        // gives it away — which is why the scan stats rather than diffing lists.
+        let path = std::env::temp_dir().join(format!("ml-shell-{}.txt", std::process::id()));
+        std::fs::write(&path, "before\n").unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+
+        let changes = Arc::new(FakeChanges::default());
+        let probe = Arc::new(FakeProbe {
+            dirty: Mutex::new(vec![path_str.clone()]),
+            head: Some("at head\n".to_string()),
+        });
+        let server = ControlServer::new(writable_gate("sh1"), Arc::new(TestPdp))
+            .with_change_ledger(changes.clone())
+            .with_workspace_probe(probe.clone());
+
+        let mut request = bash("sh1", "sed -i s/a/b/ file.txt");
+        decide_json(&server, &request).await;
+        assert!(
+            changes.recorded().is_empty(),
+            "nothing is attributable until the command has actually run"
+        );
+
+        // The command runs and rewrites the file.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(&path, "after the shell wrote\n").unwrap();
+
+        request.event = "PostToolUse".into();
+        let resp = decide_json(&server, &request).await;
+
+        assert!(matches!(resp, HookResponse::Allow), "observe-only");
+        let recorded = changes.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].path, path_str);
+        assert_eq!(recorded[0].tool, ChangeTool::Shell);
+        assert_eq!(
+            recorded[0].baseline,
+            Baseline::FromHead("at head\n".into()),
+            "nobody read this file first, so HEAD is the only \"before\""
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_shell_command_that_writes_nothing_records_nothing() {
+        let path = std::env::temp_dir().join(format!("ml-shell-quiet-{}.txt", std::process::id()));
+        std::fs::write(&path, "untouched\n").unwrap();
+
+        let changes = Arc::new(FakeChanges::default());
+        let probe = Arc::new(FakeProbe {
+            dirty: Mutex::new(vec![path.to_string_lossy().into_owned()]),
+            head: Some("x".into()),
+        });
+        let server = ControlServer::new(writable_gate("sh2"), Arc::new(TestPdp))
+            .with_change_ledger(changes.clone())
+            .with_workspace_probe(probe);
+
+        let mut request = bash("sh2", "cargo build");
+        decide_json(&server, &request).await;
+        request.event = "PostToolUse".into();
+        decide_json(&server, &request).await;
+
+        assert!(changes.recorded().is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn a_file_the_shell_created_has_no_head_blob() {
+        let path = std::env::temp_dir().join(format!("ml-shell-new-{}.txt", std::process::id()));
+        std::fs::remove_file(&path).ok();
+
+        let changes = Arc::new(FakeChanges::default());
+        let probe = Arc::new(FakeProbe {
+            dirty: Mutex::new(Vec::new()),
+            head: None, // untracked at HEAD
+        });
+        let server = ControlServer::new(writable_gate("sh3"), Arc::new(TestPdp))
+            .with_change_ledger(changes.clone())
+            .with_workspace_probe(probe.clone());
+
+        let mut request = bash("sh3", "echo hi > new.txt");
+        decide_json(&server, &request).await;
+
+        // The command creates the file, so it is newly dirty.
+        std::fs::write(&path, "hi\n").unwrap();
+        *probe.dirty.lock().unwrap() = vec![path.to_string_lossy().into_owned()];
+
+        request.event = "PostToolUse".into();
+        decide_json(&server, &request).await;
+
+        let recorded = changes.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].baseline, Baseline::Created);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn read_only_shell_commands_are_never_scanned() {
+        let changes = Arc::new(FakeChanges::default());
+        let probe = Arc::new(FakeProbe {
+            dirty: Mutex::new(vec!["/repo/a.rs".into()]),
+            head: Some("x".into()),
+        });
+        let server = ControlServer::new(writable_gate("sh4"), Arc::new(TestPdp))
+            .with_change_ledger(changes.clone())
+            .with_workspace_probe(probe);
+
+        // `ls` classifies Safe, so no fingerprint is taken…
+        let mut request = bash("sh4", "ls -la");
+        decide_json(&server, &request).await;
+        // …and the matching PostToolUse finds no open scan to close.
+        request.event = "PostToolUse".into();
+        decide_json(&server, &request).await;
+        assert!(changes.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_post_hook_without_a_matching_pre_scan_is_harmless() {
+        // The app started mid-command, so there is no fingerprint to compare against.
+        let changes = Arc::new(FakeChanges::default());
+        let server = ControlServer::new(writable_gate("sh5"), Arc::new(TestPdp))
+            .with_change_ledger(changes.clone());
+
+        let mut request = bash("sh5", "sed -i s/a/b/ x");
+        request.event = "PostToolUse".into();
+        let resp = decide_json(&server, &request).await;
+
+        assert!(matches!(resp, HookResponse::Allow));
+        assert!(changes.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_denied_shell_command_opens_no_scan() {
+        let changes = Arc::new(FakeChanges::default());
+        let probe = Arc::new(FakeProbe {
+            dirty: Mutex::new(Vec::new()),
+            head: None,
+        });
+        // Adopted + Plan freezes project writes, so the command is denied outright.
+        let gates = gates_with(
+            "sh6",
+            GateState {
+                adopted: true,
+                phase: Phase::Plan,
+                ..Default::default()
+            },
+        );
+        let server = ControlServer::new(gates, Arc::new(TestPdp))
+            .with_change_ledger(changes.clone())
+            .with_workspace_probe(probe);
+
+        let mut request = bash("sh6", "sed -i s/a/b/ x");
+        let resp = decide_json(&server, &request).await;
+        assert!(matches!(resp, HookResponse::Deny { .. }));
+
+        request.event = "PostToolUse".into();
+        decide_json(&server, &request).await;
+        assert!(
+            changes.recorded().is_empty(),
+            "a denied command never ran, so it wrote nothing"
+        );
     }
 
     async fn roundtrip(server: Arc<ControlServer>, request: &HookRequest) -> HookResponse {

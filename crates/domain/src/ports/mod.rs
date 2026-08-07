@@ -15,5 +15,5 @@ pub use mcp::{ActorRequest, ActorResult, McpActor, PermissionRequest, PolicyDeci
 pub use notifier::{Notification, Notifier};
 pub use store::{
     AuditStore, BaselineStore, ManagedSession, ManagedSessionStore, ManagedStateUpdate,
-    SessionStore,
+    SessionChangeStore, SessionStore,
 };

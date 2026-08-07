@@ -13,6 +13,7 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/rtk/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/trust/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/worktree/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/persistence/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

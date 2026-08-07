@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use moonlight_domain::agent::AgentKind;
 use moonlight_domain::ids::SessionId;
 use moonlight_domain::phase::Phase;
-use moonlight_domain::ports::store::{ManagedSession, ManagedSessionStore};
+use moonlight_domain::ports::store::{ManagedSession, ManagedSessionStore, SessionChangeStore};
 use moonlight_domain::session::{AttentionKind, Session, SessionStatus};
 use moonlight_engine::{Command, EngineEvent};
 use tokio::sync::broadcast;
@@ -265,9 +265,17 @@ pub struct GridHome {
     /// broadcast, which this panel — built lazily by the dock — would otherwise miss.
     /// `None` for test/static views.
     store: Option<Arc<dyn ManagedSessionStore>>,
+    /// Per-session count of files the agent has written, polled from the change
+    /// ledger so a tile can show "there is something to review here" without
+    /// opening anything. Absent sessions have written nothing.
+    changed: HashMap<SessionId, u32>,
+    /// Reads [`changed`](Self::changed); `None` for test/static views.
+    changes: Option<Arc<dyn SessionChangeStore>>,
     /// Holds the bus-subscription task alive for the view's lifetime (dropping it
     /// cancels the subscription). `None` for views built without a bus.
     _subscription: Option<Task<()>>,
+    /// Holds the ledger poll alive for the view's lifetime.
+    _changed_poll: Option<Task<()>>,
 }
 
 impl GridHome {
@@ -323,6 +331,21 @@ impl GridHome {
             model.backfill_titles(crate::transcript::latest_title);
         }
 
+        // The ledger is written by the hook server on another runtime, so there is no
+        // event to fold — poll it, at the same cadence as the other status polls.
+        let changes = cx.try_global::<ShellDeps>().map(|d| d.changes.clone());
+        let changed_poll = changes.as_ref().map(|_| {
+            cx.spawn(async move |weak, cx| loop {
+                let alive = weak.update(cx, |grid: &mut Self, cx| grid.refresh_changed(cx));
+                if alive.is_err() {
+                    break; // the view was dropped
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+            })
+        });
+
         Self {
             model,
             focus,
@@ -334,7 +357,29 @@ impl GridHome {
             focus_handle: cx.focus_handle(),
             meta_cache,
             store,
+            changed: HashMap::new(),
+            changes,
             _subscription: Some(subscription),
+            _changed_poll: changed_poll,
+        }
+    }
+
+    /// Re-read the per-session changed-file counts, re-rendering only when a count
+    /// actually moved (the grid repaints many tiles; a no-op tick shouldn't).
+    fn refresh_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(changes) = &self.changes else {
+            return;
+        };
+        let counts: HashMap<SessionId, u32> = match changes.touched_counts() {
+            Ok(rows) => rows.into_iter().collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "reading changed-file counts failed");
+                return;
+            }
+        };
+        if counts != self.changed {
+            self.changed = counts;
+            cx.notify();
         }
     }
 
@@ -483,11 +528,12 @@ impl Render for GridHome {
                 let meta = metas.get(&s.id).cloned().unwrap_or_default();
                 let attention = self.model.attention(s);
                 let agent = agents.get(&s.id).copied().unwrap_or_default();
+                let changed = self.changed.get(&s.id).copied().unwrap_or(0);
                 (
                     s.clone(),
                     s.adopted,
                     s.paused,
-                    session_tile(s, &meta, attention, agent),
+                    session_tile(s, &meta, attention, agent, changed),
                 )
             })
             .collect();

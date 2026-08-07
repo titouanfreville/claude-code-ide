@@ -17,10 +17,9 @@
 
 use std::path::PathBuf;
 
-/// macOS-first marker location under Application Support (next to `open_tabs.json`).
+/// The restore marker, beside `open_tabs.json` in the platform state directory.
 fn path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/MoonlightCode/restore.lock"))
+    crate::support::support_path("restore.lock")
 }
 
 /// Whether the previous launch died *during* restore — a [`begin`] marker that was

@@ -43,6 +43,10 @@ pub enum FeedbackOrigin {
     /// Free-form operator redirection mid-flight (the `Steer` command). Not tied
     /// to a rejected hunk or a denied gate — the operator is nudging direction.
     OperatorSteer,
+    /// A batch of line-anchored review comments submitted from the review surface
+    /// as one message. Distinct from [`HunkRejection`](Self::HunkRejection): nothing
+    /// was rejected, the operator is annotating what the session already wrote.
+    ReviewComment,
     /// The aim of a phase the session just entered — today only
     /// [`PLAN_AIM`](crate::phase::PLAN_AIM), told to a session moving into
     /// `Phase::Plan`. Every phase runs CC in `auto`, so this text is what makes the

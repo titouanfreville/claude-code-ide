@@ -45,10 +45,9 @@ pub struct SpaceTabs {
     pub active_tab: Option<String>,
 }
 
-/// macOS-first sidecar location under Application Support (next to `layout.json`).
+/// The open-tabs sidecar, beside `layout.json` in the platform state directory.
 fn path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/MoonlightCode/open_tabs.json"))
+    crate::support::support_path("open_tabs.json")
 }
 
 /// Load the sidecar, or `None` when it is missing, unreadable, unparseable, or its

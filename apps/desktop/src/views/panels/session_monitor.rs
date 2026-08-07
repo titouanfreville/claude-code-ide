@@ -29,6 +29,7 @@ actions!(
 );
 
 use moonlight_domain::agent::AgentKind;
+use moonlight_domain::changes::TouchedPath;
 use moonlight_domain::ids::{SessionId, Timestamp};
 use moonlight_domain::phase::Phase;
 use moonlight_domain::session::{AttentionKind, Session, SessionStatus};
@@ -66,6 +67,10 @@ const MCP_REFUSE_REASON: &str =
 /// Refusal reason sent when the operator refuses a non-tool held approval (a sensitive
 /// phase change, a danger-zone command).
 const ACTION_REFUSE_REASON: &str = "Refused by operator.";
+
+/// How many changed files the session header previews. The header is a glance
+/// surface, not a file browser — the review tab holds the full list.
+const CHANGED_PREVIEW: usize = 5;
 
 /// A held operator authorization awaiting a verdict in this session's bottom-right
 /// popup (the small overlay on the focus view — the once/always/refuse gate that used
@@ -169,6 +174,18 @@ pub struct SessionMonitor {
     phase_open: bool,
     /// Whether the condensed-header Trust selector dropdown is open.
     trust_open: bool,
+    /// The files this session has written, polled from the change ledger. Drives the
+    /// header's "✎ N files" pill and the list it expands to.
+    changed: Vec<TouchedPath>,
+    /// Whether that list is expanded.
+    changed_open: bool,
+    /// Whether "Clear" has been clicked once and is waiting for confirmation.
+    clear_armed: bool,
+    /// How many review comments the pending clear would destroy without the session
+    /// ever having seen them, counted when the button was armed. Clearing drops the
+    /// ledger, and the comments hang off it — so the confirmation has to say what is
+    /// actually at stake, not just ask twice.
+    clear_unsent: usize,
     /// Whether the info header is condensed: the whole facts card (phase stepper,
     /// trust selector, Path) plus the advance/resume affordances fold away, and Phase
     /// + Trust collapse into two compact dropdown buttons in the header top row, so the
@@ -209,6 +226,8 @@ pub struct SessionMonitor {
     /// Holds the process-exit watcher alive (managed sessions only) — drives
     /// [`Self::check_terminal_exit`].
     _exit_watch: Option<Task<()>>,
+    /// Holds the changed-files poll alive for the view's lifetime.
+    _changed_poll: Task<()>,
 }
 
 impl SessionMonitor {
@@ -373,6 +392,16 @@ impl SessionMonitor {
             })
         });
 
+        // The change ledger is written by the hook server on another runtime, so there
+        // is no event to fold — poll it, like the other status polls here.
+        let changed_poll = cx.spawn(async move |weak, cx| loop {
+            let alive = weak.update(cx, |this: &mut Self, cx| this.refresh_changed(cx));
+            if alive.is_err() {
+                break; // panel dropped
+            }
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+        });
+
         // Register the embedded terminal so other panels (the Plan tab) can drive
         // this session's CC TUI — e.g. send Enter to accept a plan's continuation.
         if let Some(term) = &terminal {
@@ -442,6 +471,10 @@ impl SessionMonitor {
             color_open: false,
             phase_open: false,
             trust_open: false,
+            changed: Vec::new(),
+            changed_open: false,
+            clear_armed: false,
+            clear_unsent: 0,
             // Default to a collapsed header so the session view opens compact;
             // the operator expands it via the ▾/▴ collapse button when needed.
             header_collapsed: true,
@@ -455,6 +488,7 @@ impl SessionMonitor {
             _subscription: Some(subscription),
             _history: history,
             _exit_watch: exit_watch,
+            _changed_poll: changed_poll,
         }
     }
 
@@ -1233,6 +1267,9 @@ impl Render for SessionMonitor {
                 let condensed = self.header_collapsed;
                 let phase_pill = condensed.then(|| self.phase_pill(s.phase, cx));
                 let trust_pill = condensed.then(|| self.trust_pill(s.trust_tier, cx));
+                // Always visible (when there is anything): "this session has changed
+                // N files" is the signal you want without opening a tab.
+                let changed_pill = (!self.changed.is_empty()).then(|| self.changed_pill(cx));
 
                 let top = div()
                     .flex()
@@ -1249,6 +1286,7 @@ impl Render for SessionMonitor {
                     .child(name_row)
                     .children(phase_pill)
                     .children(trust_pill)
+                    .children(changed_pill)
                     .children(auto_resume)
                     .children(compact)
                     .children(reset)
@@ -1266,6 +1304,7 @@ impl Render for SessionMonitor {
                         .py(px(8.));
                 }
                 head.child(top)
+                    .children(self.changed_open.then(|| self.changed_menu(cx)))
                     .children(self.color_open.then(|| self.color_palette(cx)))
                     .children((condensed && self.phase_open).then(|| self.phase_menu(s.phase, cx)))
                     .children(
@@ -1604,6 +1643,278 @@ impl SessionMonitor {
     /// Compact header button surfacing the current **Phase** (condensed header only).
     /// Click opens the [`Self::phase_menu`] dropdown. Clickable only for a steerable
     /// managed session (one we own a PTY for); otherwise it reads as a static chip.
+    /// "✎ N files" — how many files this session has written, from the change
+    /// ledger. Clicking expands [`changed_menu`](Self::changed_menu).
+    fn changed_pill(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let color = theme::git_modified();
+        let caret = if self.changed_open { "▴" } else { "▾" };
+        let n = self.changed.len();
+        let label = if n == 1 {
+            "1 file".to_string()
+        } else {
+            format!("{n} files")
+        };
+        div()
+            .id("changed-pill")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .px_2()
+            .py(px(2.))
+            .rounded(theme::radius_sm())
+            .bg(theme::tint(color, 0.16))
+            .text_color(color)
+            .text_size(theme::text_sm())
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .hover(|d| d.bg(theme::tint(color, 0.26)))
+            .child(format!("✎ {label}"))
+            .child(div().text_size(theme::text_xs()).child(caret))
+            .on_click(cx.listener(|this, _e, _w, cx| {
+                this.changed_open = !this.changed_open;
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// The names of the files this session wrote, and the way into the review.
+    /// The files this session wrote, and the ways out of the list.
+    ///
+    /// Capped at [`CHANGED_PREVIEW`]. This hangs inside the session header, and a
+    /// session that has been working writes dozens of files — rendering all of them
+    /// pushed the actions off the bottom of the window, which made the list actively
+    /// worse than no list. The full set lives in the review tab, which is built to
+    /// hold it.
+    fn changed_menu(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let total = self.changed.len();
+        // `touched_paths` answers most-recently-written first, which is the right
+        // preview: what the session just did is what you are deciding about.
+        let shown = self.changed.iter().take(CHANGED_PREVIEW);
+
+        let mut menu = div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .p(px(4.))
+            .rounded(theme::radius_sm())
+            .border_1()
+            .border_color(theme::border_subtle())
+            .bg(theme::surface_raised());
+
+        for (i, file) in shown.enumerate() {
+            // Same markers as the review surface, keyed on the same thing: what the
+            // "before" side of that file's diff actually is.
+            let (marker, tone) = if file.created {
+                ("+", theme::git_added())
+            } else if file.from_head {
+                ("~", theme::git_modified())
+            } else {
+                ("•", theme::text_muted())
+            };
+            menu = menu.child(
+                div()
+                    .id(("changed-file", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(px(2.))
+                    .rounded(theme::radius_sm())
+                    .text_size(theme::text_sm())
+                    .child(div().w(px(10.)).flex_none().text_color(tone).child(marker))
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .font_family(theme::mono_font())
+                            .text_color(theme::text_secondary())
+                            .child(self.relative_path(&file.path)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(theme::text_2xs())
+                            .text_color(theme::text_muted())
+                            .child(format!("{}×", file.touches)),
+                    ),
+            );
+        }
+
+        if total > CHANGED_PREVIEW {
+            menu = menu.child(
+                div()
+                    .px_2()
+                    .py(px(2.))
+                    .text_size(theme::text_2xs())
+                    .text_color(theme::text_muted())
+                    .child(format!(
+                        "+ {} more — open the review to see them all",
+                        total - CHANGED_PREVIEW
+                    )),
+            );
+        }
+
+        let action = |id: &'static str,
+                      label: &'static str,
+                      color: gpui::Hsla,
+                      on_click: fn(&mut Self, &mut Context<Self>),
+                      cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .px_2()
+                .py(px(3.))
+                .rounded(theme::radius_sm())
+                .cursor_pointer()
+                .text_size(theme::text_sm())
+                .text_color(color)
+                .hover(|d| d.bg(theme::row_hover()))
+                .child(label)
+                .on_click(cx.listener(move |this, _e, _w, cx| on_click(this, cx)))
+        };
+
+        // Named before the second click, not after it: the comments go with the
+        // ledger, and nothing brings them back.
+        if self.clear_armed && self.clear_unsent > 0 {
+            menu = menu.child(
+                div()
+                    .mt(px(3.))
+                    .text_size(theme::text_2xs())
+                    .text_color(theme::git_conflict())
+                    .child(if self.clear_unsent == 1 {
+                        "1 review comment here has never been sent — clearing deletes it too."
+                            .to_string()
+                    } else {
+                        format!(
+                            "{} review comments here have never been sent — clearing deletes them too.",
+                            self.clear_unsent
+                        )
+                    }),
+            );
+        }
+
+        menu.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .mt(px(3.))
+                .child(action(
+                    "changed-open-review",
+                    "Review changes ▸",
+                    theme::accent(),
+                    |this, cx| this.open_review(cx),
+                    cx,
+                ))
+                .child(div().flex_1())
+                .child(action(
+                    "changed-clear",
+                    if self.clear_armed {
+                        "Really clear?"
+                    } else {
+                        "Clear"
+                    },
+                    if self.clear_armed {
+                        theme::git_deleted()
+                    } else {
+                        theme::text_muted()
+                    },
+                    |this, cx| this.clear_changes(cx),
+                    cx,
+                )),
+        )
+        .into_any_element()
+    }
+
+    /// Forget this session's recorded changes — the same "the pass is over" the
+    /// review tab's Approve performs, reachable without opening it.
+    ///
+    /// Two clicks: the ledger holds pre-images that are the only record of what the
+    /// files looked like before, and nothing restores them once dropped.
+    fn clear_changes(&mut self, cx: &mut Context<Self>) {
+        let changes = cx.try_global::<ShellDeps>().map(|d| d.changes.clone());
+        if !self.clear_armed {
+            // Count what the confirmation is really asking about. A review typed here
+            // and never sent is destroyed by this button, and "Really clear?" alone
+            // does not tell anyone that.
+            self.clear_unsent = changes
+                .as_ref()
+                .and_then(|changes| changes.comments(&self.id).ok())
+                .map(|comments| {
+                    comments
+                        .iter()
+                        .filter(|c| c.sent_at.is_none() && !c.is_resolved())
+                        .count()
+                })
+                .unwrap_or(0);
+            self.clear_armed = true;
+            cx.notify();
+            return;
+        }
+        self.clear_armed = false;
+        self.clear_unsent = 0;
+        if let Some(changes) = changes {
+            if let Err(err) = changes.forget_session_changes(&self.id) {
+                tracing::warn!(error = %err, "clearing the session's changes failed");
+            }
+        }
+        self.changed.clear();
+        self.changed_open = false;
+        cx.notify();
+    }
+
+    /// A changed file's path relative to the session root, so the list reads as
+    /// code rather than as absolute paths.
+    fn relative_path(&self, path: &str) -> String {
+        self.session
+            .as_ref()
+            .and_then(|s| s.attached_path.as_deref())
+            .and_then(|root| path.strip_prefix(&format!("{root}/")))
+            .unwrap_or(path)
+            .to_string()
+    }
+
+    /// Open (or focus) this session's review tab.
+    fn open_review(&mut self, cx: &mut Context<Self>) {
+        self.changed_open = false;
+        let Some(deps) = cx.try_global::<ShellDeps>() else {
+            return;
+        };
+        let session = self.id.clone();
+        let root = self
+            .session
+            .as_ref()
+            .and_then(|s| s.attached_path.as_ref())
+            .map(PathBuf::from)
+            .or_else(|| self.resume_root.clone());
+        let center = deps.center.clone();
+        center.update(cx, |_, cx| {
+            cx.emit(OpenRequest::CodeReview {
+                session,
+                root,
+                summary: None,
+            })
+        });
+        cx.notify();
+    }
+
+    /// Re-read this session's changed-file list, re-rendering only on a real change.
+    fn refresh_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(changes) = cx.try_global::<ShellDeps>().map(|d| d.changes.clone()) else {
+            return;
+        };
+        match changes.touched_paths(&self.id) {
+            Ok(files) if files != self.changed => {
+                self.changed = files;
+                cx.notify();
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(error = %err, "reading this session's changed files failed"),
+        }
+    }
+
     fn phase_pill(&self, phase: Phase, cx: &mut Context<Self>) -> gpui::AnyElement {
         let color = theme::phase_color(phase);
         let caret = if self.phase_open { "▴" } else { "▾" };

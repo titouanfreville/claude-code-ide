@@ -95,6 +95,26 @@ pub fn file_diff(root: &Path, file: &ChangedFile) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The content of `rel_path` as of `HEAD`, or `None` when `HEAD` has no such file
+/// (it is new to this commit) or the blob isn't UTF-8 text.
+///
+/// This is the "before" side for a write nobody saw coming — a shell command's
+/// output — where there was no chance to read the file first. See
+/// [`moonlight_domain::changes::Baseline::FromHead`].
+pub fn head_blob(root: &Path, rel_path: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("show")
+        .arg(format!("HEAD:{rel_path}"))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
 /// Split a file's unified diff into its `(header, hunk_bodies)`: the preamble
 /// (`diff --git`, `index`, `---`, `+++`) up to the first `@@`, then one string per
 /// `@@ … @@` section (each `@@` header + its body, trailing newline trimmed). The

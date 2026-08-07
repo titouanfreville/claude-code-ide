@@ -54,6 +54,66 @@ const MIGRATIONS: &[&str] = &[
     // default-deny `Observed`. Stored as serde-JSON like the other enum columns; the
     // default `"Observed"` backfills every pre-existing row (matches the old reseed).
     "ALTER TABLE managed_session ADD COLUMN trust_tier TEXT NOT NULL DEFAULT '\"Observed\"';",
+    // 9 — per-session ledger of the files an agent wrote (FR22). One row per
+    // (session, file): `baseline` is the file's content the FIRST time the session
+    // touched it, so the review surface can diff the session's whole effect rather
+    // than its last edit. Keyed on the pair so the capture path can upsert.
+    "CREATE TABLE session_file_change (
+        session_id      TEXT NOT NULL,
+        path            TEXT NOT NULL,
+        first_touch_at  INTEGER NOT NULL,
+        last_touch_at   INTEGER NOT NULL,
+        touches         INTEGER NOT NULL,
+        tool            TEXT NOT NULL,
+        baseline        TEXT NOT NULL,
+        PRIMARY KEY (session_id, path)
+    );
+    CREATE INDEX idx_change_session_touch ON session_file_change (session_id, last_touch_at);",
+    // 10 — operator review comments anchored to a line range of a reviewed file.
+    // Written as soon as they're typed (a closed tab must not lose them) and
+    // batched: `sent_at` is NULL until the review carrying them reaches the session.
+    "CREATE TABLE review_comment (
+        id          TEXT PRIMARY KEY NOT NULL,
+        session_id  TEXT NOT NULL,
+        path        TEXT NOT NULL,
+        side        TEXT NOT NULL,
+        start_line  INTEGER NOT NULL,
+        end_line    INTEGER NOT NULL,
+        body        TEXT NOT NULL,
+        at          INTEGER NOT NULL,
+        sent_at     INTEGER
+    );
+    CREATE INDEX idx_comment_session_at ON review_comment (session_id, at);",
+    // 11 — when the operator last marked this file reviewed (GitHub's "viewed"),
+    // NULL until they do. A *time* rather than a flag, so the mark expires on its
+    // own: `record_touch` advances `last_touch_at`, and any mark older than that
+    // stops counting. A file the agent rewrites after you signed it off therefore
+    // comes back unreviewed with no bookkeeping to forget.
+    "ALTER TABLE session_file_change ADD COLUMN reviewed_at INTEGER;",
+    // 12 — paths hidden from a session's review. Separate from the ledger because a
+    // row here can be a *directory* prefix (ignoring `target/` hides files that were
+    // never listed individually), and because ignoring a file must not touch its
+    // change record. Dropped with the ledger when the pass closes.
+    "CREATE TABLE review_ignore (
+        session_id  TEXT NOT NULL,
+        path        TEXT NOT NULL,
+        PRIMARY KEY (session_id, path)
+    );",
+    // 13 — what a comment is about, whether the code under it still reads the same,
+    // and whether it has been settled.
+    //
+    // `scope` widens a comment beyond a line range (file-wide, or about the review
+    // itself); the default backfills every existing row, which was line-anchored by
+    // construction. `anchor_text` is the anchored line as it read when the comment
+    // was written — a line *number* is not an anchor, so this is what lets a comment
+    // notice the code moved out from under it instead of arguing with whatever
+    // occupies that number now; NULL for older rows, which are therefore never
+    // called outdated rather than guessed about. `resolved_at` retires a comment
+    // from the diff without deleting it, because why the code looks the way it does
+    // is exactly what the settled half of a review records.
+    "ALTER TABLE review_comment ADD COLUMN scope TEXT NOT NULL DEFAULT '\"Line\"';
+     ALTER TABLE review_comment ADD COLUMN anchor_text TEXT;
+     ALTER TABLE review_comment ADD COLUMN resolved_at INTEGER;",
 ];
 
 /// Apply every migration the database hasn't seen yet, in order. Idempotent: a

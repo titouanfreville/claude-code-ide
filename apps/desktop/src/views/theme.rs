@@ -16,6 +16,8 @@
 //! popovers) matches the hand-painted panels instead of falling back to its default
 //! light theme.
 
+use std::sync::OnceLock;
+
 use gpui::{point, px, rems, rgb, App, BoxShadow, Hsla, Pixels};
 use gpui_component::highlighter::HighlightTheme;
 use gpui_component::text::TextViewStyle;
@@ -188,10 +190,51 @@ pub fn radius_lg() -> Pixels {
 pub fn ui_font() -> &'static str {
     ".SystemUIFont"
 }
+/// Monospace candidates, best first, per platform. The first one the system
+/// actually has wins — asking for a font that isn't installed silently lands on a
+/// proportional fallback, which makes a terminal grid stop aligning.
+#[cfg(target_os = "macos")]
+const MONO_CANDIDATES: &[&str] = &["Menlo", "SF Mono", "Monaco", "Courier New"];
+#[cfg(target_os = "windows")]
+const MONO_CANDIDATES: &[&str] = &["Cascadia Mono", "Consolas", "Courier New"];
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const MONO_CANDIDATES: &[&str] = &[
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Noto Sans Mono",
+    "Ubuntu Mono",
+    "monospace",
+];
+
+/// Resolved once at [`install`]; `mono_font` reads it thereafter.
+static MONO_FONT: OnceLock<String> = OnceLock::new();
+
 /// Monospace font for code-adjacent UI (paths, session ids, the terminal grid).
-/// Menlo ships on every macOS, so cells always align.
+///
+/// Resolved against the fonts actually present (see [`MONO_CANDIDATES`]). Before
+/// [`install`] runs — and if none of the candidates exist — this is the platform's
+/// first choice, which is what the generic `"monospace"` alias is for on Linux.
 pub fn mono_font() -> &'static str {
-    "Menlo"
+    MONO_FONT
+        .get()
+        .map(String::as_str)
+        .unwrap_or(MONO_CANDIDATES[0])
+}
+
+/// Pick the monospace family from what the text system reports as installed.
+fn resolve_mono_font(cx: &App) {
+    let available = cx.text_system().all_font_names();
+    let picked = MONO_CANDIDATES
+        .iter()
+        .find(|name| available.iter().any(|have| have == *name))
+        .copied()
+        // Nothing matched: keep the last candidate (a generic alias on Linux) and
+        // let the text system do what it can.
+        .unwrap_or_else(|| MONO_CANDIDATES[MONO_CANDIDATES.len() - 1]);
+    if picked != MONO_CANDIDATES[0] {
+        tracing::info!(font = picked, "monospace font resolved to a fallback");
+    }
+    let _ = MONO_FONT.set(picked.to_string());
 }
 
 // ── Markdown rendering (plan view, assistant messages) ───────────────────────
@@ -290,6 +333,31 @@ pub fn git_conflict() -> Hsla {
     c(0xf5a623) // amber — needs resolution
 }
 
+// ── Diff — the review surface's two panes ────────────────────────────────────
+// Hue lives in the *row wash* and the gutter glyph, never in the code text: a
+// line tinted green on green is harder to read than the line it replaced, and the
+// point of a review pane is reading code. Changed lines instead get the brighter
+// text step, so emphasis comes from contrast and the color says only "what kind
+// of change".
+
+/// Wash behind an added line.
+pub fn diff_added_bg() -> Hsla {
+    tint(git_added(), 0.13)
+}
+/// Wash behind a removed line.
+pub fn diff_removed_bg() -> Hsla {
+    tint(git_deleted(), 0.13)
+}
+/// Wash behind a line that was rewritten in place (the after side of a replace).
+pub fn diff_modified_bg() -> Hsla {
+    tint(git_modified(), 0.11)
+}
+/// The void opposite an inserted or removed line. Reads as "nothing here" rather
+/// than as content, which is what keeps the two panes legible as one alignment.
+pub fn diff_gap_bg() -> Hsla {
+    tint(text_muted(), 0.05)
+}
+
 // ── Terminal palette ────────────────────────────────────────────────────────
 //
 // A real ANSI terminal needs the 256-color model: 16 named colors, a 6×6×6
@@ -386,6 +454,10 @@ pub fn ansi_indexed(index: u8) -> Hsla {
 /// Call once, immediately after `gpui_component::init(cx)`.
 pub fn install(cx: &mut App) {
     use gpui_component::{Theme, ThemeMode};
+
+    // Must precede any `mono_font()` read: the terminal grid and every mono surface
+    // are sized from whichever family this picks.
+    resolve_mono_font(cx);
 
     // Start from gpui-component's built-in dark config (coherent defaults for the
     // many fields we don't touch), then brand it.

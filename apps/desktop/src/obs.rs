@@ -253,10 +253,9 @@ fn read_tail(path: &Path, max: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// MoonlightCode's macOS-first support directory (shared with layout/projects state).
+/// MoonlightCode's support directory (shared with layout/projects state).
 pub(crate) fn support_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/MoonlightCode"))
+    crate::support::support_dir()
 }
 
 /// Claude Code's config dir (`$CLAUDE_CONFIG_DIR`, else `~/.claude`).

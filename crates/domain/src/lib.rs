@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod audit;
+pub mod changes;
 pub mod continuity;
 pub mod economy;
 pub mod errors;
@@ -19,6 +20,9 @@ pub mod trust;
 // Convenience re-exports for the most-used types.
 pub use agent::{AgentKind, McpInjection};
 pub use audit::{AuditAction, AuditEntry};
+pub use changes::{
+    Baseline, BaselineGap, ChangeTool, DiffSide, FileTouch, ReviewComment, TouchedPath,
+};
 pub use economy::{GovernorAction, RateHeadroom, TokenStat};
 pub use errors::{ControlError, DomainError, StoreError, TrustError};
 pub use ids::{HunkId, SessionId, Timestamp};

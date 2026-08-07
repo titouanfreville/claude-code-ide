@@ -9,6 +9,7 @@
 //!
 //! Untrusted input (NFR6): parsing never panics; an unparsable/absent path is `None`.
 
+use moonlight_domain::changes::ChangeTool;
 use moonlight_domain::trust::WriteScope;
 use serde::Deserialize;
 use serde_json::Value;
@@ -193,7 +194,7 @@ fn absolute_root(root: &str) -> Option<String> {
 
 /// `path` as an absolute string for absolute-root matching: kept as-is when already
 /// absolute, otherwise joined onto `cwd` (shedding a leading `./`).
-fn absolutize(path: &str, cwd: &str) -> String {
+pub fn absolutize(path: &str, cwd: &str) -> String {
     let path = path.trim();
     if path.starts_with('/') {
         path.to_string()
@@ -201,6 +202,28 @@ fn absolutize(path: &str, cwd: &str) -> String {
         let rel = path.strip_prefix("./").unwrap_or(path);
         format!("{}/{rel}", cwd.trim_end_matches('/'))
     }
+}
+
+/// The file a tool call is about to write and which tool is writing it, or `None`
+/// when the call isn't a path-attributable file write (reads, Bash, meta tools).
+///
+/// A shell redirect inside `Bash` is deliberately *not* attributable: the target
+/// isn't declared in the tool input, so neither the write gate nor the change
+/// ledger can name it.
+pub fn write_target<'a>(tool_name: &str, tool_input: &'a Value) -> Option<(&'a str, ChangeTool)> {
+    let (path, tool) = match tool_name {
+        "Edit" => (tool_input.get("file_path"), ChangeTool::Edit),
+        "Write" => (tool_input.get("file_path"), ChangeTool::Write),
+        "MultiEdit" => (tool_input.get("file_path"), ChangeTool::MultiEdit),
+        "NotebookEdit" => (
+            tool_input
+                .get("notebook_path")
+                .or_else(|| tool_input.get("file_path")),
+            ChangeTool::NotebookEdit,
+        ),
+        _ => return None,
+    };
+    Some((path?.as_str()?, tool))
 }
 
 /// The write scope of a tool call, or `None` when the tool isn't a path-attributable
@@ -211,14 +234,7 @@ pub fn classify_write_scope(
     cwd: &str,
     ai: &AiWorkspace,
 ) -> Option<WriteScope> {
-    let path = match tool_name {
-        "Edit" | "Write" | "MultiEdit" => tool_input.get("file_path").and_then(Value::as_str),
-        "NotebookEdit" => tool_input
-            .get("notebook_path")
-            .or_else(|| tool_input.get("file_path"))
-            .and_then(Value::as_str),
-        _ => None,
-    }?;
+    let (path, _) = write_target(tool_name, tool_input)?;
     Some(ai.scope_of(path, cwd))
 }
 

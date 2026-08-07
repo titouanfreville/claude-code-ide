@@ -126,6 +126,14 @@ pub enum Command {
         session: SessionId,
         message: String,
     },
+    /// A batch of line-anchored review comments, submitted from the review surface
+    /// as one message. Delivered like any other feedback, but recorded under
+    /// [`FeedbackOrigin::ReviewComment`] so the audit log distinguishes "the
+    /// operator annotated this work" from "the operator rejected a hunk".
+    SubmitReview {
+        session: SessionId,
+        message: String,
+    },
     /// Opt a session into (or out of) MoonlightCode governance. Only adopted
     /// sessions are gated by the PDP/hooks.
     ToggleAdoption {

@@ -1,0 +1,19 @@
+[Desktop Entry]
+# Desktop entry for MoonlightCode. This is a template: `install.sh` rewrites the
+# two placeholders below into absolute paths. An absolute Icon= avoids having to
+# bucket the PNG into a hicolor size directory it doesn't exactly match.
+#
+# The file name, and StartupWMClass below, must both equal the window's `app_id`
+# (`APP_ID` in apps/desktop/src/main.rs) or the desktop won't connect the running
+# window to this entry, and the taskbar falls back to the binary name.
+Type=Application
+Name=MoonlightCode
+GenericName=IDE
+Comment=Dockable IDE shell for supervising Claude Code sessions
+Exec=@EXEC@ %F
+Icon=@ICON@
+Terminal=false
+StartupNotify=true
+StartupWMClass=dev.moonlightcode.MoonlightCode
+Categories=Development;IDE;
+Keywords=claude;code;agent;ide;terminal;

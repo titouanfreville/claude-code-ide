@@ -194,6 +194,14 @@ impl SessionSupervisor {
                 };
                 self.inject(feedback, "steered").await;
             }
+            Command::SubmitReview { session, message } => {
+                let feedback = Feedback {
+                    session_id: session,
+                    message,
+                    origin: FeedbackOrigin::ReviewComment,
+                };
+                self.inject(feedback, "review submitted").await;
+            }
             Command::ApproveAction { session } => self.approve_action(session).await,
             Command::ApprovePlan { session } => self.approve_plan(session).await,
             Command::ToggleAdoption { session } => self.toggle_adoption(session),

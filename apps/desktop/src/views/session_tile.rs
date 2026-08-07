@@ -24,6 +24,7 @@ pub fn session_tile(
     meta: &SessionMeta,
     attention: Option<AttentionKind>,
     agent: AgentKind,
+    changed: u32,
 ) -> impl IntoElement {
     let status = s.status;
     let scolor = theme::status_color(status);
@@ -123,6 +124,14 @@ pub fn session_tile(
                                 .children(
                                     (agent != AgentKind::ClaudeCode)
                                         .then(|| chip("AGY", theme::accent())),
+                                )
+                                // How many files this session has written — the "there
+                                // is something to review here" signal, absent (not zero)
+                                // until it has touched anything.
+                                .children(
+                                    (changed > 0).then(|| {
+                                        chip(&format!("✎ {changed}"), theme::git_modified())
+                                    }),
                                 )
                                 .child(
                                     div()

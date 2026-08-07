@@ -77,6 +77,10 @@ jobs:
           cp "target/${TGT}/release/moonlight" "dist/$name/"
           cp README.md "dist/$name/" 2>/dev/null || true
           cp LICENSE* "dist/$name/" 2>/dev/null || true
+          # Desktop entry + icon, so an unpacked tarball can register itself with
+          # the app grid via `./install.sh ./moonlight` (see packaging/linux).
+          cp icon.png "dist/$name/"
+          cp packaging/linux/*.desktop packaging/linux/*.sh "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
 

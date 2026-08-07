@@ -3,9 +3,9 @@
 //!
 //! Modifying the operator's Claude Code config is outward-facing, so install/
 //! uninstall **always back up the file first** and **confirm** before writing.
-//! The registered `PreToolUse` hook invokes this same binary (`… hook
-//! pre-tool-use`), which the control server answers; if MoonlightCode is not
-//! running the hook fails open (Claude Code behaves normally).
+//! Each registered hook invokes this same binary in hook mode, which the control
+//! server answers; if MoonlightCode is not running the hook fails open (Claude Code
+//! behaves normally). See [`REGISTRATIONS`] for what gets registered and why.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -51,22 +51,37 @@ fn settings_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".claude").join("settings.json"))
 }
 
-/// The shell command Claude Code runs for the PreToolUse hook: this binary in
-/// hook mode. The path is quoted so a space-containing install location is safe.
-fn hook_command() -> String {
+/// The hook registrations MoonlightCode owns: the CC event, the tool matcher, and
+/// our `hook` subcommand for it.
+///
+/// `PreToolUse` on everything is the gate. `PostToolUse` on `Bash` only is the
+/// other half of shell-write attribution — the command declared no path, so the
+/// workspace is compared either side of it (see `moonlight_control::shell_scan`);
+/// narrowing the matcher keeps every other tool off that path entirely.
+const REGISTRATIONS: &[(&str, &str, &str)] = &[
+    ("PreToolUse", "*", "pre-tool-use"),
+    ("PostToolUse", "Bash", "post-tool-use"),
+];
+
+/// The shell command Claude Code runs for `sub`: this binary in hook mode. The
+/// path is quoted so a space-containing install location is safe.
+fn hook_command(sub: &str) -> String {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "moonlight".to_string());
-    format!("\"{exe}\" hook pre-tool-use")
+    format!("\"{exe}\" hook {sub}")
 }
 
 /// Whether a hook command string is one of ours (so install is idempotent and
-/// uninstall can find it). Matches our specific `… moonlight hook pre-tool-use`
-/// subcommand — NOT a loose `moonlight`+`hook` substring, which would wrongly claim
+/// uninstall can find it). Matches our specific `… moonlight hook <sub>`
+/// subcommands — NOT a loose `moonlight`+`hook` substring, which would wrongly claim
 /// (and on uninstall, delete) an unrelated operator hook.
 fn is_ours(command: &str) -> bool {
-    command.contains("hook pre-tool-use") && command.contains("moonlight")
+    command.contains("moonlight")
+        && REGISTRATIONS
+            .iter()
+            .any(|(_, _, sub)| command.contains(&format!("hook {sub}")))
 }
 
 /// Load settings.json as a JSON object (empty object if the file is absent).
@@ -111,8 +126,9 @@ fn write_settings(path: &PathBuf, settings: &Value) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("write failed: {e}"))
 }
 
-/// The PreToolUse entries array under `hooks`, as a mutable Vec (created if absent).
-fn pretooluse_mut(settings: &mut Value) -> &mut Vec<Value> {
+/// The entries array for one hook `event` under `hooks`, as a mutable Vec (created
+/// if absent).
+fn hooks_mut<'a>(settings: &'a mut Value, event: &str) -> &'a mut Vec<Value> {
     settings
         .as_object_mut()
         .expect("settings is an object")
@@ -120,10 +136,10 @@ fn pretooluse_mut(settings: &mut Value) -> &mut Vec<Value> {
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .expect("hooks is an object")
-        .entry("PreToolUse")
+        .entry(event)
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        .expect("PreToolUse is an array")
+        .expect("hook event is an array")
 }
 
 fn entry_has_our_command(entry: &Value) -> bool {
@@ -157,20 +173,33 @@ fn install() {
         }
     };
 
-    if pretooluse_mut(&mut settings)
+    // Install per event, so adding a registration to an existing install works:
+    // the operator upgrading from a PreToolUse-only version gets the new PostToolUse
+    // entry without having to uninstall first.
+    let missing: Vec<&(&str, &str, &str)> = REGISTRATIONS
         .iter()
-        .any(entry_has_our_command)
-    {
+        .filter(|(event, _, _)| {
+            !hooks_mut(&mut settings, event)
+                .iter()
+                .any(entry_has_our_command)
+        })
+        .collect();
+    if missing.is_empty() {
         println!(
-            "MoonlightCode PreToolUse hook already installed in {}",
+            "MoonlightCode hooks already installed in {}",
             path.display()
         );
         return;
     }
 
-    let command = hook_command();
-    println!("About to add a PreToolUse hook to {}:", path.display());
-    println!("    matcher: \"*\"  →  {command}");
+    println!(
+        "About to add {} hook(s) to {}:",
+        missing.len(),
+        path.display()
+    );
+    for (event, matcher, sub) in &missing {
+        println!("    {event} matcher: {matcher:?}  →  {}", hook_command(sub));
+    }
     println!("(MoonlightCode gates only sessions you adopt; it fails open when not running.)");
     if !confirm("Proceed?") {
         println!("aborted; no changes made");
@@ -181,14 +210,17 @@ fn install() {
         eprintln!("{e}");
         return;
     }
-    pretooluse_mut(&mut settings).push(json!({
-        "matcher": "*",
-        // `timeout` (seconds) must exceed the server's approval hold so Claude Code
-        // waits for an operator decision rather than killing the hook mid-hold.
-        "hooks": [ { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS } ],
-    }));
+    for (event, matcher, sub) in missing {
+        let entry = json!({
+            "matcher": matcher,
+            // `timeout` (seconds) must exceed the server's approval hold so Claude Code
+            // waits for an operator decision rather than killing the hook mid-hold.
+            "hooks": [ { "type": "command", "command": hook_command(sub), "timeout": HOOK_TIMEOUT_SECS } ],
+        });
+        hooks_mut(&mut settings, event).push(entry);
+    }
     match write_settings(&path, &settings) {
-        Ok(()) => println!("installed. Restart Claude Code sessions to pick up the hook."),
+        Ok(()) => println!("installed. Restart Claude Code sessions to pick up the hooks."),
         Err(e) => eprintln!("{e}"),
     }
 }
@@ -207,9 +239,14 @@ fn uninstall() {
         }
     };
 
-    let before = pretooluse_mut(&mut settings).len();
-    pretooluse_mut(&mut settings).retain(|e| !entry_has_our_command(e));
-    let removed = before - pretooluse_mut(&mut settings).len();
+    let removed: usize = REGISTRATIONS
+        .iter()
+        .map(|(event, _, _)| {
+            let before = hooks_mut(&mut settings, event).len();
+            hooks_mut(&mut settings, event).retain(|e| !entry_has_our_command(e));
+            before - hooks_mut(&mut settings, event).len()
+        })
+        .sum();
     if removed == 0 {
         println!("no MoonlightCode hook found in {}", path.display());
         return;
@@ -234,13 +271,21 @@ fn status() {
         eprintln!("no $HOME");
         return;
     };
-    let installed = match load_settings(&path) {
-        Ok(mut v) if v.is_object() => pretooluse_mut(&mut v).iter().any(entry_has_our_command),
-        _ => false,
+    let mut settings = match load_settings(&path) {
+        Ok(v) if v.is_object() => v,
+        _ => json!({}),
     };
     println!("settings file : {}", path.display());
-    println!("hook installed: {}", if installed { "yes" } else { "no" });
-    println!("hook command  : {}", hook_command());
+    for (event, matcher, sub) in REGISTRATIONS {
+        let installed = hooks_mut(&mut settings, event)
+            .iter()
+            .any(entry_has_our_command);
+        let mark = if installed { "yes" } else { "no " };
+        println!(
+            "{event:<12} : {mark}  matcher {matcher:?}  →  {}",
+            hook_command(sub)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -257,12 +302,70 @@ mod tests {
     #[test]
     fn recognizes_our_commands() {
         assert!(is_ours("\"/x/moonlight\" hook pre-tool-use"));
+        assert!(is_ours("\"/x/moonlight\" hook post-tool-use"));
         assert!(!is_ours("some-other-tool --flag"));
+        // A foreign hook that merely mentions moonlight is not ours to delete.
+        assert!(!is_ours("\"/x/moonlight\" hook agy-pre-tool-use-other"));
         assert!(entry_has_our_command(&our_entry()));
         assert!(!entry_has_our_command(&json!({
             "matcher": "*",
             "hooks": [ { "type": "command", "command": "codeisland-hook.sh" } ],
         })));
+    }
+
+    #[test]
+    fn every_registration_lands_under_its_own_event() {
+        let mut settings = json!({});
+        for (event, matcher, sub) in REGISTRATIONS {
+            hooks_mut(&mut settings, event).push(json!({
+                "matcher": matcher,
+                "hooks": [ { "type": "command", "command": hook_command(sub) } ],
+            }));
+        }
+        // The gate covers every tool; the shell-write scan only Bash.
+        assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], json!("*"));
+        assert_eq!(
+            settings["hooks"]["PostToolUse"][0]["matcher"],
+            json!("Bash")
+        );
+        for (event, _, _) in REGISTRATIONS {
+            assert!(
+                hooks_mut(&mut settings, event)
+                    .iter()
+                    .any(entry_has_our_command),
+                "{event} entry is recognized as ours"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_clears_every_event_and_spares_foreign_hooks() {
+        let mut settings = json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "matcher": "*", "hooks": [ { "type": "command", "command": "codeisland-hook.sh" } ] },
+                    { "matcher": "*", "hooks": [ { "type": "command", "command": hook_command("pre-tool-use") } ] },
+                ],
+                "PostToolUse": [
+                    { "matcher": "Bash", "hooks": [ { "type": "command", "command": hook_command("post-tool-use") } ] },
+                ],
+            },
+        });
+        let removed: usize = REGISTRATIONS
+            .iter()
+            .map(|(event, _, _)| {
+                let before = hooks_mut(&mut settings, event).len();
+                hooks_mut(&mut settings, event).retain(|e| !entry_has_our_command(e));
+                before - hooks_mut(&mut settings, event).len()
+            })
+            .sum();
+        assert_eq!(removed, 2, "one per event");
+        assert_eq!(hooks_mut(&mut settings, "PostToolUse").len(), 0);
+        assert_eq!(
+            settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            json!("codeisland-hook.sh"),
+            "the operator's own hook survives"
+        );
     }
 
     #[test]
@@ -277,29 +380,29 @@ mod tests {
         });
 
         // First "install": append our entry.
-        if !pretooluse_mut(&mut settings)
+        if !hooks_mut(&mut settings, "PreToolUse")
             .iter()
             .any(entry_has_our_command)
         {
-            pretooluse_mut(&mut settings).push(our_entry());
+            hooks_mut(&mut settings, "PreToolUse").push(our_entry());
         }
-        assert_eq!(pretooluse_mut(&mut settings).len(), 2);
+        assert_eq!(hooks_mut(&mut settings, "PreToolUse").len(), 2);
 
         // Second "install": already present → no duplicate.
-        if !pretooluse_mut(&mut settings)
+        if !hooks_mut(&mut settings, "PreToolUse")
             .iter()
             .any(entry_has_our_command)
         {
-            pretooluse_mut(&mut settings).push(our_entry());
+            hooks_mut(&mut settings, "PreToolUse").push(our_entry());
         }
-        assert_eq!(pretooluse_mut(&mut settings).len(), 2);
+        assert_eq!(hooks_mut(&mut settings, "PreToolUse").len(), 2);
 
         // Unrelated config is untouched.
         assert_eq!(settings["other"]["kept"], json!(true));
 
         // Uninstall removes only ours, leaving the foreign hook.
-        pretooluse_mut(&mut settings).retain(|e| !entry_has_our_command(e));
-        assert_eq!(pretooluse_mut(&mut settings).len(), 1);
+        hooks_mut(&mut settings, "PreToolUse").retain(|e| !entry_has_our_command(e));
+        assert_eq!(hooks_mut(&mut settings, "PreToolUse").len(), 1);
         assert_eq!(
             settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             json!("codeisland-hook.sh")
@@ -307,9 +410,9 @@ mod tests {
     }
 
     #[test]
-    fn pretooluse_mut_builds_missing_structure() {
+    fn hooks_mut_builds_missing_structure() {
         let mut empty = json!({});
-        assert!(pretooluse_mut(&mut empty).is_empty());
+        assert!(hooks_mut(&mut empty, "PreToolUse").is_empty());
         assert!(empty["hooks"]["PreToolUse"].is_array());
     }
 }

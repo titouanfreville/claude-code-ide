@@ -16,7 +16,9 @@ pub mod gate;
 pub mod ipc;
 pub mod paths;
 pub mod pending;
+pub mod probe;
 pub mod server;
+pub mod shell_scan;
 
 pub use classify::classify;
 pub use config::{append_safe_tool, load_config, user_config_path, AiWorkspaceResolver};
@@ -24,6 +26,7 @@ pub use gate::{decide, evaluate, GateDecision, GateState, HoldKind, EXIT_PLAN_MO
 pub use ipc::{HookRequest, HookResponse};
 pub use paths::{classify_write_scope, AiWorkspace, AiWorkspaceConfig};
 pub use pending::{ApprovalNotifier, Decision, PendingApprovals};
+pub use probe::{NoProbe, SharedProbe, WorkspaceProbe};
 pub use server::{query_hook, ControlServer, GateView, RuntimeSafeTools, DEFAULT_HOLD};
 
 use std::sync::Arc;

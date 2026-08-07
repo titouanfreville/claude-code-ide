@@ -37,7 +37,7 @@ use gpui_component::{Root, WindowExt};
 
 use moonlight_domain::ids::{SessionId, Timestamp};
 use moonlight_domain::phase::Phase;
-use moonlight_domain::ports::store::{ManagedSession, ManagedSessionStore};
+use moonlight_domain::ports::store::{ManagedSession, ManagedSessionStore, SessionChangeStore};
 use moonlight_domain::session::{AttentionKind, SessionStatus};
 use moonlight_domain::trust::TrustTier;
 use moonlight_engine::{Command, EngineEvent, EventBus};
@@ -124,6 +124,11 @@ pub struct ShellDeps {
     /// app launched comes back **managed** (re-resumes its embedded terminal), not
     /// as a read-only observed session, and written when a managed session launches.
     pub store: Arc<dyn ManagedSessionStore>,
+    /// Per-session ledger of the files each agent wrote, with the pre-image captured
+    /// at its first touch. The review surface reads it to diff *this session's*
+    /// changes (and to persist the operator's review comments); the hook's control
+    /// server writes it. Same SQLite connection as [`store`](Self::store).
+    pub changes: Arc<dyn SessionChangeStore>,
     /// UI-side session→terminal registry, so a panel that doesn't own the embedded
     /// terminal (the Plan-review tab) can drive the session's CC TUI — e.g. send
     /// Enter to accept a plan's continuation (option 1 / auto). See [`SessionIo`].
@@ -188,6 +193,7 @@ pub fn init_shell(
     editor_commands: Entity<EditorCommands>,
     obs_store: Entity<ObsStore>,
     store: Arc<dyn ManagedSessionStore>,
+    changes: Arc<dyn SessionChangeStore>,
     mcp_host: Option<McpHostHandle>,
     run_registry: crate::run::RunRegistry,
     http_history: crate::http::HttpHistory,
@@ -215,6 +221,7 @@ pub fn init_shell(
         editor_commands,
         obs_store,
         store,
+        changes,
         session_io: SessionIo::default(),
         approvals: super::approvals::Approvals::default(),
         session_meta,
@@ -229,15 +236,19 @@ pub fn init_shell(
     });
 
     // ⌘S saves / ⌘⇧I formats the focused code-editor tab (the panel's `key_context`).
+    // `secondary-` is ⌘ on macOS and Ctrl elsewhere — a literal `cmd-` would bind
+    // these to the Super key on Linux, which the window manager owns.
     cx.bind_keys(vec![
-        KeyBinding::new("cmd-s", SaveFile, Some("CodeEditor")),
-        KeyBinding::new("cmd-shift-i", FormatDocument, Some("CodeEditor")),
+        KeyBinding::new("secondary-s", SaveFile, Some("CodeEditor")),
+        KeyBinding::new("secondary-shift-i", FormatDocument, Some("CodeEditor")),
     ]);
     // Tab/Shift+Tab inside a focused terminal go to the child (shell completion,
     // Claude Code autofill + mode cycle), overriding Root's focus traversal.
     super::panels::terminal::init_keybindings(cx);
     // Cmd+F / Esc inside the Run window (search open/close).
     super::panels::run_console::init_keybindings(cx);
+    // Find-in-diff inside a focused review tab.
+    super::panels::code_review::init_keybindings(cx);
 
     register_panel(cx, "GridHome", |_, _, _, _window, cx| {
         let deps = cx.global::<ShellDeps>().clone();
@@ -372,8 +383,16 @@ pub fn init_shell(
         let id = SessionId::new(panel_info_str(info, "session").unwrap_or_default());
         let root = panel_info_str(info, "root").map(PathBuf::from);
         let summary = panel_info_str(info, "summary");
-        let view =
-            cx.new(|cx| CodeReviewPanel::new(id, root, summary, Some(deps.commands.clone()), cx));
+        let view = cx.new(|cx| {
+            CodeReviewPanel::new(
+                id,
+                root,
+                summary,
+                Some(deps.commands.clone()),
+                Some(deps.changes.clone()),
+                cx,
+            )
+        });
         Box::new(view) as Box<dyn PanelView>
     });
 }
@@ -843,6 +862,12 @@ impl Workspace {
                         Ok(EngineEvent::PhaseTransitioned { session, phase }) => {
                             // A phase move resolves a pending phase-change approval.
                             approvals.clear(&session);
+                            // Entering Review *is* the request to look at the changes —
+                            // open the surface rather than making the operator find it.
+                            // Only on the transition into Review (the map dedupes), so
+                            // re-emitted facts don't reopen a tab that was closed.
+                            let entering_review = phases.get(&session) != Some(&Phase::Review)
+                                && phase == Phase::Review;
                             // Thin phase update (some engine paths use this instead of a
                             // full SessionUpserted). Dedupes against the same map.
                             if let Some(prev) = phases.insert(session.clone(), phase) {
@@ -850,10 +875,21 @@ impl Workspace {
                                 if let Some((kind, text)) = phase_notification(prev, phase, &label)
                                 {
                                     notifications.update(cx, |n, cx| {
-                                        n.push(kind, text, Some(session));
+                                        n.push(kind, text, Some(session.clone()));
                                         cx.notify();
                                     });
                                 }
+                            }
+                            if entering_review {
+                                let root = roots.get(&session).cloned().flatten();
+                                let summary = summaries.get(&session).cloned();
+                                center.update(cx, |_center, cx| {
+                                    cx.emit(OpenRequest::CodeReview {
+                                        session,
+                                        root,
+                                        summary,
+                                    });
+                                });
                             }
                         }
                         Ok(EngineEvent::SessionRemoved { session }) => {
@@ -2375,7 +2411,14 @@ impl Workspace {
                 root,
                 summary,
             } => Arc::new(cx.new(|cx| {
-                CodeReviewPanel::new(session, root, summary, Some(deps.commands.clone()), cx)
+                CodeReviewPanel::new(
+                    session,
+                    root,
+                    summary,
+                    Some(deps.commands.clone()),
+                    Some(deps.changes.clone()),
+                    cx,
+                )
             })),
             OpenRequest::NewManagedSession { id, phase, agent } => {
                 // Launch the agent in the phase's permission mode — always `auto`. The
@@ -2660,7 +2703,14 @@ fn build_center_panel(
         "review" => {
             let id = SessionId::new(rest.to_string());
             Arc::new(cx.new(|cx| {
-                CodeReviewPanel::new(id, space_root, None, Some(deps.commands.clone()), cx)
+                CodeReviewPanel::new(
+                    id,
+                    space_root,
+                    None,
+                    Some(deps.commands.clone()),
+                    Some(deps.changes.clone()),
+                    cx,
+                )
             }))
         }
         _ => return None,
@@ -2948,10 +2998,9 @@ fn save_state(state: &DockAreaState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// macOS-first layout file location under Application Support.
+/// The dock layout, in the platform state directory.
 fn layout_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/MoonlightCode/layout.json"))
+    crate::support::support_path("layout.json")
 }
 
 impl Render for Workspace {

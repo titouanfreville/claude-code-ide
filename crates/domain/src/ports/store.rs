@@ -4,6 +4,7 @@ use async_trait::async_trait;
 
 use crate::agent::AgentKind;
 use crate::audit::AuditEntry;
+use crate::changes::{Baseline, FileTouch, ReviewComment, TouchedPath};
 use crate::continuity::{BaselineMetric, SessionSummary};
 use crate::errors::StoreError;
 use crate::ids::{SessionId, Timestamp};
@@ -165,4 +166,71 @@ pub trait ManagedSessionStore: Send + Sync {
         session: &SessionId,
         limit: usize,
     ) -> Result<Vec<AuditEntry>, StoreError>;
+}
+
+/// Per-session ledger of the files an agent wrote, plus the operator's review
+/// comments on them (FR22). **Synchronous** for the same reason as
+/// [`ManagedSessionStore`]: local SQLite, so the hook path can record inline
+/// without an async hop while Claude Code waits on its verdict.
+pub trait SessionChangeStore: Send + Sync {
+    /// Record one observed write. Idempotent per `(session, path)`: the **first**
+    /// call stores [`FileTouch::baseline`], later ones only advance the last-touch
+    /// timestamp and the counter. Returns whether this call established the
+    /// baseline (i.e. it was the session's first touch of that file).
+    fn record_touch(&self, touch: &FileTouch) -> Result<bool, StoreError>;
+    /// Every file `session` has written, most recently touched first — names and
+    /// counts only. A baseline is a whole file's contents, so listing a session's
+    /// changes never loads them.
+    fn touched_paths(&self, session: &SessionId) -> Result<Vec<TouchedPath>, StoreError>;
+    /// The pre-image of **one** file, fetched only when something is about to show
+    /// it. `None` when this session never touched `path`.
+    fn baseline(&self, session: &SessionId, path: &str) -> Result<Option<Baseline>, StoreError>;
+    /// How many files each session has written, for every session at once — one
+    /// query behind a whole grid of badges.
+    fn touched_counts(&self) -> Result<Vec<(SessionId, u32)>, StoreError>;
+    /// Drop a session's ledger, its comments, and its review state (the session was
+    /// forgotten, or the operator closed the pass).
+    fn forget_session_changes(&self, session: &SessionId) -> Result<(), StoreError>;
+
+    /// Mark a file reviewed as of `at`, or clear the mark with `None`.
+    ///
+    /// The timestamp is the whole mechanism: [`TouchedPath::reviewed`] is
+    /// `at >= last_touch_at`, so a later write by the session un-marks the file
+    /// without anyone having to notice it happened. Returns whether a ledger row
+    /// was found to mark.
+    fn mark_reviewed(
+        &self,
+        session: &SessionId,
+        path: &str,
+        at: Option<Timestamp>,
+    ) -> Result<bool, StoreError>;
+
+    /// The paths this session's review is hiding — files, and directory prefixes
+    /// standing for everything beneath them.
+    ///
+    /// Kept per session rather than per project: "ignore for this review" is a
+    /// judgement about the pass being made now, and it dies with the pass. A
+    /// generated file worth skipping today can be the whole point of tomorrow's
+    /// review.
+    fn ignored_paths(&self, session: &SessionId) -> Result<Vec<String>, StoreError>;
+    /// Hide `path` from this session's review, or bring it back.
+    fn set_ignored(&self, session: &SessionId, path: &str, ignored: bool)
+        -> Result<(), StoreError>;
+    /// Bring everything this session's review is hiding back.
+    fn clear_ignored(&self, session: &SessionId) -> Result<(), StoreError>;
+
+    /// Persist one review comment (written as soon as the operator adds it, so a
+    /// closed tab doesn't lose it).
+    fn add_comment(&self, comment: &ReviewComment) -> Result<(), StoreError>;
+    /// All of `session`'s comments, oldest first.
+    fn comments(&self, session: &SessionId) -> Result<Vec<ReviewComment>, StoreError>;
+    /// Rewrite an existing comment in place — its body, its anchor, whether it
+    /// counts as delivered, and whether it is resolved. Editing a comment that was
+    /// already sent is how an operator corrects one that landed wrong; clearing its
+    /// `sent_at` is what puts it back in the next batch, and stamping
+    /// `resolved_at` is what takes it off the diff without erasing it.
+    fn update_comment(&self, comment: &ReviewComment) -> Result<bool, StoreError>;
+    fn delete_comment(&self, id: &str) -> Result<(), StoreError>;
+    /// Stamp `ids` as delivered — called once the batched review reaches the session.
+    fn mark_comments_sent(&self, ids: &[String], at: Timestamp) -> Result<(), StoreError>;
 }

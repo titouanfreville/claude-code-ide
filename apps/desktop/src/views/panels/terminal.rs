@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    actions, canvas, div, px, App, Bounds, ClipboardItem, Context, DispatchPhase, Entity,
-    EventEmitter, FocusHandle, Focusable, Hsla, KeyBinding, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, SharedString, Task, Window,
+    actions, canvas, div, px, App, Bounds, ClipboardEntry, ClipboardItem, Context, DispatchPhase,
+    Entity, EventEmitter, FocusHandle, Focusable, Hsla, Image, ImageFormat, KeyBinding,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    SharedString, Task, Window,
 };
 use gpui_component::dock::{Panel, PanelEvent};
 
@@ -44,14 +45,15 @@ use crate::term::emulator::Emulator;
 use crate::views::project_space::ProjectSpace;
 use crate::views::theme;
 
-/// Monospace font for the terminal grid. Menlo ships on every macOS, so cells
-/// always align even before a configurable font is wired in.
-const MONO_FONT: &str = "Menlo";
 const FONT_SIZE: f32 = 13.0;
-/// Approximate cell metrics for Menlo @ 13px — used to map panel pixels → grid
-/// cells. Exact glyph advance is not required; the shell reflows on resize.
-const CELL_W: f32 = 7.8;
+/// Cell height — a chosen line height rather than a measured one: the renderer
+/// sets it explicitly, so the grid's rows are exactly this tall by construction.
 const CELL_H: f32 = 17.0;
+/// Fallback cell width (Menlo @ 13px), used only until the real advance width of
+/// the resolved monospace font is measured — see [`TerminalPanel::cell_width`].
+/// Mapping pixels to grid cells with the wrong advance makes clicks and selections
+/// drift further the further right you go, so it must match the font in use.
+const CELL_W_FALLBACK: f32 = 7.8;
 /// Redraw cadence — fast enough to feel live, cheap when idle (only notifies on
 /// an actual dirty grid).
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
@@ -94,19 +96,24 @@ struct TermTab {
 
 /// Spawn a fresh terminal tab rooted at `root`, optionally running `command`.
 fn spawn_tab(root: PathBuf, command: Option<&str>, label: String) -> TermTab {
-    let (emulator, error) =
-        match Emulator::spawn(Some(root.clone()), 80, 24, CELL_W as u16, CELL_H as u16) {
-            Ok(emu) => {
-                if let Some(cmd) = command {
-                    emu.write_str(&format!("{cmd}\n"));
-                }
-                (Some(emu), None)
+    let (emulator, error) = match Emulator::spawn(
+        Some(root.clone()),
+        80,
+        24,
+        CELL_W_FALLBACK as u16,
+        CELL_H as u16,
+    ) {
+        Ok(emu) => {
+            if let Some(cmd) = command {
+                emu.write_str(&format!("{cmd}\n"));
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to spawn terminal");
-                (None, Some(e.to_string()))
-            }
-        };
+            (Some(emu), None)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to spawn terminal");
+            (None, Some(e.to_string()))
+        }
+    };
     TermTab {
         emulator,
         error,
@@ -165,6 +172,9 @@ pub struct TerminalPanel {
     /// When the operator last typed/pasted into the grid — the typing-lull clock
     /// that gates [`Self::auto_inject`] (only a fresh message may trigger it).
     last_typed_at: Option<std::time::Instant>,
+    /// Advance width of one grid cell, measured from the resolved monospace font
+    /// the first time this panel renders — see [`Self::cell_width`].
+    cell_w: Option<f32>,
     _poll: Option<Task<()>>,
 }
 
@@ -261,6 +271,7 @@ impl TerminalPanel {
             mouse_reported: false,
             auto_inject: None,
             last_typed_at: None,
+            cell_w: None,
             _poll: Some(poll),
         }
     }
@@ -276,6 +287,30 @@ impl TerminalPanel {
         self.tabs.get(self.active)
     }
 
+    /// The width of one grid cell: the monospace font's actual advance, measured
+    /// once, falling back to the Menlo figure until then.
+    fn cell_width(&self) -> f32 {
+        self.cell_w.unwrap_or(CELL_W_FALLBACK)
+    }
+
+    /// Measure the resolved monospace font's advance width, once. The grid maps
+    /// pixels to cells with it, so a font whose advance isn't Menlo's would
+    /// otherwise misplace every click past the first column.
+    fn measure_cell(&mut self, window: &Window) {
+        if self.cell_w.is_some() {
+            return;
+        }
+        let font = gpui::font(theme::mono_font());
+        let text_system = window.text_system();
+        let font_id = text_system.resolve_font(&font);
+        if let Ok(advance) = text_system.em_advance(font_id, px(FONT_SIZE)) {
+            let advance = f32::from(advance);
+            if advance > 0.0 {
+                self.cell_w = Some(advance);
+            }
+        }
+    }
+
     /// Write raw text to the active tab's PTY — used to drive Claude Code's TUI
     /// prompts from the cockpit (e.g. Enter to accept a plan's continuation).
     /// No-op if the PTY failed to spawn.
@@ -283,6 +318,33 @@ impl TerminalPanel {
         if let Some(emu) = self.active_tab().and_then(|t| t.emulator.as_ref()) {
             emu.write_str(text);
         }
+    }
+
+    /// Submit a **multi-line** message to the child as one prompt: the text is
+    /// wrapped as a bracketed paste (when the child asked for that mode) and then
+    /// submitted with a single CR.
+    ///
+    /// Sending the same text through [`send_text`](Self::send_text) would submit it
+    /// line by line — each `\n` reads as Enter in Claude Code's prompt, so an
+    /// N-line message becomes N truncated turns. Everything the cockpit composes
+    /// from structured input (a batched review, a rejection reason) goes through
+    /// here.
+    pub fn send_paste(&self, text: &str) {
+        let Some(emu) = self.active_tab().and_then(|t| t.emulator.as_ref()) else {
+            return;
+        };
+        emu.scroll_to_bottom();
+        if emu.bracketed_paste() {
+            emu.write_str(&format!("\x1b[200~{text}\x1b[201~"));
+        } else {
+            // Without bracketed paste a bare `\n` IS an Enter: the child would
+            // submit the message one line at a time and keep only a fragment. The
+            // xterm meta+Enter sequence is a literal newline to Claude Code — the
+            // same thing `encode_key` sends for Shift+Enter — so multi-line text
+            // arrives as one prompt whatever mode the child is in.
+            emu.write_str(&text.replace('\n', "\x1b\r"));
+        }
+        emu.write_str("\r");
     }
 
     /// Arm a one-shot injection: `text` is written to the PTY immediately before
@@ -404,6 +466,8 @@ impl TerminalPanel {
     /// records the content bounds so mouse positions can be mapped to grid cells.
     fn sync_size(&mut self, bounds: Bounds<Pixels>) {
         self.grid_bounds = Some(bounds);
+        // Read the cell width before borrowing the emulator mutably.
+        let cell_w = self.cell_width();
         let Some(emu) = self
             .tabs
             .get_mut(self.active)
@@ -411,9 +475,9 @@ impl TerminalPanel {
         else {
             return;
         };
-        let cols = (f32::from(bounds.size.width) / CELL_W).floor().max(2.0) as usize;
+        let cols = (f32::from(bounds.size.width) / cell_w).floor().max(2.0) as usize;
         let rows = (f32::from(bounds.size.height) / CELL_H).floor().max(1.0) as usize;
-        emu.resize(cols, rows, CELL_W as u16, CELL_H as u16);
+        emu.resize(cols, rows, cell_w as u16, CELL_H as u16);
     }
 
     /// Map a window-space mouse position to a **viewport** cell: 0-based column and
@@ -425,11 +489,12 @@ impl TerminalPanel {
         let b = self.grid_bounds?;
         let rel_x = (f32::from(pos.x) - f32::from(b.origin.x)).max(0.0);
         let rel_y = (f32::from(pos.y) - f32::from(b.origin.y)).max(0.0);
-        let cols = (f32::from(b.size.width) / CELL_W).floor().max(1.0);
+        let cell_w = self.cell_width();
+        let cols = (f32::from(b.size.width) / cell_w).floor().max(1.0);
         let rows = (f32::from(b.size.height) / CELL_H).floor().max(1.0);
-        let col = (rel_x / CELL_W).floor().clamp(0.0, cols - 1.0) as usize;
+        let col = (rel_x / cell_w).floor().clamp(0.0, cols - 1.0) as usize;
         let line = (rel_y / CELL_H).floor().clamp(0.0, rows - 1.0) as usize;
-        let side = if (rel_x / CELL_W).fract() < 0.5 {
+        let side = if (rel_x / cell_w).fract() < 0.5 {
             Side::Left
         } else {
             Side::Right
@@ -723,11 +788,119 @@ fn ansi_to_hsla(color: AnsiColor, is_fg: bool) -> Hsla {
     }
 }
 
+/// A clipboard chord the panel serves itself instead of forwarding to the PTY.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardChord {
+    Copy,
+    Paste,
+}
+
+/// Classify a keystroke as a copy/paste chord, or `None` to let it reach the child.
+///
+/// macOS keeps ⌘C/⌘V. Everywhere else GPUI reports ⌘ as `Modifiers::platform`,
+/// which is bound to the **Super** key (`MOD_NAME_LOGO`) — nobody pastes with
+/// Super, so the terminal conventions apply instead: Ctrl+Shift+C copies and
+/// Ctrl+V / Ctrl+Shift+V / Shift+Insert paste. Bare Ctrl+C is deliberately *not*
+/// a chord — it has to stay SIGINT, which is how the operator interrupts Claude
+/// Code.
+fn clipboard_chord(ks: &Keystroke) -> Option<ClipboardChord> {
+    let m = &ks.modifiers;
+    if cfg!(target_os = "macos") {
+        if !m.platform || m.control || m.alt {
+            return None;
+        }
+        return match ks.key.as_str() {
+            "c" => Some(ClipboardChord::Copy),
+            "v" => Some(ClipboardChord::Paste),
+            _ => None,
+        };
+    }
+    // Super chords belong to the window manager, Alt chords to the child.
+    if m.platform || m.alt {
+        return None;
+    }
+    match (ks.key.as_str(), m.control, m.shift) {
+        ("c", true, true) => Some(ClipboardChord::Copy),
+        ("v", true, _) => Some(ClipboardChord::Paste),
+        ("insert", false, true) => Some(ClipboardChord::Paste),
+        _ => None,
+    }
+}
+
+/// Whether a click chord means "open the link under the cursor" — ⌘-click on
+/// macOS, Ctrl-click elsewhere (the VS Code / gnome-terminal convention).
+fn is_open_link_chord(m: &gpui::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        m.platform
+    } else {
+        m.control
+    }
+}
+
+/// What a paste chord should type into the PTY: the clipboard's text, or — when
+/// it holds an image — the path of a file the image was spilled to, since Claude
+/// Code reads images by path.
+///
+/// The image branch is deliberately app-side: CC's own `^V` handler shells out to
+/// `xclip`/`wl-paste`, which need not be installed, while GPUI's clipboard already
+/// decodes image formats itself.
+fn clipboard_payload(cx: &mut App) -> Option<String> {
+    let item = cx.read_from_clipboard()?;
+    let image = item.entries().iter().find_map(|entry| match entry {
+        ClipboardEntry::Image(image) => Some(image),
+        _ => None,
+    });
+    if let Some(image) = image {
+        return match spill_image(image) {
+            // Trailing space so the path doesn't run into whatever is typed next.
+            Ok(path) => Some(format!("{} ", path.display())),
+            Err(error) => {
+                tracing::warn!(error = %error, "clipboard image could not be spilled to a file");
+                None
+            }
+        };
+    }
+    item.text().filter(|text| !text.is_empty())
+}
+
+/// Write a clipboard image to a temp file so a child process can be handed it by
+/// path. Named by the image's content hash, so pasting the same screenshot twice
+/// reuses one file instead of littering the temp dir.
+fn spill_image(image: &Image) -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join("moonlight-clipboard");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!(
+        "paste-{:016x}.{}",
+        image.id(),
+        image_extension(image.format)
+    ));
+    if !path.exists() {
+        std::fs::write(&path, &image.bytes)?;
+    }
+    Ok(path)
+}
+
+/// File extension for a clipboard image format — readers key off the extension,
+/// so it has to match the bytes actually written.
+fn image_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+        ImageFormat::Ico => "ico",
+        ImageFormat::Pnm => "pnm",
+    }
+}
+
 /// Encode a keystroke into the bytes a PTY expects, or `None` to let GPUI handle
 /// it (e.g. ⌘-shortcuts, unmapped chords).
 fn encode_key(ks: &Keystroke) -> Option<Vec<u8>> {
     let m = &ks.modifiers;
-    // Leave platform (⌘) chords to the app's keybindings.
+    // Leave platform (⌘ / Super) chords to the app's keybindings.
     if m.platform {
         return None;
     }
@@ -887,16 +1060,17 @@ fn encode_mouse(
     Some(vec![0x1b, b'[', b'M', bcb, bx, by])
 }
 
-/// Whether a keystroke starts/continues **composing a message**: a ⌘V paste, or a
-/// printable character with no control/alt/⌘ chord — excluding digits, which drive
-/// Claude Code's numbered menus (never inject a command in front of a menu pick).
-/// Gates the armed injection (see [`TerminalPanel::arm_injection`]).
+/// Whether a keystroke starts/continues **composing a message**: a paste, or a
+/// printable character with no chord — excluding digits, which drive Claude Code's
+/// numbered menus (never inject a command in front of a menu pick). Gates the armed
+/// injection (see [`TerminalPanel::arm_injection`]).
 fn is_compose_event(ks: &Keystroke) -> bool {
     let m = &ks.modifiers;
-    if m.platform {
-        return !m.control && !m.alt && ks.key == "v";
+    // A paste drops a draft into the prompt; the copy chord changes nothing.
+    if let Some(chord) = clipboard_chord(ks) {
+        return chord == ClipboardChord::Paste;
     }
-    if m.control || m.alt {
+    if m.platform || m.control || m.alt {
         return false;
     }
     ks.key_char
@@ -1034,7 +1208,11 @@ impl TerminalPanel {
 }
 
 impl Render for TerminalPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // First frame: learn the monospace font's real advance width, so pixel →
+        // cell mapping matches whatever font this platform actually resolved.
+        self.measure_cell(window);
+
         // Active-tab content (grid lines, link runs, exited flag, or a spawn error).
         let (lines, links, exited, err) = match self.active_tab() {
             Some(tab) => match &tab.emulator {
@@ -1160,7 +1338,7 @@ impl Render for TerminalPanel {
             .size_full()
             .bg(theme::terminal_bg())
             .text_color(theme::terminal_fg())
-            .font_family(MONO_FONT)
+            .font_family(theme::mono_font())
             .text_size(px(FONT_SIZE))
             // Pin the visual line height to the cell height the PTY is sized against,
             // so rendered rows match the grid exactly (no drift / trailing gap).
@@ -1180,7 +1358,7 @@ impl Render for TerminalPanel {
                         else {
                             return;
                         };
-                        if ev.modifiers.platform {
+                        if is_open_link_chord(&ev.modifiers) {
                             if let Some(url) = this.link_at(point) {
                                 cx.open_url(&url);
                             }
@@ -1231,32 +1409,30 @@ impl Render for TerminalPanel {
                     emu.scroll_to_bottom();
                     emu.write_str(text);
                 }
-                let m = &ev.keystroke.modifiers;
-                // ⌘C copies the selection, ⌘V pastes (bracketed when the app asks);
-                // other ⌘ chords fall through to the app's keybindings.
-                if m.platform && !m.control && !m.alt {
-                    match ev.keystroke.key.as_str() {
-                        "c" => {
-                            if let Some(text) = emu.selection_to_string() {
-                                if !text.is_empty() {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                                }
+                // The copy/paste chords are served here (see [`clipboard_chord`]);
+                // everything else falls through to the PTY or the app's keybindings.
+                match clipboard_chord(&ev.keystroke) {
+                    Some(ClipboardChord::Copy) => {
+                        if let Some(text) = emu.selection_to_string() {
+                            if !text.is_empty() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
                             }
                         }
-                        "v" => {
-                            if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                                let payload = if emu.bracketed_paste() {
-                                    format!("\x1b[200~{text}\x1b[201~")
-                                } else {
-                                    text
-                                };
-                                emu.scroll_to_bottom();
-                                emu.write_str(&payload);
-                            }
-                        }
-                        _ => {}
+                        return;
                     }
-                    return;
+                    Some(ClipboardChord::Paste) => {
+                        if let Some(text) = clipboard_payload(cx) {
+                            let payload = if emu.bracketed_paste() {
+                                format!("\x1b[200~{text}\x1b[201~")
+                            } else {
+                                text
+                            };
+                            emu.scroll_to_bottom();
+                            emu.write_str(&payload);
+                        }
+                        return;
+                    }
+                    None => {}
                 }
                 if let Some(bytes) = encode_key(&ev.keystroke) {
                     // Typing clears any selection and snaps back to the live view.
@@ -1674,12 +1850,106 @@ mod tests {
                 ..Default::default()
             }
         )));
-        // ⌘V pastes a draft → compose; ⌘C copy is not.
-        let cmd = gpui::Modifiers {
+        // A paste drops in a draft → compose; the copy chord is not.
+        assert!(is_compose_event(&ks("v", Some("v"), paste_mods())));
+        assert!(!is_compose_event(&ks("c", Some("c"), copy_mods())));
+    }
+
+    /// The host's paste modifiers — ⌘ on macOS, Ctrl elsewhere.
+    fn paste_mods() -> gpui::Modifiers {
+        if cfg!(target_os = "macos") {
+            gpui::Modifiers {
+                platform: true,
+                ..Default::default()
+            }
+        } else {
+            gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    /// The host's copy modifiers — ⌘ on macOS, Ctrl+Shift elsewhere (bare Ctrl+C
+    /// is reserved for SIGINT).
+    fn copy_mods() -> gpui::Modifiers {
+        if cfg!(target_os = "macos") {
+            gpui::Modifiers {
+                platform: true,
+                ..Default::default()
+            }
+        } else {
+            gpui::Modifiers {
+                control: true,
+                shift: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[test]
+    fn host_copy_and_paste_chords_are_recognized() {
+        assert_eq!(
+            clipboard_chord(&ks("v", Some("v"), paste_mods())),
+            Some(ClipboardChord::Paste)
+        );
+        assert_eq!(
+            clipboard_chord(&ks("c", Some("c"), copy_mods())),
+            Some(ClipboardChord::Copy)
+        );
+    }
+
+    /// The whole point of the Linux chords: interrupting Claude Code still works,
+    /// and Super chords stay with the window manager rather than pasting.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_c_stays_sigint_and_super_is_not_a_chord() {
+        let ctrl = gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        assert_eq!(clipboard_chord(&ks("c", Some("c"), ctrl)), None);
+        // …and it reaches the PTY as the interrupt byte.
+        assert_eq!(encode_key(&ks("c", Some("c"), ctrl)), Some(vec![0x03]));
+
+        let sup = gpui::Modifiers {
             platform: true,
             ..Default::default()
         };
-        assert!(is_compose_event(&ks("v", Some("v"), cmd)));
-        assert!(!is_compose_event(&ks("c", Some("c"), cmd)));
+        assert_eq!(clipboard_chord(&ks("v", Some("v"), sup)), None);
+    }
+
+    /// Shift+Insert is the X11 paste chord that predates Ctrl+Shift+V.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn shift_insert_and_ctrl_shift_v_also_paste() {
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            clipboard_chord(&ks("insert", None, shift)),
+            Some(ClipboardChord::Paste)
+        );
+        let ctrl_shift = gpui::Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            clipboard_chord(&ks("v", Some("v"), ctrl_shift)),
+            Some(ClipboardChord::Paste)
+        );
+    }
+
+    #[test]
+    fn spilled_image_keeps_its_format_extension() {
+        let image = Image::from_bytes(ImageFormat::Png, b"\x89PNG\r\n\x1a\n".to_vec());
+        let path = spill_image(&image).expect("spill");
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+        assert_eq!(std::fs::read(&path).expect("read back"), image.bytes);
+        // Same bytes → same file, so repeated pastes don't litter the temp dir.
+        assert_eq!(spill_image(&image).expect("spill again"), path);
+        std::fs::remove_file(&path).ok();
     }
 }

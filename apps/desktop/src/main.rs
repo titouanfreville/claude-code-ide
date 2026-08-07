@@ -16,6 +16,7 @@ mod agy_setup;
 mod assets;
 mod docker;
 mod git;
+mod git_probe;
 mod grpc;
 mod hook_install;
 mod http;
@@ -24,11 +25,16 @@ mod icon;
 mod lsp;
 mod mcp_activity;
 mod obs;
+mod pair_diff;
+mod path_tree;
 mod phase_verbs;
+mod review_findings;
+mod review_skills;
 mod run;
 mod run_verbs;
 #[cfg(test)]
 mod seed;
+mod support;
 mod term;
 mod transcript;
 mod views;
@@ -38,7 +44,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use gpui::{AppContext, WindowOptions};
+use gpui::{AppContext, TitlebarOptions, WindowOptions};
 use gpui_component::Root;
 
 use moonlight_control::{
@@ -54,6 +60,7 @@ use moonlight_domain::phase::Phase;
 use moonlight_domain::ports::mcp::McpActor;
 use moonlight_domain::ports::{
     ControlPort, DetectionSource, ManagedSessionStore, PermissionRequest, PolicyDecisionPoint,
+    SessionChangeStore,
 };
 use moonlight_domain::review::Feedback;
 use moonlight_domain::session::SessionStatus;
@@ -138,6 +145,9 @@ fn main() {
             // the supervisor (refreshes managed state + appends audit) and the UI shell
             // (consults it on layout-restore to re-resume managed sessions embedded).
             let store = open_store();
+            // The same connection, seen through each of its two ports.
+            let managed: Arc<dyn ManagedSessionStore> = store.clone();
+            let changes: Arc<dyn SessionChangeStore> = store.clone();
             // Steering channel (Option C): the `SteerControl` adapter queues injected
             // feedback (rejection-as-feedback, FR18-20) here; `run_steer_drain` writes it
             // into the target session's embedded terminal — the engine can't reach the
@@ -146,7 +156,7 @@ fn main() {
             let supervisor = SessionSupervisor::with_store(
                 Arc::new(SteerControl::new(steer_tx)),
                 bus.clone(),
-                Some(store.clone()),
+                Some(managed.clone()),
             );
 
             // Control gate: a shared per-session read-model the hook `ControlServer`
@@ -170,7 +180,8 @@ fn main() {
                 pending.clone(),
                 notifier.clone(),
                 runtime_safe.clone(),
-                store.clone(),
+                managed.clone(),
+                changes.clone(),
             );
 
             // Fold engine facts into the gate read-model (on GPUI's executor).
@@ -256,7 +267,7 @@ fn main() {
                             )),
                         )),
                     )),
-                    Arc::new(StoreAuditSink::new(store.clone())),
+                    Arc::new(StoreAuditSink::new(managed.clone())),
                     // `None` = hold MCP-verb approvals until the operator decides (no auto-deny
                     // — a human approval must not be rushed; see KeystoneApprovalGate).
                     Arc::new(KeystoneApprovalGate::new(
@@ -278,7 +289,9 @@ fn main() {
             let loop_runtime_safe = runtime_safe.clone();
             // The shell shares the same store so a restored managed-session tab can be
             // re-resumed (see the SessionMonitor registry arm in `views::workspace`).
-            let shell_store = store.clone();
+            let shell_store = managed.clone();
+            // The review surface reads the ledger the hook server writes.
+            let shell_changes = changes.clone();
 
             cx.spawn(async move |cx| {
                 cx.open_window(window_options(), |window, cx| {
@@ -306,6 +319,7 @@ fn main() {
                         editor_commands,
                         obs_store,
                         shell_store,
+                        shell_changes,
                         mcp_host,
                         run_registry,
                         http_history,
@@ -399,7 +413,9 @@ async fn run_steer_drain(mut rx: mpsc::UnboundedReceiver<Feedback>, cx: gpui::As
             };
             match io.terminal(&feedback.session_id) {
                 Some(term) => {
-                    let _ = term.update(cx, |t, _| t.send_text(&format!("{}\r", feedback.message)));
+                    // As a paste, not raw text: a batched review is many lines, and
+                    // each `\n` would otherwise submit a separate truncated turn.
+                    let _ = term.update(cx, |t, _| t.send_paste(&feedback.message));
                 }
                 None => tracing::warn!(
                     session = %feedback.session_id,
@@ -506,10 +522,14 @@ fn route_approval(
     }
 }
 
-/// Open the durable managed-session store under Application Support, falling back
-/// to an ephemeral in-memory store if the file can't be opened (no home dir, a
-/// read-only disk, …) so the app still runs — it just won't survive a restart.
-fn open_store() -> Arc<dyn ManagedSessionStore> {
+/// Open the durable store under Application Support, falling back to an ephemeral
+/// in-memory store if the file can't be opened (no home dir, a read-only disk, …)
+/// so the app still runs — it just won't survive a restart.
+///
+/// Returns the concrete [`Store`] rather than one port object because it backs
+/// **two** ports — [`ManagedSessionStore`] and [`SessionChangeStore`] — and they
+/// must share one connection; callers coerce to whichever port they need.
+fn open_store() -> Arc<Store> {
     let opened = store_path()
         .ok_or_else(|| "no home dir for store path".to_string())
         .and_then(|path| {
@@ -527,12 +547,11 @@ fn open_store() -> Arc<dyn ManagedSessionStore> {
     }
 }
 
-/// On-disk location of the managed-session database (macOS-first, mirrors the
-/// dock layout under Application Support). `pub(crate)`: the workspace's DB
-/// observer (right dock) opens this same database by default.
+/// On-disk location of the managed-session database, beside the dock layout in
+/// the platform state directory. `pub(crate)`: the workspace's DB observer (right
+/// dock) opens this same database by default.
 pub(crate) fn store_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/MoonlightCode/moonlight.db"))
+    support::support_path("moonlight.db")
 }
 
 /// Path of the control IPC socket the hook CLI and server rendez-vous on.
@@ -542,10 +561,9 @@ pub(crate) fn control_socket_path() -> PathBuf {
     PathBuf::from(home).join(".moonlight").join("control.sock")
 }
 
-/// On-disk crash log (next to the dock layout, under Application Support).
+/// On-disk crash log, next to the dock layout in the platform state directory.
 fn crash_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/MoonlightCode/crash.log"))
+    support::support_path("crash.log")
 }
 
 /// Install a global panic hook: log the message + location + backtrace via `tracing`
@@ -670,6 +688,7 @@ fn spawn_control_server(
     notifier: Arc<dyn ApprovalNotifier>,
     runtime_safe: RuntimeSafeTools,
     store: Arc<dyn ManagedSessionStore>,
+    changes: Arc<dyn SessionChangeStore>,
 ) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -722,7 +741,14 @@ fn spawn_control_server(
                         )
                         .with_ai_resolver(ai_workspace_resolver())
                         .with_runtime_safe(runtime_safe)
-                        .with_id_resolver(resolver),
+                        .with_id_resolver(resolver)
+                        // Every allowed file write is recorded here, with the file's
+                        // pre-image, so the review surface can show what THIS session
+                        // changed instead of whatever is dirty in the tree.
+                        .with_change_ledger(changes)
+                        // …and git makes the writes that never named a file — a
+                        // `sed -i`, a redirect, a formatter — attributable too.
+                        .with_workspace_probe(Arc::new(crate::git_probe::GitProbe)),
                     )
                     .serve(listener)
                     .await;
@@ -777,7 +803,10 @@ fn run_hook() {
     };
     let response = rt.block_on(query_hook(&control_socket_path(), &request, HOOK_TIMEOUT));
 
-    if let HookResponse::Deny { reason } = response {
+    // Only `PreToolUse` carries a permission decision — the server never denies a
+    // `PostToolUse` (it is observe-only), and emitting a decision block for one
+    // would be malformed output.
+    if let (HookResponse::Deny { reason }, "PreToolUse" | "") = (response, request.event.as_str()) {
         // PreToolUse structured output: deny + reason. Allow â no output, exit 0.
         let out = serde_json::json!({
             "hookSpecificOutput": {
@@ -875,13 +904,33 @@ fn run_statusline() {
     }
 }
 
+/// The product name a desktop environment shows for the window.
+const APP_NAME: &str = "MoonlightCode";
+
+/// Desktop-environment identity: the X11 `WM_CLASS` and the Wayland `app_id`.
+/// A desktop matches this against the installed `.desktop` entry of the same
+/// name (`packaging/linux/`) to find the app's icon and label, and groups our
+/// windows under one taskbar entry.
+const APP_ID: &str = "dev.moonlightcode.MoonlightCode";
+
 fn window_options() -> WindowOptions {
     WindowOptions {
         // Transparent titlebar hosting the macOS traffic lights, so the workspace's
         // own main toolbar (JetBrains-style) occupies that row instead of a wasted
         // native title. `TitleBar::title_bar_options()` sets `appears_transparent` and
         // the traffic-light inset that the `TitleBar` chrome reserves 80px for.
-        titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+        titlebar: Some(TitlebarOptions {
+            // Linux WMs put this in the window list and Alt-Tab; without it the
+            // window is labelled after the `moonlight` binary. macOS keeps hiding
+            // it (`appears_transparent` sets `NSWindowTitleHidden`), but it still
+            // names the window in the Window menu and Mission Control.
+            title: Some(APP_NAME.into()),
+            ..gpui_component::TitleBar::title_bar_options()
+        }),
+        app_id: Some(APP_ID.into()),
+        // X11 only; the other platforms are served by `icon::set_app_icon` or the
+        // `.desktop` entry (see `icon`).
+        icon: icon::window_icon(),
         ..Default::default()
     }
 }
