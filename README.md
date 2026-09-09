@@ -71,6 +71,8 @@ xattr -cr /Applications/MoonlightCode.app
 
 (or: System Settings → Privacy & Security → scroll to the blocked-app notice → "Open Anyway".)
 
+Confirmed working on the nightly `aarch64-apple-darwin` build.
+
 ## License
 
 MIT
