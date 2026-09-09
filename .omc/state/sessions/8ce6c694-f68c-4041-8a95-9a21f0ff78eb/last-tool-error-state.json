@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"grep -n \\\"SubmitReview\\\\|Steer\\\" crates/engine/src/lib.rs | head -20; echo ===; grep -n \\\"SubmitReview\\\" -A 25 crates/engine/src/supervisor.rs | head -60\",\"description\":\"Check engine comma...",
-  "error": "Exit code 1\n125:    Steer {\n133:    SubmitReview {\n(eval):1: == not found",
-  "timestamp": "2026-08-07T16:02:40.406Z",
-  "retry_count": 1
-}

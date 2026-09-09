@@ -8,3 +8,4 @@ Cargo.lock.orig
 
 # Local app data (MoonlightCode runtime store lives outside the repo)
 /.moonlight-local
+.omc

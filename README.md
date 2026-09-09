@@ -46,6 +46,30 @@ cargo test --all
 cargo run -p moonlight-desktop   # binary: moonlight
 ```
 
+### macOS prerequisite: Metal Toolchain
+
+GPUI's macOS renderer compiles Metal shaders at build time via `xcrun -sdk macosx
+metal`. Since Xcode 26, that compiler is an optional download and is **not**
+installed by default — a fresh Xcode install on a new Mac will fail the first
+`cargo build`/`cargo run` with an error like `cannot execute tool 'metal' due to
+missing Metal Toolchain`. Install it once with:
+
+```bash
+sudo xcodebuild -downloadComponent MetalToolchain
+```
+
+### Installing an unsigned build
+
+Release/nightly DMGs aren't code-signed or notarized yet, so macOS will refuse to
+open the app with a "MoonlightCode is damaged and can't be opened" message. Until
+signing is set up, work around it after copying the app to `/Applications`:
+
+```bash
+xattr -cr /Applications/MoonlightCode.app
+```
+
+(or: System Settings → Privacy & Security → scroll to the blocked-app notice → "Open Anyway".)
+
 ## License
 
 MIT

@@ -53,6 +53,14 @@ jobs:
             libvulkan-dev libgl1-mesa-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev
 
+      # gpui_macos's build.rs shells out to `xcrun -sdk macosx metal` to compile
+      # shaders.metal. Since Xcode 26 that compiler is an optional "Metal Toolchain"
+      # download, not bundled with Xcode by default — without this, compiling
+      # anything touching gpui_macos fails with "missing Metal Toolchain".
+      - name: Install Metal Toolchain
+        if: runner.os == 'macOS'
+        run: sudo xcodebuild -downloadComponent MetalToolchain
+
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test

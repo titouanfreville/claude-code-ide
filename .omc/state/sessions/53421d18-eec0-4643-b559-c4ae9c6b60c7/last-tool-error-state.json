@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"rtk grep -n \\\"async fn done_in_autoimplement_advances_forward_not_back_to_plan\\\" -A 30 crates/engine/src/supervisor.rs; echo ===; rtk grep -n \\\"async fn no_store_means_no_persistence_calls...",
-  "error": "Exit code 1\n1732:    async fn done_in_autoimplement_advances_forward_not_back_to_plan() {\n1733-        let (mut sup, control, mut rx) = fixture();\n1734-        let id = SessionId::new(\"sess-1\");\n1735-\n1736-        // Spawn (lands in Plan, unpinned), then drive it into AutoImplement.\n1737-        sup.handle_command(Command::SpawnSession {\n1738-            prompt: \"x\".into(),\n1739-            attached_path: None,\n1740-        })\n1741-        .await;\n1742-        sup.on_detection(DetectionEvent::Ph...",
-  "timestamp": "2026-08-05T16:37:48.748Z",
-  "retry_count": 1
-}

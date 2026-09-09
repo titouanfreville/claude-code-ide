@@ -35,7 +35,11 @@ jobs:
             os: macos-14        # Apple Silicon runner
             kind: macos
           - target: x86_64-apple-darwin
-            os: macos-13        # Intel runner
+            # macos-13 (the Intel runner image) was retired by GitHub on 2025-12-08.
+            # Cross-compile the Intel slice from the Apple Silicon runner instead —
+            # rustc/ld64 can produce an x86_64-apple-darwin binary on an arm64 host
+            # fine, since nothing here *executes* the target binary.
+            os: macos-14
             kind: macos
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -64,6 +68,17 @@ jobs:
             libvulkan-dev libgl1-mesa-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev
 
+      # gpui_macos's build.rs shells out to `xcrun -sdk macosx metal` to compile
+      # shaders.metal -> shaders.metallib, during this very build step (both the
+      # aarch64/M-series and cross-compiled x86_64 legs). Since Xcode 26 that
+      # compiler ships as an optional "Metal Toolchain" component, not bundled with
+      # Xcode by default — without this, the build fails with "cannot execute tool
+      # 'metal' due to missing Metal Toolchain". Same bites a fresh dev machine's
+      # first `cargo build`.
+      - name: Install Metal Toolchain
+        if: matrix.kind == 'macos'
+        run: sudo xcodebuild -downloadComponent MetalToolchain
+
       - name: Build release binary
         run: cargo build --release -p moonlight-desktop --target "$TGT"
 
@@ -91,7 +106,9 @@ jobs:
 
       - name: Bundle .app
         if: matrix.kind == 'macos'
-        run: cargo bundle --release -p moonlight-desktop --target "$TGT"
+        # --format osx only: without it cargo-bundle also emits its own throwaway
+        # .dmg, which we ignore in favor of the hand-built one below.
+        run: cargo bundle --release -p moonlight-desktop --target "$TGT" --format osx
 
       - name: Sign & notarize (only if signing secrets are set)
         if: matrix.kind == 'macos'

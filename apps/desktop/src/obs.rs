@@ -328,11 +328,63 @@ pub fn quota() -> Option<Quota> {
     fetch_quota().or_else(load_quota)
 }
 
-/// The user's Claude OAuth access token (`claudeAiOauth.accessToken` in
-/// `~/.claude/.credentials.json`) — the same token Claude Code itself uses.
+/// The user's Claude OAuth access token — the same token Claude Code itself uses.
+/// Tries `claudeAiOauth.accessToken` in `~/.claude/.credentials.json` first (Linux,
+/// or any platform where CC was told to use file storage), then the **macOS
+/// Keychain** (`security find-generic-password`), which is where current macOS
+/// Claude Code installs store credentials instead of writing the file at all.
 fn oauth_access_token() -> Option<String> {
-    let path = claude_config_dir()?.join(".credentials.json");
+    claude_config_dir()
+        .and_then(|dir| oauth_access_token_from(&dir))
+        .or_else(oauth_access_token_from_keychain)
+}
+
+/// Parse the OAuth access token out of a `.credentials.json` living in `config_dir`.
+/// Split from [`oauth_access_token`] so the parsing logic is unit-testable without
+/// touching the real `$HOME`/`$CLAUDE_CONFIG_DIR`.
+fn oauth_access_token_from(config_dir: &Path) -> Option<String> {
+    let path = config_dir.join(".credentials.json");
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    v.get("claudeAiOauth")?
+        .get("accessToken")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Claude Code's macOS Keychain service name for its OAuth credentials.
+#[cfg(target_os = "macos")]
+const CC_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// Read the OAuth token from the macOS Keychain — same JSON shape as
+/// `.credentials.json`, just stored as the Keychain item's password instead of a
+/// file. `None` on any failure (no item, access denied, unparsable) so a Keychain
+/// prompt/denial never blocks the caller; it just falls through to the OMC cache.
+#[cfg(target_os = "macos")]
+fn oauth_access_token_from_keychain() -> Option<String> {
+    use std::process::{Command, Stdio};
+    let out = Command::new("security")
+        .args(["find-generic-password", "-w", "-s", CC_KEYCHAIN_SERVICE])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(out.stdout).ok()?;
+    parse_keychain_credentials(raw.trim())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn oauth_access_token_from_keychain() -> Option<String> {
+    None
+}
+
+/// Parse the Keychain item's password (same `claudeAiOauth.accessToken` shape as
+/// `.credentials.json`) into the access token. Split out for unit testing.
+#[cfg(target_os = "macos")]
+fn parse_keychain_credentials(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     v.get("claudeAiOauth")?
         .get("accessToken")?
         .as_str()
@@ -973,6 +1025,51 @@ mod tests {
         assert_eq!(fmt_dur(3_000), "3s");
         assert_eq!(fmt_dur(72_000), "1m");
         assert_eq!(fmt_dur(4_320_000), "1h12m");
+    }
+
+    #[test]
+    fn oauth_access_token_reads_credentials_file() {
+        let dir = std::env::temp_dir().join(format!("mlc-obs-creds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-test-token","refreshToken":"r"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            oauth_access_token_from(&dir),
+            Some("sk-test-token".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oauth_access_token_none_on_missing_or_malformed() {
+        // No `.credentials.json` at all.
+        let empty_dir =
+            std::env::temp_dir().join(format!("mlc-obs-nocreds-{}", std::process::id()));
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        assert_eq!(oauth_access_token_from(&empty_dir), None);
+        let _ = std::fs::remove_dir_all(&empty_dir);
+
+        // Present but missing the expected shape.
+        let bad_dir = std::env::temp_dir().join(format!("mlc-obs-badcreds-{}", std::process::id()));
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join(".credentials.json"), r#"{"unexpected":true}"#).unwrap();
+        assert_eq!(oauth_access_token_from(&bad_dir), None);
+        let _ = std::fs::remove_dir_all(&bad_dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_keychain_credentials_reads_token() {
+        let raw = r#"{"claudeAiOauth":{"accessToken":"sk-keychain-token","refreshToken":"r"}}"#;
+        assert_eq!(
+            parse_keychain_credentials(raw),
+            Some("sk-keychain-token".to_string())
+        );
+        assert_eq!(parse_keychain_credentials("not json"), None);
+        assert_eq!(parse_keychain_credentials(r#"{"unexpected":true}"#), None);
     }
 
     #[test]

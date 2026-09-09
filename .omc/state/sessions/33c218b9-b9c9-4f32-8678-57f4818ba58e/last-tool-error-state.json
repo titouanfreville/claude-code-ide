@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"rtk find \\\"frontend-design*\\\" 2>/dev/null | head -20; echo \\\"---plugins---\\\"; ls ~/.claude/skills/ 2>/dev/null; echo \\\"---project---\\\"; ls .claude/skills/ 2>/dev/null\",\"description\":\"Look ...",
-  "error": "Exit code 1\n---plugins---\nfull-code-review\nomc-reference\nsheik-code-review\n---project---",
-  "timestamp": "2026-08-05T09:14:18.157Z",
-  "retry_count": 1
-}
