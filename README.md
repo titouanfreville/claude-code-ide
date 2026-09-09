@@ -49,13 +49,14 @@ cargo run -p moonlight-desktop   # binary: moonlight
 ### macOS prerequisite: Metal Toolchain
 
 GPUI's macOS renderer compiles Metal shaders at build time via `xcrun -sdk macosx
-metal`. Since Xcode 26, that compiler is an optional download and is **not**
-installed by default — a fresh Xcode install on a new Mac will fail the first
+metal`. On Xcode 26+, that compiler is an optional download and is **not**
+installed by default — a fresh Xcode install on a new Mac can fail the first
 `cargo build`/`cargo run` with an error like `cannot execute tool 'metal' due to
-missing Metal Toolchain`. Install it once with:
+missing Metal Toolchain`. Check first, then install only if actually missing
+(older Xcode versions don't have this component at all and don't need it):
 
 ```bash
-sudo xcodebuild -downloadComponent MetalToolchain
+xcrun -sdk macosx metal -v || sudo xcodebuild -downloadComponent MetalToolchain
 ```
 
 ### Installing an unsigned build

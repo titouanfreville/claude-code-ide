@@ -70,14 +70,23 @@ jobs:
 
       # gpui_macos's build.rs shells out to `xcrun -sdk macosx metal` to compile
       # shaders.metal -> shaders.metallib, during this very build step (both the
-      # aarch64/M-series and cross-compiled x86_64 legs). Since Xcode 26 that
-      # compiler ships as an optional "Metal Toolchain" component, not bundled with
-      # Xcode by default — without this, the build fails with "cannot execute tool
-      # 'metal' due to missing Metal Toolchain". Same bites a fresh dev machine's
-      # first `cargo build`.
-      - name: Install Metal Toolchain
+      # aarch64/M-series and cross-compiled x86_64 legs). On Xcode 26+ that compiler
+      # ships as an optional "Metal Toolchain" component, not bundled by default —
+      # but the runner's *default* Xcode may predate that split entirely (no
+      # -downloadComponent flag), in which case Metal already just works. Check
+      # first so this never fails a runner that doesn't need it.
+      - name: Install Metal Toolchain (if needed)
         if: matrix.kind == 'macos'
-        run: sudo xcodebuild -downloadComponent MetalToolchain
+        run: |
+          set -euo pipefail
+          if xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+            echo "Metal compiler already available — nothing to do."
+          elif xcodebuild -help 2>&1 | grep -q -- '-downloadComponent'; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          else
+            echo "::error::Metal compiler is missing and this Xcode has no -downloadComponent (too old for the Metal Toolchain split). Update the runner's selected Xcode."
+            exit 1
+          fi
 
       - name: Build release binary
         run: cargo build --release -p moonlight-desktop --target "$TGT"
