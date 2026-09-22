@@ -1,0 +1,32 @@
+{
+  "name": "moonlight",
+  "displayName": "MoonlightCode",
+  "description": "Governance and review for Claude Code sessions. Installs every MoonlightCode extension.",
+  "version": "0.1.1",
+  "private": false,
+  "publisher": "titouanfreville",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/titouanfreville/claude-code-ide"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Extension Packs"
+  ],
+  "icon": "icon.png",
+  "scripts": {
+    "package": "vsce package --no-dependencies",
+    "publish:vsce": "vsce publish --no-dependencies",
+    "publish:ovsx": "ovsx publish --no-dependencies"
+  },
+  "extensionPack": [
+    "titouanfreville.moonlight-core",
+    "titouanfreville.moonlight-status",
+    "titouanfreville.moonlight-session-control",
+    "titouanfreville.moonlight-ai-review",
+    "titouanfreville.moonlight-agentic-support"
+  ]
+}

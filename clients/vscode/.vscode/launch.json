@@ -1,0 +1,30 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run all MoonlightCode extensions",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/extensions/moonlight-core",
+        "--extensionDevelopmentPath=${workspaceFolder}/extensions/moonlight-status",
+        "--extensionDevelopmentPath=${workspaceFolder}/extensions/moonlight-session-control",
+        "--extensionDevelopmentPath=${workspaceFolder}/extensions/moonlight-ai-review",
+        "--extensionDevelopmentPath=${workspaceFolder}/extensions/moonlight-agentic-support"
+      ],
+      "outFiles": ["${workspaceFolder}/extensions/*/out/**/*.js"],
+      "preLaunchTask": "${defaultBuildTask}"
+    },
+    {
+      "name": "Run AI Review only",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/extensions/moonlight-core",
+        "--extensionDevelopmentPath=${workspaceFolder}/extensions/moonlight-ai-review"
+      ],
+      "outFiles": ["${workspaceFolder}/extensions/*/out/**/*.js"],
+      "preLaunchTask": "${defaultBuildTask}"
+    }
+  ]
+}

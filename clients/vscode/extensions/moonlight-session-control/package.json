@@ -1,0 +1,248 @@
+{
+  "name": "moonlight-session-control",
+  "displayName": "MoonlightCode Session Control",
+  "description": "Adopt Claude Code sessions into governance, set their workflow phase, and start governed sessions.",
+  "version": "0.1.1",
+  "private": false,
+  "publisher": "titouanfreville",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/titouanfreville/claude-code-ide"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "icon": "icon.png",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "dependencies": {
+    "moonlight-control-client": "*",
+    "moonlight-core": "*"
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "package": "vsce package --no-dependencies",
+    "publish:vsce": "vsce publish --no-dependencies",
+    "publish:ovsx": "ovsx publish --no-dependencies",
+    "test": "node --test out"
+  },
+  "extensionDependencies": [
+    "titouanfreville.moonlight-core"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "moonlight.sessionControl.setActive",
+        "title": "MoonlightCode: Set Active Session"
+      },
+      {
+        "command": "moonlight.sessionControl.adopt",
+        "title": "MoonlightCode: Adopt a Claude Code Session"
+      },
+      {
+        "command": "moonlight.sessionControl.setPhase",
+        "title": "MoonlightCode: Set Session Phase"
+      },
+      {
+        "command": "moonlight.sessionControl.startSession",
+        "title": "MoonlightCode: Start Session in Owned Terminal"
+      },
+      {
+        "command": "moonlight.sessions.refresh",
+        "title": "MoonlightCode: Refresh Sessions",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "moonlight.sessions.adopt",
+        "title": "MoonlightCode: Adopt This Session",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "moonlight.sessions.setPhase",
+        "title": "MoonlightCode: Set Phase",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "moonlight.sessions.advancePhase",
+        "title": "MoonlightCode: Advance Phase",
+        "icon": "$(debug-step-over)"
+      },
+      {
+        "command": "moonlight.sessions.setActive",
+        "title": "MoonlightCode: Follow This Session",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "moonlight.sessions.reviewPlan",
+        "title": "MoonlightCode: Review the Held Plan",
+        "icon": "$(bell-dot)"
+      },
+      {
+        "command": "moonlight.sessions.createGroup",
+        "title": "New Session Group",
+        "category": "MoonlightCode",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "moonlight.sessions.addToGroup",
+        "title": "Add to Group\u2026",
+        "category": "MoonlightCode",
+        "icon": "$(folder)"
+      },
+      {
+        "command": "moonlight.sessions.removeFromGroup",
+        "title": "Remove from Group",
+        "category": "MoonlightCode"
+      },
+      {
+        "command": "moonlight.sessions.renameGroup",
+        "title": "Rename Group",
+        "category": "MoonlightCode",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "moonlight.sessions.deleteGroup",
+        "title": "Delete Group",
+        "category": "MoonlightCode",
+        "icon": "$(trash)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "moonlight",
+          "title": "MoonlightCode",
+          "icon": "resources/moonlight.svg"
+        }
+      ]
+    },
+    "views": {
+      "moonlight": [
+        {
+          "id": "moonlight.governed",
+          "name": "Governed"
+        },
+        {
+          "id": "moonlight.unadopted",
+          "name": "Not adopted"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "moonlight.sessionControl.startSession",
+          "when": "view == moonlight.governed",
+          "group": "navigation@1"
+        },
+        {
+          "command": "moonlight.sessions.refresh",
+          "when": "view == moonlight.governed || view == moonlight.unadopted",
+          "group": "navigation@2"
+        },
+        {
+          "command": "moonlight.sessions.createGroup",
+          "when": "view == moonlight.governed",
+          "group": "navigation@9"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "moonlight.sessions.adopt",
+          "when": "viewItem == moonlight.session.unadopted",
+          "group": "inline@1"
+        },
+        {
+          "command": "moonlight.sessions.reviewPlan",
+          "when": "viewItem =~ /^moonlight\\.session\\.held/",
+          "group": "inline@1"
+        },
+        {
+          "command": "moonlight.sessions.setPhase",
+          "when": "viewItem =~ /moonlight.session.(governed|held)/",
+          "group": "inline@2"
+        },
+        {
+          "command": "moonlight.sessions.advancePhase",
+          "when": "viewItem =~ /moonlight.session.(governed|held)/",
+          "group": "inline@3"
+        },
+        {
+          "command": "moonlight.sessions.setActive",
+          "when": "viewItem =~ /moonlight.session./",
+          "group": "context@1"
+        },
+        {
+          "command": "moonlight.sessions.addToGroup",
+          "when": "view == moonlight.governed && viewItem =~ /^moonlight\\.session\\./",
+          "group": "9_groups@1"
+        },
+        {
+          "command": "moonlight.sessions.removeFromGroup",
+          "when": "view == moonlight.governed && viewItem =~ /^moonlight\\.session\\..*\\.grouped$/",
+          "group": "9_groups@2"
+        },
+        {
+          "command": "moonlight.sessions.renameGroup",
+          "when": "view == moonlight.governed && viewItem == moonlight.group.custom",
+          "group": "inline@1"
+        },
+        {
+          "command": "moonlight.sessions.deleteGroup",
+          "when": "view == moonlight.governed && viewItem == moonlight.group.custom",
+          "group": "inline@2"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "moonlight.governed",
+        "when": "!moonlight.backendUp",
+        "contents": "No MoonlightCode backend is answering.\n\nThe daemon holds the sessions, the gate and the review record \u2014 without it nothing here is governed.\n\n[Retry now](command:moonlight.sessions.refresh)\n\nOne is started automatically when a `moonlightd` can be found on your PATH."
+      },
+      {
+        "view": "moonlight.governed",
+        "when": "moonlight.backendUp && moonlight.hasSessions",
+        "contents": "No session is governed yet.\n\nSessions below are running with nothing gating them. Adopt one to put it under a workflow phase."
+      },
+      {
+        "view": "moonlight.governed",
+        "when": "moonlight.backendUp && !moonlight.hasSessions",
+        "contents": "No Claude Code sessions detected.\n\nA session appears once it writes its first transcript line \u2014 detection has nothing to see before that.\n\n[Start a governed session](command:moonlight.sessionControl.startSession)"
+      },
+      {
+        "view": "moonlight.unadopted",
+        "when": "moonlight.backendUp",
+        "contents": "Every detected session is governed."
+      }
+    ],
+    "configuration": {
+      "title": "MoonlightCode",
+      "properties": {
+        "moonlight.sessions.groupBy": {
+          "type": "string",
+          "enum": [
+            "project",
+            "custom",
+            "none"
+          ],
+          "enumDescriptions": [
+            "Group sessions by their project root.",
+            "Group by the groups you create; anything ungrouped still falls back to its project.",
+            "One flat list, ordered worst-first."
+          ],
+          "default": "project",
+          "markdownDescription": "How the session lists in the MoonlightCode sidebar are arranged.\n\nGrouping applies **within** the Governed and Not-adopted views \u2014 those stay separate lists. A single group is rendered flat, since one header over the whole list carries no information.",
+          "scope": "resource"
+        }
+      }
+    }
+  }
+}

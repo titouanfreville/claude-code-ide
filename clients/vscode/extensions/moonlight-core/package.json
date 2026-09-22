@@ -1,0 +1,58 @@
+{
+  "name": "moonlight-core",
+  "displayName": "MoonlightCode Core",
+  "description": "Shared backend connection, session state and owned-terminal registry. Every other MoonlightCode extension depends on this one.",
+  "version": "0.1.1",
+  "private": false,
+  "publisher": "titouanfreville",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/titouanfreville/claude-code-ide"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "icon": "icon.png",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "dependencies": {
+    "moonlight-control-client": "*"
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "package": "vsce package --no-dependencies",
+    "publish:vsce": "vsce publish --no-dependencies",
+    "publish:ovsx": "ovsx publish --no-dependencies",
+    "test": "node --test out"
+  },
+  "types": "./out/api.d.ts",
+  "contributes": {
+    "configuration": {
+      "title": "MoonlightCode",
+      "properties": {
+        "moonlight.daemon.path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "markdownDescription": "Absolute path to the `moonlightd` binary this window should start. Leave empty to use the `MOONLIGHT_DAEMON_BIN` environment variable, then the first `moonlightd` on `PATH`.\n\nSet this when you build the daemon yourself and want the editor to start *your* build rather than the installed one. If the path is set but not executable, no daemon is started \u2014 a named daemon is never silently swapped for a different one.",
+          "scope": "machine-overridable"
+        },
+        "moonlight.daemon.autostart": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Start `moonlightd` from this window when the backend is unreachable.\n\nTurn this off if you run the daemon yourself \u2014 from a terminal, a debugger, or a service manager. The editor keeps talking to whichever daemon is running; it just stops starting one, so your process is not displaced by an autostart on the poll loop.\n\nWith this off and no daemon running, sessions are ungoverned: the hooks fail open.",
+          "scope": "machine-overridable"
+        }
+      }
+    }
+  }
+}

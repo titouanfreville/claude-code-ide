@@ -13,3 +13,6 @@ moonlight-domain.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+# `EngineEvent` crosses the process boundary so a client IDE folds the daemon's facts
+# rather than running a second engine and arriving at its own answer.
+serde = { workspace = true, features = ["derive"] }

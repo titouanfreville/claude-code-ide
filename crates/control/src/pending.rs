@@ -25,9 +25,19 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use moonlight_domain::ids::SessionId;
 use tokio::sync::oneshot;
+
+/// Wall-clock milliseconds. A clock before the epoch reads as 0 rather than panicking:
+/// a wrong "waiting since" is a cosmetic defect, and a hold is not worth crashing over.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// The operator's verdict on a held action.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,10 +69,33 @@ pub trait ApprovalNotifier: Send + Sync {
     );
 }
 
+/// What a held approval is asking, for a client that arrives after the notification.
+///
+/// The notifier announces a hold exactly once, when it starts. An editor window opened
+/// or reloaded after that point has missed it — and since an unbounded hold waits for
+/// an operator indefinitely, nothing else would ever surface the blocked session. So
+/// the registry keeps the question, not just the channel to answer it on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldApproval {
+    /// Short human-readable description, as passed to [`ApprovalNotifier`].
+    pub what: String,
+    /// The proposed plan markdown, when the held action is `ExitPlanMode`.
+    pub plan: Option<String>,
+    /// The full `mcp__server__tool` name, when a frozen phase held an external tool.
+    pub mcp_tool: Option<String>,
+    /// When the hold started (epoch ms), so a client can show how long it has waited.
+    pub since_ms: u64,
+}
+
+struct Waiter {
+    tx: oneshot::Sender<Decision>,
+    held: HeldApproval,
+}
+
 /// Registry of in-flight held approvals, keyed by session.
 #[derive(Default)]
 pub struct PendingApprovals {
-    waiters: Mutex<HashMap<SessionId, oneshot::Sender<Decision>>>,
+    waiters: Mutex<HashMap<SessionId, Waiter>>,
 }
 
 impl PendingApprovals {
@@ -74,12 +107,42 @@ impl PendingApprovals {
     /// Any prior pending approval for the same session is superseded (its sender is
     /// dropped, so its waiter resolves as closed → deny).
     pub fn register(&self, session: SessionId) -> oneshot::Receiver<Decision> {
+        self.register_held(
+            session,
+            HeldApproval {
+                what: String::new(),
+                plan: None,
+                mcp_tool: None,
+                since_ms: now_ms(),
+            },
+        )
+    }
+
+    /// Register a pending approval along with what it is asking. Prefer this over
+    /// [`register`](Self::register) wherever the context is known — a hold listed with
+    /// an empty `what` tells a late-joining client that something is blocked but not
+    /// what it would be approving.
+    pub fn register_held(
+        &self,
+        session: SessionId,
+        held: HeldApproval,
+    ) -> oneshot::Receiver<Decision> {
         let (tx, rx) = oneshot::channel();
         self.waiters
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(session, tx);
+            .insert(session, Waiter { tx, held });
         rx
+    }
+
+    /// Every hold currently waiting on an operator, session id first.
+    pub fn outstanding(&self) -> Vec<(SessionId, HeldApproval)> {
+        self.waiters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(session, waiter)| (session.clone(), waiter.held.clone()))
+            .collect()
     }
 
     /// Resolve the pending approval for `session`, if any. Returns `true` when a
@@ -87,7 +150,7 @@ impl PendingApprovals {
     /// hold timed out, in which case the send is dropped and this still reports the
     /// waiter was consumed).
     pub fn resolve(&self, session: &SessionId, decision: Decision) -> bool {
-        let Some(tx) = self
+        let Some(Waiter { tx, .. }) = self
             .waiters
             .lock()
             .unwrap_or_else(|p| p.into_inner())

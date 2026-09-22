@@ -10,3 +10,8 @@ rust-version.workspace = true
 [dependencies]
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The Claude-observability read model (`obs`): statusline snapshots off disk and the
+# account usage quota off Anthropic's OAuth usage endpoint, shared by the desktop app
+# and the headless daemon so both report the same figures.
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

@@ -32,6 +32,13 @@ pub enum HookResponse {
     Allow,
     /// Block the action; `reason` is surfaced to the session/operator.
     Deny { reason: String },
+    /// Not a verdict: text to prepend to the session's turn (`UserPromptSubmit`).
+    ///
+    /// A new variant on a tagged enum is a one-way compatibility step — an older
+    /// client decoding it fails the parse and falls back to [`HookResponse::fail_open`],
+    /// so a version-skewed pair degrades to "allow, no context" rather than to an
+    /// error. That is the right direction: the brief is an improvement, never a gate.
+    Context { text: String },
 }
 
 impl HookResponse {

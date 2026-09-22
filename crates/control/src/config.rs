@@ -39,6 +39,50 @@ pub fn load_config(path: &Path) -> Option<AiWorkspaceConfig> {
     }
 }
 
+/// Governance policy read from the same `.moonlight/config.json`, kept in its own
+/// partial struct (the established pattern — see `LspConfig`, `TestCommandConfig`)
+/// because it has nothing to do with AI-workspace roots or safe tools.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct AutoAdoptConfig {
+    /// Directory trees whose Claude Code sessions are adopted into governance
+    /// automatically. **Allowlist, empty by default**: adoption is what first lets
+    /// the gate deny a tool call, so this opts specific trees in rather than
+    /// governing everything detection happens to see.
+    pub auto_adopt_roots: Vec<String>,
+}
+
+/// Read `auto_adopt_roots` from the user-level `~/.moonlight/config.json`.
+///
+/// User-level only, deliberately: a workspace-level file lives *inside* a repo, so
+/// honouring it there would let a cloned repository opt itself into governance —
+/// the allowlist has to be something only the machine's operator can write.
+/// Relative entries are ignored; an auto-adopt rule must name an absolute tree.
+pub fn auto_adopt_roots(home: impl AsRef<Path>) -> Vec<String> {
+    let path = user_config_path(home);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    let cfg: AutoAdoptConfig = match serde_json::from_slice(&bytes) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err,
+                "ignoring malformed .moonlight/config.json while reading auto_adopt_roots");
+            return Vec::new();
+        }
+    };
+    cfg.auto_adopt_roots
+        .into_iter()
+        .filter(|r| {
+            let absolute = Path::new(r).is_absolute();
+            if !absolute {
+                tracing::warn!(root = %r, "ignoring relative auto_adopt_roots entry");
+            }
+            absolute
+        })
+        .collect()
+}
+
 /// Find and load the workspace config governing `cwd`: the nearest ancestor (starting
 /// at `cwd` itself) that contains `.moonlight/config.json`. `None` if none is found.
 fn workspace_config_for(cwd: &str) -> Option<AiWorkspaceConfig> {

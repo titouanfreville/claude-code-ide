@@ -1,0 +1,25 @@
+{
+  "name": "moonlight-vscode-clients",
+  "private": true,
+  "version": "0.0.0",
+  "description": "MoonlightCode editor clients: a shared control-API client, feature extensions, and the extension pack that installs them together.",
+  "workspaces": [
+    "packages/*",
+    "extensions/*"
+  ],
+  "scripts": {
+    "compile": "npm run link:local && npm run compile -w moonlight-control-client && npm run compile -w moonlight-core && npm run compile --workspaces --if-present",
+    "watch": "npm run watch --workspaces --if-present",
+    "package": "npm run package --workspaces --if-present",
+    "publish:vsce": "npm run publish:vsce --workspaces --if-present",
+    "publish:ovsx": "npm run publish:ovsx --workspaces --if-present",
+    "test": "npm run compile && npm run test --workspaces --if-present",
+    "link:local": "node scripts/link-local.js",
+    "postinstall": "node scripts/link-local.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

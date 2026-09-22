@@ -20,7 +20,11 @@ use moonlight_domain::trust::TrustTier;
 
 /// Facts and requests the engine publishes; the UI's only inbound channel.
 /// Past-tense variants are facts; imperative variants are requests for the operator.
-#[derive(Debug, Clone)]
+///
+/// Serializable so the events can leave the process that produced them: a client IDE
+/// folds the same facts the daemon publishes, rather than running a second engine and
+/// arriving at its own answer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EngineEvent {
     /// A session row was created, or a non-status field (e.g. title) changed —
     /// carries the full record so the UI can add or replace a tile. Thin
@@ -194,6 +198,18 @@ pub enum Command {
     /// shows it again. Runs once at boot and on the operator's manual "refresh".
     /// Idempotent: sessions already live are left untouched.
     RehydrateFleet,
+    /// Republish `SessionUpserted` for **every** session currently in the fleet.
+    ///
+    /// Distinct from [`Command::RehydrateFleet`], which reads the store and skips
+    /// anything already in memory — that is right for boot, but useless for
+    /// resynchronising a downstream read-model, which is exactly when nothing has
+    /// changed in memory and everything has been lost downstream.
+    ///
+    /// The bus is drop-oldest: a subscriber that falls behind gets `Lagged` and the
+    /// dropped events are gone. A fold that merely skips them is permanently wrong
+    /// for every session that then goes quiet — and for the gate's read-model, wrong
+    /// means a session it has never heard of, which it allows.
+    RepublishFleet,
     /// Forget a session entirely: drop it from the live fleet **and** delete its
     /// managed record, then announce [`EngineEvent::SessionRemoved`] so the grid
     /// drops its tile. Used when ↻ Reset replaces a session with a fresh id (CC's

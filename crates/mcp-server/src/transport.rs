@@ -92,14 +92,93 @@ pub struct VerbToolServer {
     actor: Arc<dyn McpActor>,
     session: SessionId,
     tool_router: ToolRouter<Self>,
+    /// Kept so [`ServerHandler::get_info`] can describe the verbs this host actually
+    /// serves. The router already withdraws the rest, but `instructions` is prose the
+    /// agent reads as authoritative — naming a tool it does not have sends it looking
+    /// for one, which costs a turn and ends in a confused retry.
+    scope: VerbScope,
 }
+
+/// Which verbs a host offers.
+///
+/// The workflow verbs are pure engine operations — they send a command, read the
+/// phase, or block until an operator decides — so any host can serve them, and the
+/// daemon does, which is what lets a session reach them with no IDE attached.
+///
+/// The `run_*` verbs address "the IDE's Run console", a UI surface a daemon does not
+/// have. Offering them from a host that cannot honour them would advertise tools that
+/// always fail, so each IDE serves those itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerbScope {
+    /// Every verb. For a host that owns a Run console.
+    All,
+    /// Workflow only: `present_plan`, `request_phase`, `phase_status`, `report_blocked`.
+    WorkflowOnly,
+}
+
+/// What the agent is told this host offers.
+///
+/// Built from the scope rather than written out once, because the two must agree: a
+/// daemon serving [`VerbScope::WorkflowOnly`] used to hand every session a paragraph
+/// naming `run_start`, `run_logs` and the rest, none of which it serves.
+fn instructions(scope: VerbScope) -> String {
+    let mut text = String::from("MoonlightCode actor verbs (policy-gated + audited). Available: ");
+    if scope == VerbScope::All {
+        text.push_str(
+            "run_with_coverage; run_list_targets / run_start / run_stop / run_status / \
+             run_logs (the IDE's Run console — shared with the operator); ",
+        );
+    }
+    text.push_str(
+        "phase_status (read-only: which workflow phase you are in and what it allows — \
+         call it when unsure before requesting a change); request_phase (ask the operator \
+         to change the workflow phase — always operator-approved); present_plan (present a \
+         plan as Markdown for operator review in the plan panel — blocks on Approve / \
+         Refine / Reject; the any-mode, any-backend equivalent of leaving plan mode); \
+         report_blocked (signal you are stuck and need the operator — raises a ⚠ on your \
+         session).",
+    );
+    if scope == VerbScope::WorkflowOnly {
+        text.push_str(
+            " This host has no Run console, so it serves no run_* verbs — use your own \
+             shell tooling to build and test.",
+        );
+    }
+    text
+}
+
+/// The verbs that need a Run console, and are therefore withdrawn by
+/// [`VerbScope::WorkflowOnly`].
+const RUN_CONSOLE_VERBS: &[&str] = &[
+    "run_with_coverage",
+    "run_list_targets",
+    "run_start",
+    "run_stop",
+    "run_status",
+    "run_logs",
+];
 
 impl VerbToolServer {
     pub fn new(actor: Arc<dyn McpActor>, session: SessionId) -> Self {
+        Self::with_scope(actor, session, VerbScope::All)
+    }
+
+    /// Build a server offering only the verbs this host can actually honour.
+    ///
+    /// Routes are *removed* rather than a second router being defined, so both hosts
+    /// share one implementation of every verb and cannot drift apart.
+    pub fn with_scope(actor: Arc<dyn McpActor>, session: SessionId, scope: VerbScope) -> Self {
+        let mut tool_router = Self::tool_router();
+        if scope == VerbScope::WorkflowOnly {
+            for verb in RUN_CONSOLE_VERBS {
+                tool_router.remove_route(verb);
+            }
+        }
         Self {
             actor,
             session,
-            tool_router: Self::tool_router(),
+            tool_router,
+            scope,
         }
     }
 
@@ -223,19 +302,7 @@ impl ServerHandler for VerbToolServer {
     fn get_info(&self) -> ServerInfo {
         // `ServerInfo` is `#[non_exhaustive]` — build from default + set fields.
         let mut info = ServerInfo::default();
-        info.instructions = Some(
-            "MoonlightCode actor verbs (policy-gated + audited). Available: \
-             run_with_coverage; run_list_targets / run_start / run_stop / run_status / \
-             run_logs (the IDE's Run console — shared with the operator); phase_status \
-             (read-only: which workflow phase you are in and what it allows — call it \
-             when unsure before requesting a change); request_phase (ask the operator to \
-             change the workflow phase — always operator-approved); present_plan (present a \
-             plan as Markdown for operator review in the plan panel — blocks on Approve / \
-             Refine / Reject; the any-mode, any-backend equivalent of leaving plan mode); \
-             report_blocked (signal you are stuck and need the operator — raises a ⚠ on your \
-             session)."
-                .to_string(),
-        );
+        info.instructions = Some(instructions(self.scope));
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }
@@ -263,6 +330,16 @@ pub async fn serve_http(
     session: SessionId,
     listener: tokio::net::TcpListener,
 ) -> std::io::Result<()> {
+    serve_http_scoped(actor, session, listener, VerbScope::All).await
+}
+
+/// As [`serve_http`], but offering only the verbs this host can honour.
+pub async fn serve_http_scoped(
+    actor: Arc<dyn McpActor>,
+    session: SessionId,
+    listener: tokio::net::TcpListener,
+    scope: VerbScope,
+) -> std::io::Result<()> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
@@ -270,7 +347,13 @@ pub async fn serve_http(
 
     // A fresh tool server per MCP session, bound to this CC session id.
     let service = StreamableHttpService::new(
-        move || Ok(VerbToolServer::new(actor.clone(), session.clone())),
+        move || {
+            Ok(VerbToolServer::with_scope(
+                actor.clone(),
+                session.clone(),
+                scope,
+            ))
+        },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
     );
@@ -287,11 +370,42 @@ pub async fn serve_http(
 pub struct McpHost {
     actor: Arc<dyn McpActor>,
     policy: Arc<crate::BusPolicyView>,
+    scope: VerbScope,
 }
 
 impl McpHost {
     pub fn new(actor: Arc<dyn McpActor>, policy: Arc<crate::BusPolicyView>) -> Self {
-        Self { actor, policy }
+        Self {
+            actor,
+            policy,
+            scope: VerbScope::All,
+        }
+    }
+
+    /// The policy-gated actor behind this host, so a caller that already has a session
+    /// id can run a verb without going through the wire transport at all.
+    ///
+    /// This is what lets the control API answer a verb on behalf of a session whose
+    /// agent reaches us out-of-process (see the daemon's `mcp` subcommand): the verb
+    /// still resolves → PDP → executes → audits exactly once, in the process that holds
+    /// the approvals, rather than a second actor being stood up somewhere that cannot
+    /// see them.
+    pub fn actor(&self) -> Arc<dyn McpActor> {
+        self.actor.clone()
+    }
+
+    /// A host that offers only the verbs it can honour — the daemon, which has no Run
+    /// console, serves workflow verbs only.
+    pub fn with_scope(
+        actor: Arc<dyn McpActor>,
+        policy: Arc<crate::BusPolicyView>,
+        scope: VerbScope,
+    ) -> Self {
+        Self {
+            actor,
+            policy,
+            scope,
+        }
     }
 
     /// The shared policy view — the composition root feeds it the engine bus
@@ -308,11 +422,101 @@ impl McpHost {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let actor = self.actor.clone();
+        let scope = self.scope;
         tokio::spawn(async move {
-            if let Err(err) = serve_http(actor, session, listener).await {
+            if let Err(err) = serve_http_scoped(actor, session, listener, scope).await {
                 tracing::warn!(error = %err, "embedded MCP server stopped");
             }
         });
         Ok(format!("http://127.0.0.1:{port}/mcp"))
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    fn names(scope: VerbScope) -> Vec<String> {
+        let mut router = VerbToolServer::tool_router();
+        if scope == VerbScope::WorkflowOnly {
+            for verb in RUN_CONSOLE_VERBS {
+                router.remove_route(verb);
+            }
+        }
+        router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect()
+    }
+
+    /// The prose an agent reads has to match the router. It did not: a workflow-only
+    /// host advertised the whole Run console in its instructions while serving none of
+    /// it, so a session was told to use tools that were not in its tool list.
+    #[test]
+    fn the_instructions_name_only_the_verbs_the_host_serves() {
+        let workflow = instructions(VerbScope::WorkflowOnly);
+        for verb in RUN_CONSOLE_VERBS {
+            assert!(
+                !workflow.contains(verb),
+                "`{verb}` is not served here and must not be advertised"
+            );
+        }
+        for verb in [
+            "present_plan",
+            "request_phase",
+            "phase_status",
+            "report_blocked",
+        ] {
+            assert!(
+                workflow.contains(verb),
+                "`{verb}` is served and must be named"
+            );
+        }
+
+        let all = instructions(VerbScope::All);
+        for verb in RUN_CONSOLE_VERBS {
+            assert!(
+                all.contains(verb),
+                "a host with a Run console advertises `{verb}`"
+            );
+        }
+    }
+
+    /// The daemon has no Run console. Advertising `run_*` from it would offer an agent
+    /// tools that always fail, which is worse than not offering them at all.
+    #[test]
+    fn a_workflow_only_host_withdraws_the_run_console_verbs() {
+        let workflow = names(VerbScope::WorkflowOnly);
+        for verb in RUN_CONSOLE_VERBS {
+            assert!(
+                !workflow.iter().any(|name| name == verb),
+                "`{verb}` needs a Run console and must not be offered"
+            );
+        }
+    }
+
+    /// The four that let a session reach the operator must survive the split — without
+    /// them a session cannot present a plan or ask to leave its phase.
+    #[test]
+    fn a_workflow_only_host_keeps_every_workflow_verb() {
+        let workflow = names(VerbScope::WorkflowOnly);
+        for verb in [
+            "present_plan",
+            "request_phase",
+            "phase_status",
+            "report_blocked",
+        ] {
+            assert!(
+                workflow.iter().any(|name| name == verb),
+                "`{verb}` is a pure engine operation and must be served everywhere"
+            );
+        }
+    }
+
+    /// An IDE owns a Run console, so it keeps the lot.
+    #[test]
+    fn an_ide_host_offers_every_verb() {
+        assert_eq!(names(VerbScope::All).len(), 10);
     }
 }

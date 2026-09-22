@@ -11,10 +11,21 @@
 //! core, exercised end-to-end against the real PDP in tests.
 
 pub mod adapters;
+pub mod control_api;
+/// The workflow verbs (`present_plan`, `request_phase`, `phase_status`,
+/// `report_blocked`). Shared rather than desktop-local so the daemon can serve them
+/// with no IDE attached — its dependencies are all domain and engine types, nothing
+/// about it needed a UI.
+pub mod phase_verbs;
+#[cfg(feature = "mcp-transport")]
 pub mod transport;
 
-pub use adapters::{BusPolicyView, StoreAuditSink};
-pub use transport::{serve_http, serve_stdio, McpHost, VerbToolServer};
+pub use adapters::{apply_gate_event, BusFleetView, BusPolicyView, StoreAuditSink};
+pub use control_api::{ControlApiState, HookStatusEntry, ReviewQueueItem};
+#[cfg(feature = "mcp-transport")]
+pub use transport::{
+    serve_http, serve_http_scoped, serve_stdio, McpHost, VerbScope, VerbToolServer,
+};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -390,6 +401,29 @@ fn summary_line(compact: &str) -> String {
 /// The concrete [`VerbExecutor`] for `run_with_coverage`: shells a configured test
 /// command in the session's repo and returns its combined stdout+stderr (the actor
 /// compacts it). Other verbs are not yet implemented (return `Unsupported`).
+/// Terminates an executor chain by refusing whatever reached it.
+///
+/// A host that serves only some verbs still needs something at the end of its chain.
+/// Refusing is the honest answer: the unserved verbs are withdrawn from the router, so
+/// nothing should arrive here, and if something does it is a wiring mistake worth
+/// surfacing rather than silently succeeding.
+pub struct UnsupportedVerbExecutor;
+
+#[async_trait]
+impl VerbExecutor for UnsupportedVerbExecutor {
+    async fn execute(
+        &self,
+        _session: &moonlight_domain::ids::SessionId,
+        _root: Option<&Path>,
+        verb: McpVerb,
+        _payload: &str,
+    ) -> Result<String, ControlError> {
+        Err(ControlError::Unsupported(format!(
+            "{verb:?} is not served by this host"
+        )))
+    }
+}
+
 pub struct ShellVerbExecutor {
     /// The test command, e.g. `["cargo", "test"]` or `["npm", "test"]`.
     test_command: Vec<String>,

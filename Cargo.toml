@@ -14,8 +14,26 @@ members = [
     "crates/rtk",
     "crates/mcp-server",
     "apps/desktop",
+    "apps/daemon",
 ]
 
+# Everything except the desktop app, which needs the Metal Toolchain to build its
+# GPUI renderer. Without this, a plain `cargo build`/`cargo test` fails on any machine
+# that hasn't installed it — even when the change is entirely headless. Build the
+# desktop explicitly with `-p moonlight-desktop`.
+default-members = [
+    "crates/domain",
+    "crates/core",
+    "crates/engine",
+    "crates/detection",
+    "crates/control",
+    "crates/trust",
+    "crates/persistence",
+    "crates/worktree",
+    "crates/rtk",
+    "crates/mcp-server",
+    "apps/daemon",
+]
 [workspace.package]
 edition = "2021"
 version = "0.0.1"

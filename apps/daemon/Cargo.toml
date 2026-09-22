@@ -1,0 +1,42 @@
+[package]
+name = "moonlight-daemon"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "moonlightd"
+path = "src/main.rs"
+
+# Headless composition root for the control API (review queue + gating status):
+# no GPUI, no desktop dependency at all, so it builds and runs anywhere the rest
+# of the workspace does — including a machine without the Metal Toolchain. Reuses
+# the exact same domain ports, engine `Command` type, and SQLite store the desktop
+# app wires, via `moonlight-core::support` for the shared on-disk paths, so the two
+# processes can never open divergent state.
+[dependencies]
+moonlight-domain.workspace = true
+moonlight-core.workspace = true
+moonlight-persistence.workspace = true
+moonlight-mcp-server.workspace = true
+# For the shared `hook_status_entries` gating-status check (see moonlight-control's
+# `hook_registration` module) — no cycle: control depends on domain only.
+moonlight-control.workspace = true
+# The session supervisor + event bus, so this daemon can discover sessions and
+# handle SetAdopted the exact same way the desktop app does — no second
+# implementation of "what counts as a session" to drift from the first.
+moonlight-engine.workspace = true
+# The JSONL (+ Antigravity) detection sources — same fusion the desktop app polls.
+moonlight-detection.workspace = true
+# The single PDP the hook ControlServer asks — same authority apps/desktop uses.
+moonlight-trust.workspace = true
+tokio = { workspace = true, features = ["net"] }
+tracing.workspace = true
+serde_json.workspace = true
+# The `mcp` subcommand implements the `McpActor` port (async) by forwarding each verb
+# to this machine's daemon over the control API (blocking, on a blocking thread).
+async-trait.workspace = true
+serde = { workspace = true, features = ["derive"] }
+ureq.workspace = true

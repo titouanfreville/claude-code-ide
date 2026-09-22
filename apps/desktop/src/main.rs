@@ -27,7 +27,6 @@ mod mcp_activity;
 mod obs;
 mod pair_diff;
 mod path_tree;
-mod phase_verbs;
 mod review_findings;
 mod review_skills;
 mod run;
@@ -49,8 +48,8 @@ use gpui_component::Root;
 
 use moonlight_control::{
     append_safe_tool, load_config, query_hook, user_config_path, AiWorkspaceResolver,
-    ApprovalNotifier, ControlServer, Decision, GateView, HookRequest, HookResponse,
-    KeystoneApprovalGate, ObserveOnlyControl, PendingApprovals, RuntimeSafeTools, SteerControl,
+    ApprovalNotifier, ControlServer, Decision, GateView, HookResponse, KeystoneApprovalGate,
+    ObserveOnlyControl, PendingApprovals, RuntimeSafeTools, SteerControl,
 };
 use moonlight_detection::{
     AntigravityDetectionSource, CompositeDetectionSource, JsonlDetectionSource,
@@ -67,7 +66,7 @@ use moonlight_domain::session::SessionStatus;
 use moonlight_domain::trust::{DangerClass, McpVerb, TrustTier};
 use moonlight_engine::{Command, EngineEvent, EventBus, SessionSupervisor};
 use moonlight_mcp_server::{
-    ActorService, BusPolicyView, McpHost, ShellVerbExecutor, StoreAuditSink,
+    ActorService, BusPolicyView, ControlApiState, McpHost, ShellVerbExecutor, StoreAuditSink,
 };
 use moonlight_persistence::Store;
 use moonlight_trust::DefaultPdp;
@@ -86,15 +85,6 @@ use views::workspace::{init_shell, ShellDeps, Workspace};
 
 /// How often the detection adapter is polled for new transcript activity.
 const DETECTION_INTERVAL: Duration = Duration::from_millis(750);
-
-/// How long the hook CLI waits for the control server before failing open. The
-/// server now holds operator approvals **indefinitely** (no auto-deny), so the client
-/// must not give up first — it would fail open (allow) before the operator decides.
-/// Set effectively-unbounded; the real ceiling is Claude Code's own per-hook timeout
-/// (set high at install, `hook_install::HOOK_TIMEOUT_SECS`), which kills the hook
-/// process anyway. Non-holding verdicts still return in milliseconds; a missing socket
-/// (app down) fails open immediately, so this ceiling only applies while connected.
-const HOOK_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 fn main() {
     // CLI subcommands (handled before any GUI/tracing init):
@@ -153,11 +143,24 @@ fn main() {
             // into the target session's embedded terminal — the engine can't reach the
             // PTY, so delivery stays behind the port but is actuated by the UI.
             let (steer_tx, steer_rx) = mpsc::unbounded_channel::<Feedback>();
+            // Same sender, kept so the control API can report whether a reject's
+            // feedback can land instead of claiming success for a dropped message.
+            let steer_probe = steer_tx.clone();
+            // Opt-in auto-adoption (allowlist, empty by default) — the same
+            // `~/.moonlight/config.json` key the daemon reads, so the two can't
+            // disagree about which trees are governed automatically.
+            let auto_adopt = std::env::var_os("HOME")
+                .map(moonlight_control::auto_adopt_roots)
+                .unwrap_or_default();
+            if !auto_adopt.is_empty() {
+                tracing::info!(roots = ?auto_adopt, "auto-adopt is configured for these roots");
+            }
             let supervisor = SessionSupervisor::with_store(
                 Arc::new(SteerControl::new(steer_tx)),
                 bus.clone(),
                 Some(managed.clone()),
-            );
+            )
+            .with_auto_adopt_roots(auto_adopt);
 
             // Control gate: a shared per-session read-model the hook `ControlServer`
             // reads. It is kept in sync from the bus below; the server itself runs on
@@ -190,7 +193,7 @@ fn main() {
                 let gate_view = gate_view.clone();
                 cx.spawn(async move |_cx| loop {
                     match rx.recv().await {
-                        Ok(event) => apply_gate_event(&gate_view, &event),
+                        Ok(event) => moonlight_mcp_server::apply_gate_event(&gate_view, &event),
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
@@ -230,6 +233,26 @@ fn main() {
             if let Ok(records) = store.all_managed() {
                 mcp_policy.seed_from_managed(&records);
             }
+
+            // Fleet read-model for the control API's `/control/discoverable-sessions` —
+            // the only place an *unadopted*, merely-detected session is visible (it has
+            // no store row until adopted). No separate store seed needed: the engine
+            // loop's `hydrate_from_store()` republishes every persisted session as a
+            // `SessionUpserted` on this same bus at boot, which this fold catches as
+            // long as the subscription (started here) precedes it — it does.
+            let control_fleet = Arc::new(moonlight_mcp_server::BusFleetView::new());
+            {
+                let mut rx = bus.subscribe();
+                let fleet = control_fleet.clone();
+                cx.spawn(async move |_cx| loop {
+                    match rx.recv().await {
+                        Ok(event) => fleet.apply(&event),
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                })
+                .detach();
+            }
             // The run registry backs both the Run console (UI) and the MCP run verbs —
             // one shared state, so operator- and agent-started runs land in one console.
             // The executor stack: run verbs hit the registry; everything else falls
@@ -239,6 +262,18 @@ fn main() {
             // controls use (the engine loop drains it below). `commands` is moved into the
             // shell at window open; the executor keeps a clone.
             let (commands, command_rx) = mpsc::unbounded_channel::<Command>();
+
+            // App-wide control API (the review queue + gating status over HTTP, for
+            // external clients like an editor extension — distinct from the per-session
+            // embedded MCP endpoint above). Discovery file, not a fixed port: the
+            // listener binds ephemerally and writes its port to `~/.moonlight/control.json`.
+            spawn_control_api(
+                commands.clone(),
+                managed.clone(),
+                changes.clone(),
+                steer_probe.clone(),
+                control_fleet.clone(),
+            );
 
             let run_registry = run::RunRegistry::new();
             // Shared HTTP call history — the `http_request` executor records into it; the
@@ -256,7 +291,7 @@ fn main() {
                 ActorService::new(
                     Arc::new(DefaultPdp),
                     mcp_policy.clone(),
-                    Arc::new(phase_verbs::PhaseVerbExecutor::new(
+                    Arc::new(moonlight_mcp_server::phase_verbs::PhaseVerbExecutor::new(
                         commands.clone(),
                         mcp_policy.clone(),
                         Arc::new(http_verbs::HttpVerbExecutor::new(
@@ -557,8 +592,23 @@ pub(crate) fn store_path() -> Option<PathBuf> {
 /// Path of the control IPC socket the hook CLI and server rendez-vous on.
 /// `pub(crate)`: the Services tool window probes it for its status lamp.
 pub(crate) fn control_socket_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".moonlight").join("control.sock")
+    moonlight_dir().join("control.sock")
+}
+
+/// Discovery file for the control API's ephemeral port (see [`spawn_control_api`]).
+/// An external client (an editor extension) reads this to find the API — there is
+/// no fixed port, so nothing else could know it. Same file (and same resolver) the
+/// headless `moonlightd` daemon writes, so a client never has to know which of the
+/// two is actually running.
+fn control_api_discovery_path() -> PathBuf {
+    moonlight_dir().join("control.json")
+}
+
+/// `~/.moonlight`, via the resolver every MoonlightCode process shares (see
+/// `moonlight_core::support::moonlight_dir`) — falls back to a relative path only
+/// when `$HOME` is unset, matching this function's previous behavior.
+fn moonlight_dir() -> PathBuf {
+    moonlight_core::support::moonlight_dir().unwrap_or_else(|| PathBuf::from(".moonlight"))
 }
 
 /// On-disk crash log, next to the dock layout in the platform state directory.
@@ -700,123 +750,128 @@ fn spawn_control_server(
         };
         rt.block_on(async move {
             let path = control_socket_path();
+            let listener = match moonlight_control::bind_singleton_unix_socket(&path).await {
+                Some(l) => l,
+                None => return,
+            };
+            let store_clone = store.clone();
+            let resolver = Arc::new(move |conversation_id: &str| {
+                if let Ok(all) = store_clone.all_managed() {
+                    all.into_iter()
+                        .find(|m| m.conversation_id.as_deref() == Some(conversation_id))
+                        .map(|m| m.id)
+                } else {
+                    None
+                }
+            });
+            Arc::new(
+                ControlServer::with_approvals(
+                    gate_view,
+                    Arc::new(DefaultPdp),
+                    pending,
+                    notifier,
+                    // `None` = hold plan/danger approvals until the operator
+                    // decides (no auto-deny). CC's own per-hook timeout (set high
+                    // at install) is the only ceiling.
+                    None,
+                )
+                .with_ai_resolver(ai_workspace_resolver())
+                .with_runtime_safe(runtime_safe)
+                .with_id_resolver(resolver)
+                // Every allowed file write is recorded here, with the file's
+                // pre-image, so the review surface can show what THIS session
+                // changed instead of whatever is dirty in the tree.
+                .with_change_ledger(changes)
+                // …and git makes the writes that never named a file — a
+                // `sed -i`, a redirect, a formatter — attributable too.
+                .with_workspace_probe(Arc::new(crate::git_probe::GitProbe)),
+            )
+            .serve(listener)
+            .await;
+        });
+    });
+}
+
+/// Run the app-wide control API (`crates/mcp-server::control_api`) on a dedicated
+/// tokio runtime thread, same rationale as [`spawn_control_server`]: it needs
+/// tokio's reactor, which GPUI's executor does not provide. Binds an ephemeral
+/// loopback port and writes it to [`control_api_discovery_path`] so an external
+/// client (an editor extension) can find it — overwritten on every start, so a
+/// stale entry from a prior run is never left behind for long.
+fn spawn_control_api(
+    commands: mpsc::UnboundedSender<Command>,
+    sessions: Arc<dyn ManagedSessionStore>,
+    changes: Arc<dyn SessionChangeStore>,
+    // A clone of the steering sender, used only to answer "can a reject's feedback
+    // actually reach the session?" — it is closed once `run_steer_drain`'s receiver
+    // is gone, i.e. once nothing can write into a terminal any more.
+    steer_closed: mpsc::UnboundedSender<Feedback>,
+    fleet: Arc<moonlight_mcp_server::BusFleetView>,
+) {
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            tracing::error!("control API: failed to build tokio runtime");
+            return;
+        };
+        rt.block_on(async move {
+            let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(error = %e, "control API bind failed");
+                    return;
+                }
+            };
+            let port = match listener.local_addr() {
+                Ok(addr) => addr.port(),
+                Err(e) => {
+                    tracing::error!(error = %e, "control API: no local address");
+                    return;
+                }
+            };
+            let path = control_api_discovery_path();
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            // Refuse to hijack a live server: if another instance already answers on
-            // the socket, don't delete + rebind it (which would silently steal all
-            // hook traffic). Only a stale/absent socket is replaced.
-            if tokio::net::UnixStream::connect(&path).await.is_ok() {
-                tracing::warn!(socket = %path.display(),
-                    "control socket already served by another instance — not starting a second server");
-                return;
+            if let Err(e) = std::fs::write(&path, serde_json::json!({ "port": port }).to_string()) {
+                tracing::warn!(error = %e, "control API: failed to write discovery file");
             }
-            let _ = std::fs::remove_file(&path); // clear a stale socket
-            match tokio::net::UnixListener::bind(&path) {
-                Ok(listener) => {
-                    // The gating socket grants deny power — restrict it to the owner.
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                    tracing::info!(socket = %path.display(), "control server listening");
-                    let store_clone = store.clone();
-                    let resolver = Arc::new(move |conversation_id: &str| {
-                        if let Ok(all) = store_clone.all_managed() {
-                            all.into_iter()
-                                .find(|m| m.conversation_id.as_deref() == Some(conversation_id))
-                                .map(|m| m.id)
-                        } else {
-                            None
+            tracing::info!(port, "control API listening");
+            let state = ControlApiState::new(
+                commands,
+                sessions,
+                changes,
+                moonlight_control::hook_status_entries,
+                // The cockpit holds the steer receiver for as long as it can write
+                // into a session's embedded terminal; if it has gone, say so rather
+                // than reporting a delivery that silently didn't happen.
+                move || {
+                    if steer_closed.is_closed() {
+                        moonlight_mcp_server::control_api::FeedbackDelivery::Undeliverable {
+                            reason: "the cockpit is no longer accepting steering — \
+                                     its terminal sink has gone away"
+                                .into(),
                         }
-                    });
-                    Arc::new(
-                        ControlServer::with_approvals(
-                            gate_view,
-                            Arc::new(DefaultPdp),
-                            pending,
-                            notifier,
-                            // `None` = hold plan/danger approvals until the operator
-                            // decides (no auto-deny). CC's own per-hook timeout (set high
-                            // at install) is the only ceiling.
-                            None,
-                        )
-                        .with_ai_resolver(ai_workspace_resolver())
-                        .with_runtime_safe(runtime_safe)
-                        .with_id_resolver(resolver)
-                        // Every allowed file write is recorded here, with the file's
-                        // pre-image, so the review surface can show what THIS session
-                        // changed instead of whatever is dirty in the tree.
-                        .with_change_ledger(changes)
-                        // …and git makes the writes that never named a file — a
-                        // `sed -i`, a redirect, a formatter — attributable too.
-                        .with_workspace_probe(Arc::new(crate::git_probe::GitProbe)),
-                    )
-                    .serve(listener)
-                    .await;
-                }
-                Err(e) => tracing::error!(error = %e, "control socket bind failed"),
+                    } else {
+                        moonlight_mcp_server::control_api::FeedbackDelivery::Queued
+                    }
+                },
+                fleet,
+            );
+            if let Err(e) = moonlight_mcp_server::control_api::serve(state, listener).await {
+                tracing::error!(error = %e, "control API stopped");
             }
         });
     });
 }
 
-/// Fold an engine fact into the control gate read-model. `adopted`/`phase`/`trust`
-/// come from the operator-authoritative `Session` row (set via the in-app adopt
-/// toggle → `SessionUpserted`); `paused` is left untouched so operator state is not
-/// clobbered by a folded fact.
-fn apply_gate_event(gate_view: &GateView, event: &EngineEvent) {
-    let mut map = gate_view.write().unwrap_or_else(|p| p.into_inner());
-    match event {
-        EngineEvent::SessionUpserted { session } => {
-            let entry = map.entry(session.id.clone()).or_default();
-            entry.phase = session.phase;
-            entry.trust = session.trust_tier;
-            entry.adopted = session.adopted;
-            entry.paused = session.paused;
-        }
-        EngineEvent::PhaseTransitioned { session, phase } => {
-            if let Some(entry) = map.get_mut(session) {
-                entry.phase = *phase;
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Serve one Claude Code hook call: read the payload from stdin, ask the running
-/// app's control server, and emit the CC-shaped verdict. Fail-open on any error
-/// (no output = allow) so Claude Code is never blocked by MoonlightCode.
+/// Serve one Claude Code hook call -- the shared client in
+/// `moonlight_control::run_hook_client` (identical behavior for every binary that
+/// can answer hooks; see its doc comment).
 fn run_hook() {
-    use std::io::Read;
-
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
-        return;
-    }
-    let Ok(request) = serde_json::from_str::<HookRequest>(&input) else {
-        return;
-    };
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return;
-    };
-    let response = rt.block_on(query_hook(&control_socket_path(), &request, HOOK_TIMEOUT));
-
-    // Only `PreToolUse` carries a permission decision — the server never denies a
-    // `PostToolUse` (it is observe-only), and emitting a decision block for one
-    // would be malformed output.
-    if let (HookResponse::Deny { reason }, "PreToolUse" | "") = (response, request.event.as_str()) {
-        // PreToolUse structured output: deny + reason. Allow â no output, exit 0.
-        let out = serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }
-        });
-        println!("{out}");
-    }
+    moonlight_control::run_hook_client(&control_socket_path());
 }
 
 /// Serve one **Antigravity** (`agy`) `PreToolUse` hook call. Same control-server query
@@ -843,7 +898,11 @@ fn run_hook_agy() {
         emit_agy_allow();
         return;
     };
-    let response = rt.block_on(query_hook(&control_socket_path(), &request, HOOK_TIMEOUT));
+    let response = rt.block_on(query_hook(
+        &control_socket_path(),
+        &request,
+        moonlight_control::HOOK_TIMEOUT,
+    ));
 
     match response {
         HookResponse::Deny { reason } => {
@@ -862,7 +921,10 @@ fn run_hook_agy() {
                 })
             );
         }
-        HookResponse::Allow => emit_agy_allow(),
+        // AGY registers us on `PreToolUse` only, so a `Context` response cannot
+        // arrive here; allow rather than emit a Claude-shaped context block AGY
+        // would not understand.
+        HookResponse::Allow | HookResponse::Context { .. } => emit_agy_allow(),
     }
 }
 

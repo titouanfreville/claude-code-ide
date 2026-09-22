@@ -162,6 +162,85 @@ impl Phase {
     }
 }
 
+/// Which MoonlightCode MCP verbs a session can actually reach.
+///
+/// Not cosmetic: [`turn_brief`] names the verb the agent should call, and naming one
+/// that is not wired hands it an instruction it can only fail. A VSCode agent-panel
+/// session gets no `--mcp-config`, so it has none of them — the brief has to say
+/// "the operator changes phase" instead of "call `request_phase`".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verbs {
+    /// The `moonlight` MCP server is wired into this session.
+    Available,
+    /// No MCP server — phase changes come from the operator's IDE, not from the agent.
+    Unavailable,
+}
+
+/// The per-turn briefing for a governed session: which phase it is in, what that
+/// phase allows, and how to get out of it.
+///
+/// Injected by the `UserPromptSubmit` hook, which is handed the session id and so can
+/// read the **live** phase. That is the whole point of it existing alongside the
+/// launch-time system prompt ([`PLAN_AIM`] and the IDE context built on it): a
+/// launch-time prompt is a snapshot, and a session that starts in Plan and moves to
+/// Auto keeps being told it is planning for the rest of its life. This is re-derived
+/// every turn, so it cannot go stale.
+///
+/// Deliberately terse — it rides every single prompt, so it spends context budget on
+/// every turn of every governed session. It states the phase, the two write rules the
+/// PDP actually enforces, and the one way out. Anything else belongs in the denial
+/// reason, which is only paid for when something is actually blocked.
+pub fn turn_brief(phase: Phase, verbs: Verbs) -> String {
+    let mut brief = format!(
+        "[MoonlightCode] Workflow phase: {}. Project files: {}. Notes under .ai/ (and \
+         other AI-workspace dirs): {}.",
+        phase.label(),
+        if phase.allows_writes() {
+            "writable"
+        } else {
+            "READ-ONLY — edits are denied by the IDE policy, not by you"
+        },
+        if phase.allows_ai_workspace_writes() {
+            "writable"
+        } else {
+            "read-only (the commit gate freezes the whole tree)"
+        },
+    );
+
+    // Plan is the one phase whose *aim* differs, not just its permissions. CC runs
+    // `auto` in every phase, so nothing about being in Plan makes the agent plan —
+    // saying so is what does (the same reason [`PLAN_AIM`] exists).
+    if phase == Phase::Plan {
+        brief.push_str(match verbs {
+            Verbs::Available => {
+                " Your aim here is to produce a plan: investigate freely, \
+                 then call the moonlight MCP tool present_plan with it as Markdown for the \
+                 operator to approve."
+            }
+            Verbs::Unavailable => {
+                " Your aim here is to produce a plan: investigate freely, \
+                 then present it and stop — the operator approves it and moves you on."
+            }
+        });
+    }
+
+    brief.push_str(match verbs {
+        Verbs::Available => {
+            " You cannot change phase yourself: call the moonlight MCP \
+             tool request_phase (the operator approves or denies), and never assume the \
+             phase changed until the result confirms it."
+        }
+        // Nothing to call, so do not invent a verb. Asking in prose is the honest
+        // remaining move, and the operator has the phase control in their IDE.
+        Verbs::Unavailable => {
+            " You cannot change phase yourself and have no tool to ask \
+             with — say what you need in your reply; the operator changes it from the IDE."
+        }
+    });
+
+    brief
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +357,74 @@ mod tests {
         assert!(!PLAN_AIM.contains('\n'), "{PLAN_AIM}");
         // It must name the verb that actually opens the plan panel.
         assert!(PLAN_AIM.contains("present_plan"), "{PLAN_AIM}");
+    }
+}
+
+#[cfg(test)]
+mod turn_brief_tests {
+    use super::*;
+
+    #[test]
+    fn frozen_phases_say_project_files_are_read_only() {
+        for phase in [Phase::Plan, Phase::Commit] {
+            let brief = turn_brief(phase, Verbs::Available);
+            assert!(brief.contains("READ-ONLY"), "{phase:?}: {brief}");
+        }
+        for phase in [Phase::AutoImplement, Phase::Test, Phase::Review] {
+            let brief = turn_brief(phase, Verbs::Available);
+            assert!(
+                brief.contains("Project files: writable"),
+                "{phase:?}: {brief}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_is_the_only_phase_that_freezes_ai_workspace_notes() {
+        // Mirrors `allows_ai_workspace_writes` — the brief must not tell a Plan-phase
+        // agent it cannot keep notes, since the PDP lets it.
+        assert!(turn_brief(Phase::Plan, Verbs::Available)
+            .contains(".ai/ (and other AI-workspace dirs): writable"));
+        assert!(turn_brief(Phase::Commit, Verbs::Available)
+            .contains("the commit gate freezes the whole tree"));
+    }
+
+    #[test]
+    fn only_plan_states_an_aim() {
+        assert!(turn_brief(Phase::Plan, Verbs::Available).contains("aim here is to produce a plan"));
+        for phase in [
+            Phase::AutoImplement,
+            Phase::Test,
+            Phase::Review,
+            Phase::Commit,
+        ] {
+            assert!(
+                !turn_brief(phase, Verbs::Available).contains("aim here"),
+                "{phase:?}"
+            );
+        }
+    }
+
+    /// The reason `Verbs` exists: naming a tool a session cannot reach hands it an
+    /// instruction it can only fail. No brief may mention an MCP verb without them.
+    #[test]
+    fn no_mcp_verb_is_named_when_none_are_wired() {
+        for phase in Phase::ALL {
+            let brief = turn_brief(phase, Verbs::Unavailable);
+            for verb in ["present_plan", "request_phase", "phase_status", "MCP"] {
+                assert!(!brief.contains(verb), "{phase:?} names {verb}: {brief}");
+            }
+        }
+    }
+
+    /// It rides every prompt of every governed session, so its cost is paid per turn.
+    #[test]
+    fn stays_small_enough_to_pay_for_every_turn() {
+        for phase in Phase::ALL {
+            for verbs in [Verbs::Available, Verbs::Unavailable] {
+                let len = turn_brief(phase, verbs).len();
+                assert!(len < 600, "{phase:?}/{verbs:?} is {len} bytes");
+            }
+        }
     }
 }

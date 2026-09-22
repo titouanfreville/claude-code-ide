@@ -114,6 +114,19 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE review_comment ADD COLUMN scope TEXT NOT NULL DEFAULT '\"Line\"';
      ALTER TABLE review_comment ADD COLUMN anchor_text TEXT;
      ALTER TABLE review_comment ADD COLUMN resolved_at INTEGER;",
+    // 14 — who wrote a comment, and which comment it answers.
+    //
+    // A review is a conversation, and until now the record could hold only one side
+    // of it: there was no way for the session under review to answer a note, and no
+    // way to tell an answer from a fresh objection if it had. `author` names the
+    // voice — existing rows are all the operator's, which is what the default
+    // backfills. `parent_id` makes two comments a thread; NULL is a thread root, so
+    // every existing comment stays exactly what it was. No foreign key: a root is
+    // deleted with its session's whole ledger, and a dangling reply is dropped when
+    // threads are assembled rather than cascading a delete through a conversation.
+    "ALTER TABLE review_comment ADD COLUMN author TEXT NOT NULL DEFAULT '\"Operator\"';
+     ALTER TABLE review_comment ADD COLUMN parent_id TEXT;
+     CREATE INDEX idx_comment_parent ON review_comment (parent_id);",
 ];
 
 /// Apply every migration the database hasn't seen yet, in order. Idempotent: a
@@ -141,4 +154,56 @@ pub fn apply(conn: &Connection) -> Result<(), StoreError> {
 
 fn backend(e: rusqlite::Error) -> StoreError {
     StoreError::Backend(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every existing comment predates the idea of an author, so the upgrade has to
+    /// give it one — a row that came back with a NULL author would fail to decode and
+    /// take the operator's whole review history with it.
+    #[test]
+    fn upgrading_an_existing_database_backfills_comment_authorship() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Bring the database to the schema as it stood before threads existed, with a
+        // comment already written in it.
+        let before = MIGRATIONS.len() - 1;
+        for ddl in &MIGRATIONS[..before] {
+            conn.execute_batch(ddl).unwrap();
+        }
+        conn.pragma_update(None, "user_version", before as i64)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO review_comment (id, session_id, path, side, start_line, end_line,
+                                         body, at)
+             VALUES ('c1', 's1', '/repo/a.rs', '\"After\"', 4, 4, 'no backoff', 1)",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).unwrap();
+
+        let (author, parent): (String, Option<String>) = conn
+            .query_row("SELECT author, parent_id FROM review_comment", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        // The operator wrote every comment that existed before the agent could reply.
+        assert_eq!(author, "\"Operator\"");
+        // And each one stands alone: a thread root, not an answer to something.
+        assert_eq!(parent, None);
+    }
+
+    /// Applying twice must not fail — the app opens the same database on every launch.
+    #[test]
+    fn apply_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).unwrap();
+        apply(&conn).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
 }

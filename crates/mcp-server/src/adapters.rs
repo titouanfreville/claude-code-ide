@@ -13,8 +13,9 @@ use moonlight_domain::audit::{AuditAction, AuditEntry};
 use moonlight_domain::ids::{SessionId, Timestamp};
 use moonlight_domain::ports::mcp::{AuditSink, SessionPolicySnapshot, SessionPolicyView};
 use moonlight_domain::ports::store::{ManagedSession, ManagedSessionStore};
+use moonlight_domain::session::Session;
 use moonlight_domain::trust::TrustTier;
-use moonlight_engine::EngineEvent;
+use moonlight_engine::{Command, EngineEvent, EventBus as EngineBus};
 
 /// A live [`SessionPolicyView`] kept in sync by folding the engine bus. Trust tier
 /// isn't persisted, so the policy snapshot is read from the *live* fleet facts
@@ -86,6 +87,97 @@ impl SessionPolicyView for BusPolicyView {
             .unwrap_or_else(|p| p.into_inner())
             .get(session)
             .cloned()
+    }
+}
+
+/// A live fleet read-model kept in sync by folding the engine bus — every session
+/// detection has found, adopted or not (an unadopted, merely-*discovered* session
+/// lives only in the supervisor's in-memory fleet, never the durable store, so this
+/// is the only way an external client learns about it). Backs the control API's
+/// `/control/discoverable-sessions` endpoint, which is how an operator picks a
+/// session to adopt from outside the desktop app. Same fold pattern as
+/// [`BusPolicyView`], just carrying the whole [`Session`] row instead of a policy
+/// snapshot.
+#[derive(Default)]
+pub struct BusFleetView {
+    sessions: RwLock<HashMap<SessionId, Session>>,
+}
+
+impl BusFleetView {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one engine fact into the fleet map.
+    pub fn apply(&self, event: &EngineEvent) {
+        let mut map = self.sessions.write().unwrap_or_else(|p| p.into_inner());
+        match event {
+            EngineEvent::SessionUpserted { session } => {
+                map.insert(session.id.clone(), session.clone());
+                tracing::debug!(session = %session.id, size = map.len(), "fleet view upsert");
+            }
+            EngineEvent::SessionRemoved { session } => {
+                map.remove(session);
+                tracing::debug!(session = %session, size = map.len(), "fleet view REMOVE");
+            }
+            _ => {}
+        }
+    }
+
+    /// Every session currently known, in no particular order.
+    /// Whether detection has seen this session at all. The engine drops commands
+    /// for sessions that aren't in the fleet, so callers use this to answer honestly
+    /// instead of accepting a request that will be silently discarded.
+    pub fn knows(&self, id: &SessionId) -> bool {
+        self.sessions
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(id)
+    }
+
+    pub fn all(&self) -> Vec<Session> {
+        self.sessions
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+}
+
+/// Fold an engine fact into the hook `ControlServer`'s gate read-model.
+///
+/// `adopted`/`phase`/`trust`/`paused` all come from the operator-authoritative
+/// `Session` row (the adopt and pause toggles both land there and republish it as
+/// `SessionUpserted`). The doc here used to say `paused` was left untouched "so
+/// operator state is not clobbered by a folded fact" while the code assigned it; the
+/// code was right and the comment was wrong, which is the more dangerous way round —
+/// a reader trusting it would have concluded the kill switch had a second transport.
+/// It does not. Shared by every process that might host the gate (desktop app,
+/// headless daemon) — the gate must classify a session identically no matter which one
+/// is answering hooks.
+pub fn apply_gate_event(gate_view: &moonlight_control::GateView, event: &EngineEvent) {
+    let mut map = gate_view.write().unwrap_or_else(|p| p.into_inner());
+    match event {
+        EngineEvent::SessionUpserted { session } => {
+            let entry = map.entry(session.id.clone()).or_default();
+            entry.phase = session.phase;
+            entry.trust = session.trust_tier;
+            entry.adopted = session.adopted;
+            // Assigned, and it has to be: `TogglePause` flips the flag on the `Session`
+            // and the supervisor republishes it as `SessionUpserted`, so this fold is
+            // the *only* path by which a pause reaches the gate. Skipping it — which an
+            // earlier version of the doc above claimed happened — would leave
+            // `GateState::paused` permanently false and the operator's kill switch
+            // inert. The store row is authoritative precisely because that is where a
+            // pause is recorded.
+        }
+        EngineEvent::PhaseTransitioned { session, phase } => {
+            if let Some(entry) = map.get_mut(session) {
+                entry.phase = *phase;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -280,5 +372,46 @@ mod tests {
             |e| matches!(&e.action, AuditAction::VerbExecuted { summary, .. }
                 if summary.contains("5 passed"))
         ));
+    }
+}
+
+/// Turn an operator verdict into a resolved hook where one is held.
+///
+/// A held `PreToolUse` waits on a oneshot in [`PendingApprovals`], not on the
+/// supervisor. A verdict sent straight to the supervisor therefore leaves the hook
+/// hanging until Claude Code's own timeout, which the operator experiences as their
+/// click doing nothing. Every command from a client must pass through here first.
+///
+/// Returns `Some(command)` when nothing was held, so the caller forwards it unchanged
+/// and the supervisor's own approve/deny path (feedback, resume) runs.
+pub fn route_approval(
+    pending: &moonlight_control::PendingApprovals,
+    bus: &EngineBus,
+    command: Command,
+) -> Option<Command> {
+    use moonlight_control::Decision;
+    use moonlight_domain::session::SessionStatus;
+
+    let (session, decision) = match &command {
+        Command::ApproveAction { session } => (session.clone(), Decision::Approve),
+        Command::DenyAction { session, reason } => (
+            session.clone(),
+            Decision::Deny {
+                reason: reason.clone(),
+            },
+        ),
+        _ => return Some(command),
+    };
+
+    if pending.resolve(&session, decision) {
+        // Publishing this is what clears a cockpit's pending state; without it the UI
+        // keeps offering a decision that has already been made.
+        bus.publish(EngineEvent::SessionStateChanged {
+            session,
+            status: SessionStatus::Running,
+        });
+        None
+    } else {
+        Some(command)
     }
 }

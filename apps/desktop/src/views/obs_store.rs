@@ -33,7 +33,7 @@ impl ObsStore {
         true
     }
 
-    /// Replace the account quota (from [`crate::obs::load_quota`]). Returns whether it
+    /// Replace the account quota (from [`crate::obs::quota`]). Returns whether it
     /// changed.
     pub fn set_quota(&mut self, quota: Option<Quota>) -> bool {
         if quota == self.quota {

@@ -42,7 +42,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use super::CloseTab;
 
 use moonlight_domain::changes::{
-    Baseline, BaselineGap, CommentScope, DiffSide, ReviewComment, TouchedPath,
+    Baseline, BaselineGap, CommentAuthor, CommentScope, DiffSide, ReviewComment, TouchedPath,
 };
 use moonlight_domain::ids::{SessionId, Timestamp};
 use moonlight_domain::ports::store::SessionChangeStore;
@@ -2819,6 +2819,11 @@ impl CodeReviewPanel {
             end_line: end,
             body,
             anchor_text,
+            // This panel is the operator's, and it writes thread roots: replying to a
+            // comment is an editor-surface gesture today (see the VSCode review
+            // extension), so nothing here starts mid-conversation.
+            author: CommentAuthor::Operator,
+            parent_id: None,
             at,
             sent_at: None,
             resolved_at: None,
@@ -3353,18 +3358,14 @@ fn review_message(comments: &[ReviewComment], findings: &[&FindingState]) -> Str
         }
     }
 
-    // Widest scope first: what is true of the whole change frames how to read the
-    // notes on individual lines, and a session that reads "land the migration first"
-    // after four line comments has already planned the wrong order.
-    let by_scope = |want: CommentScope| comments.iter().filter(move |c| c.scope == want);
-    for comment in by_scope(CommentScope::Review)
-        .chain(by_scope(CommentScope::File))
-        .chain(by_scope(CommentScope::Line))
-    {
-        out.push_str(&format!("\n{}\n", comment.anchor()));
-        for line in comment.body.lines() {
-            out.push_str(&format!("  {line}\n"));
-        }
+    // The comment half is rendered by `moonlight_domain::changes::review_message`, so
+    // this panel and the editor plugin (which reaches the same tracker over the
+    // control API) deliver identical text. Its own header line is dropped here — the
+    // findings count above already framed the message.
+    if !comments.is_empty() {
+        let shared = moonlight_domain::changes::review_message(comments);
+        let body = shared.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+        out.push_str(body);
     }
     out
 }
@@ -3509,10 +3510,11 @@ fn is_back_to_baseline(changes: &dyn SessionChangeStore, session: &SessionId, pa
 /// drifted apart would mean a button that counts two comments, sends three, and
 /// warns about none.
 fn pending_comments(comments: &[ReviewComment]) -> Vec<&ReviewComment> {
-    comments
-        .iter()
-        .filter(|c| c.sent_at.is_none() && !c.is_resolved())
-        .collect()
+    // The shared rule, not a second copy of it: a session can now answer a comment
+    // from the editor surface, and those replies land in this same store. Filtering
+    // on "unsent and unresolved" alone would put the agent's own words back in the
+    // batch delivered *to* it — the session answering itself, forever.
+    moonlight_domain::changes::pending_feedback(comments)
 }
 
 /// A duration as a reviewer reads it: `12s`, `4m 12s`, `1h 04m`. Seconds stop being
@@ -5040,6 +5042,8 @@ mod tests {
             end_line: end,
             body: body.into(),
             anchor_text: None,
+            author: CommentAuthor::Operator,
+            parent_id: None,
             at: Timestamp::from_millis(0),
             sent_at: None,
             resolved_at: None,

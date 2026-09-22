@@ -11,12 +11,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use moonlight_domain::agent::AgentKind;
 use moonlight_domain::audit::{AuditAction, AuditEntry};
 use moonlight_domain::ids::{SessionId, Timestamp};
 use moonlight_domain::phase::Phase;
 use moonlight_domain::ports::control::ControlPort;
 use moonlight_domain::ports::detection::DetectionEvent;
-use moonlight_domain::ports::store::{ManagedSessionStore, ManagedStateUpdate};
+use moonlight_domain::ports::store::{ManagedSession, ManagedSessionStore, ManagedStateUpdate};
 use moonlight_domain::review::{Feedback, FeedbackOrigin};
 use moonlight_domain::session::{AttentionKind, Mode, Session, SessionStatus};
 use moonlight_domain::trust::TrustTier;
@@ -35,6 +36,9 @@ pub struct SessionSupervisor {
     /// persisted) and autonomous actions are appended to the audit log.
     store: Option<Arc<dyn ManagedSessionStore>>,
     /// Monotonic counter feeding time-ordered audit-entry ids.
+    /// Directory trees whose sessions are adopted automatically (empty = none).
+    /// See [`SessionSupervisor::with_auto_adopt_roots`].
+    auto_adopt_roots: Vec<String>,
     audit_seq: u64,
 }
 
@@ -57,8 +61,23 @@ impl SessionSupervisor {
             bus,
             control,
             store,
+            auto_adopt_roots: Vec::new(),
             audit_seq: 0,
         }
+    }
+
+    /// Opt whole directory trees into **automatic** adoption: a detected session
+    /// whose working directory sits under one of `roots` is adopted without the
+    /// operator clicking anything.
+    ///
+    /// This deliberately trades away the day-one safety property documented on
+    /// [`Session::adopted`] ("nothing is denied until the operator opts in"), so it
+    /// is an allowlist and empty by default — never "adopt everything detected".
+    /// A session whose root is not yet known matches nothing, and is re-evaluated
+    /// when detection observes its cwd.
+    pub fn with_auto_adopt_roots(mut self, roots: Vec<String>) -> Self {
+        self.auto_adopt_roots = roots;
+        self
     }
 
     /// Rehydrate the in-memory fleet from the durable store (FR42). Without this the
@@ -98,13 +117,37 @@ impl SessionSupervisor {
         tracing::info!(
             restored,
             fleet = self.fleet.len(),
+            subscribers = self.bus.receiver_count(),
             "fleet rehydrated from store"
         );
     }
 
-    /// Refresh the persisted state of a *managed* session (UPDATE-only — a no-op if
+    /// Republish every session in the fleet so a lagged read-model can catch up.
+    ///
+    /// Read-models are folded from a drop-oldest bus, so any of them can miss events
+    /// under a burst. Without this they stay wrong indefinitely for sessions that go
+    /// quiet afterwards — and a gate read-model that has never heard of a session
+    /// fails open on it.
+    fn republish_fleet(&mut self) {
+        let sessions: Vec<Session> = self.fleet.values().cloned().collect();
+        let count = sessions.len();
+        for session in sessions {
+            self.bus.publish(EngineEvent::SessionUpserted { session });
+        }
+        tracing::info!(count, "republished the fleet for a lagged read-model");
+    }
+
+    /// Refresh the persisted state of a *managed* session. UPDATE-only — a no-op if
     /// the session was never launched/taken-over by the app, keeping the managed
-    /// table free of merely-observed sessions). Logged, never fatal.
+    /// table free of merely-observed sessions. Logged, never fatal.
+    ///
+    /// **Adoption is the one exception.** Adopting a merely-*detected* session is
+    /// precisely what makes it managed, so there is no row to update yet and an
+    /// UPDATE would match zero rows — silently dropping the write, leaving the
+    /// in-memory fleet reporting `adopted: true` over a session the gate (which
+    /// reads the store) never governs, and losing the adoption on restart. So when
+    /// the update finds no row and the session is adopted, insert it instead. A
+    /// merely-observed session still never gains a row.
     fn persist(&self, s: &Session) {
         let Some(store) = &self.store else { return };
         let update = ManagedStateUpdate {
@@ -119,9 +162,60 @@ impl SessionSupervisor {
             hidden: s.hidden,
             last_seen: s.last_activity,
         };
-        if let Err(err) = store.update_managed_state(&update) {
-            tracing::warn!(session = %s.id, error = %err, "persist managed state failed");
+        match store.update_managed_state(&update) {
+            Ok(true) => {}
+            Ok(false) if s.adopted => {
+                // Detection observes the backend; the live read-model doesn't carry
+                // it, so a session adopted before that's known records as Claude Code
+                // (the same default the persistence migration backfills).
+                let record =
+                    ManagedSession::from_session(s, AgentKind::ClaudeCode, s.last_activity);
+                if let Err(err) = store.upsert_managed(&record) {
+                    tracing::warn!(session = %s.id, error = %err, "adopting into the store failed");
+                } else {
+                    tracing::info!(session = %s.id, "session inserted into the managed store on adoption");
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(session = %s.id, error = %err, "persist managed state failed");
+            }
         }
+    }
+
+    /// Adopt `session` automatically when its working directory falls under a
+    /// configured auto-adopt root. No-op when the feature is unconfigured, the
+    /// session is already adopted, or its root isn't known yet.
+    ///
+    /// Routed through [`Self::set_adopted`] rather than setting the flag inline, so
+    /// automatic adoption persists, audits, and republishes exactly like the manual
+    /// path — one adoption implementation, no second one to drift.
+    fn maybe_auto_adopt(&mut self, session: &SessionId) {
+        if self.auto_adopt_roots.is_empty() {
+            return;
+        }
+        let Some(s) = self.fleet.get(session) else {
+            return;
+        };
+        if s.adopted {
+            return;
+        }
+        let Some(root) = s.attached_path.clone() else {
+            return; // unknown location matches no allowlist entry (default-deny)
+        };
+        let Some(matched) = self
+            .auto_adopt_roots
+            .iter()
+            .find(|r| is_within(&root, r))
+            .cloned()
+        else {
+            return;
+        };
+        tracing::info!(
+            session = %session, root = %root, rule = %matched,
+            "auto-adopting session: its working directory is under a configured auto-adopt root"
+        );
+        self.set_adopted(session.clone(), true);
     }
 
     /// Append one audit entry for an autonomous action (no-op without a store).
@@ -215,6 +309,7 @@ impl SessionSupervisor {
             Command::AdvancePhase { session } => self.advance_phase(session).await,
             Command::SetPhasePinned { session, pinned } => self.set_phase_pinned(session, pinned),
             Command::RehydrateFleet => self.hydrate_from_store(),
+            Command::RepublishFleet => self.republish_fleet(),
             Command::ForgetSession { session } => self.forget_session(session),
             Command::FlagSession { session, alert } => self.flag_session(session, alert),
             // Handled by the composition-root command router (runtime overlay + config
@@ -609,6 +704,9 @@ impl SessionSupervisor {
                 } else {
                     tracing::warn!(session = %session, "WorkspaceObserved for unknown session");
                 }
+                // The cwd is only observed from the transcript, so this — not
+                // `Discovered` — is the first moment an auto-adopt rule can match.
+                self.maybe_auto_adopt(&session);
             }
             DetectionEvent::Discovered { session } => {
                 if !self.fleet.contains_key(&session) {
@@ -761,6 +859,13 @@ fn now() -> Timestamp {
 
 /// Default session record for a session first observed via detection (it may have
 /// been started outside MoonlightCode). Default-deny posture.
+/// Whether `path` is inside `root` — compared by path components, so `/a/b` does
+/// **not** match `/a/bc` the way a plain string prefix would.
+fn is_within(path: &str, root: &str) -> bool {
+    let (path, root) = (std::path::Path::new(path), std::path::Path::new(root));
+    !root.as_os_str().is_empty() && path.starts_with(root)
+}
+
 fn discovered_session(id: SessionId) -> Session {
     Session {
         id,
@@ -795,6 +900,10 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         updates: Mutex<Vec<ManagedStateUpdate>>,
+        /// Rows actually INSERTed. Distinct from `updates` because an UPDATE that
+        /// matches no row is not a write — the distinction this fake used to erase
+        /// by always reporting success.
+        upserts: Mutex<Vec<ManagedSession>>,
         audits: Mutex<Vec<AuditEntry>>,
         /// Optional managed record returned by `managed()` — lets a test simulate an
         /// app-created/imported session the supervisor should auto-adopt on discovery.
@@ -808,18 +917,30 @@ mod tests {
         fn updates(&self) -> Vec<ManagedStateUpdate> {
             self.updates.lock().unwrap().clone()
         }
+        fn upserts(&self) -> Vec<ManagedSession> {
+            self.upserts.lock().unwrap().clone()
+        }
+        /// Mirrors the real store's UPDATE ... WHERE id = ?: a row exists only if it
+        /// was seeded or inserted.
+        fn has_row(&self, id: &SessionId) -> bool {
+            self.managed_all.iter().any(|m| &m.id == id)
+                || self.upserts.lock().unwrap().iter().any(|m| &m.id == id)
+        }
         fn audits(&self) -> Vec<AuditEntry> {
             self.audits.lock().unwrap().clone()
         }
     }
 
     impl ManagedSessionStore for FakeStore {
-        fn upsert_managed(&self, _s: &ManagedSession) -> Result<(), StoreError> {
+        fn upsert_managed(&self, s: &ManagedSession) -> Result<(), StoreError> {
+            self.upserts.lock().unwrap().push(s.clone());
             Ok(())
         }
         fn update_managed_state(&self, u: &ManagedStateUpdate) -> Result<bool, StoreError> {
             self.updates.lock().unwrap().push(u.clone());
-            Ok(true)
+            // Report honestly whether a row was actually matched — the real store is
+            // UPDATE-only, so an unknown id writes nothing.
+            Ok(self.has_row(&u.id))
         }
         fn set_conversation_id(
             &self,
@@ -1658,6 +1779,219 @@ mod tests {
                 if session.attached_path.as_deref() == Some("/work/api")),
             "got {events:?}"
         );
+    }
+
+    /// Helper: a supervisor with an auto-adopt allowlist and a real store.
+    fn auto_adopt_fixture(roots: Vec<String>) -> (SessionSupervisor, Arc<FakeStore>) {
+        let control = Arc::new(FakeControl::default());
+        let bus = EventBus::new(64);
+        let store = Arc::new(FakeStore::default());
+        let sup = SessionSupervisor::with_store(control, bus, Some(store.clone() as Arc<_>))
+            .with_auto_adopt_roots(roots);
+        (sup, store)
+    }
+
+    /// Drive a session to the point where its cwd is known — the only moment an
+    /// auto-adopt rule can match, since the root comes from the transcript.
+    async fn discover_at(sup: &mut SessionSupervisor, id: &SessionId, root: &str) {
+        sup.on_detection(DetectionEvent::Discovered {
+            session: id.clone(),
+        })
+        .await;
+        sup.on_detection(DetectionEvent::WorkspaceObserved {
+            session: id.clone(),
+            path: root.to_string(),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn auto_adopts_a_session_under_a_configured_root() {
+        let (mut sup, store) = auto_adopt_fixture(vec!["/repo".into()]);
+        let id = SessionId::new("s1");
+
+        discover_at(&mut sup, &id, "/repo/api").await;
+
+        assert!(
+            sup.session(&id).unwrap().adopted,
+            "should have auto-adopted"
+        );
+        // And it must be durable, or the gate never sees it.
+        assert_eq!(store.upserts().len(), 1);
+        assert!(store.upserts()[0].adopted);
+    }
+
+    #[tokio::test]
+    async fn does_not_auto_adopt_outside_the_configured_roots() {
+        let (mut sup, store) = auto_adopt_fixture(vec!["/repo".into()]);
+        let id = SessionId::new("s1");
+
+        discover_at(&mut sup, &id, "/elsewhere/api").await;
+
+        assert!(!sup.session(&id).unwrap().adopted);
+        assert!(store.upserts().is_empty());
+    }
+
+    /// `/repo` must not match `/repository` — a plain string prefix would, and would
+    /// silently govern an unrelated tree.
+    #[tokio::test]
+    async fn auto_adopt_matches_path_components_not_string_prefixes() {
+        let (mut sup, _store) = auto_adopt_fixture(vec!["/repo".into()]);
+        let id = SessionId::new("s1");
+
+        discover_at(&mut sup, &id, "/repository/api").await;
+
+        assert!(
+            !sup.session(&id).unwrap().adopted,
+            "/repository must not match the /repo rule"
+        );
+    }
+
+    /// Default-deny: the feature is off unless configured, and a session whose cwd is
+    /// still unknown matches nothing.
+    #[tokio::test]
+    async fn auto_adopt_is_off_by_default_and_ignores_unknown_roots() {
+        let (mut sup, _store) = auto_adopt_fixture(Vec::new());
+        let id = SessionId::new("s1");
+        discover_at(&mut sup, &id, "/repo/api").await;
+        assert!(!sup.session(&id).unwrap().adopted, "off by default");
+
+        let (mut sup, _store) = auto_adopt_fixture(vec!["/repo".into()]);
+        let id2 = SessionId::new("s2");
+        // Discovered, but no cwd observed yet.
+        sup.on_detection(DetectionEvent::Discovered {
+            session: id2.clone(),
+        })
+        .await;
+        assert!(
+            !sup.session(&id2).unwrap().adopted,
+            "a session with no known root must not match any rule"
+        );
+    }
+
+    /// Regression: adopting a merely-*detected* session must reach the durable
+    /// store. `persist` is UPDATE-only, so before the fix this wrote nothing — the
+    /// in-memory fleet flipped to `adopted: true` and the control API happily
+    /// reported it, while the gate (which reads the store) saw no such session and
+    /// let every tool through. Observed end to end: `POST /control/adopt` → 204,
+    /// `adopted: true` over the wire, zero rows in `managed_session`.
+    #[tokio::test]
+    async fn adopting_a_detected_session_inserts_it_into_the_store() {
+        let control = Arc::new(FakeControl::default());
+        let bus = EventBus::new(64);
+        let store = Arc::new(FakeStore::default());
+        let mut sup = SessionSupervisor::with_store(control, bus, Some(store.clone() as Arc<_>));
+        let id = SessionId::new("detected-1");
+
+        // Detection finds it — observed only, so nothing is persisted yet.
+        sup.on_detection(DetectionEvent::Discovered {
+            session: id.clone(),
+        })
+        .await;
+        sup.on_detection(DetectionEvent::WorkspaceObserved {
+            session: id.clone(),
+            path: "/repo".into(),
+        })
+        .await;
+        sup.on_detection(DetectionEvent::TitleObserved {
+            session: id.clone(),
+            title: "a detected session".into(),
+        })
+        .await;
+        assert!(
+            store.upserts().is_empty(),
+            "merely observing a session must not make it managed"
+        );
+
+        sup.handle_command(Command::SetAdopted {
+            session: id.clone(),
+            adopted: true,
+        })
+        .await;
+
+        let upserts = store.upserts();
+        assert_eq!(
+            upserts.len(),
+            1,
+            "adoption must insert a row, got {upserts:?}"
+        );
+        assert_eq!(upserts[0].id, id);
+        assert!(upserts[0].adopted, "the inserted row must be adopted");
+        assert_eq!(upserts[0].root.as_deref(), Some("/repo"));
+        assert_eq!(upserts[0].title.as_deref(), Some("a detected session"));
+    }
+
+    /// The other half of the contract: the managed table stays managed-only. A
+    /// non-adoption update to an unknown session still writes nothing.
+    #[tokio::test]
+    async fn updating_an_unadopted_session_never_inserts_a_row() {
+        let control = Arc::new(FakeControl::default());
+        let bus = EventBus::new(64);
+        let store = Arc::new(FakeStore::default());
+        let mut sup = SessionSupervisor::with_store(control, bus, Some(store.clone() as Arc<_>));
+        let id = SessionId::new("observed-only");
+
+        sup.on_detection(DetectionEvent::Discovered {
+            session: id.clone(),
+        })
+        .await;
+        sup.handle_command(Command::SetPhase {
+            session: id.clone(),
+            phase: Phase::Review,
+        })
+        .await;
+
+        assert!(
+            store.upserts().is_empty(),
+            "an unadopted session must never gain a managed row, got {:?}",
+            store.upserts()
+        );
+    }
+
+    /// Regression: a read-model folded off the drop-oldest bus can miss events under
+    /// a burst, and nothing republishes a session that then goes idle. Observed live:
+    /// the boot burst dropped 54 events, so the gate's view never learned about three
+    /// adopted sessions — and a gate view missing a session **allows everything that
+    /// session does** while the UI reports gating as active.
+    ///
+    /// `RepublishFleet` is how a lagged view recovers. It must republish every
+    /// session, including ones already in memory — that is exactly what
+    /// `RehydrateFleet` refuses to do.
+    #[tokio::test]
+    async fn republish_fleet_reemits_every_session_so_a_lagged_view_can_recover() {
+        let control = Arc::new(FakeControl::default());
+        let bus = EventBus::new(64);
+        let store = Arc::new(FakeStore::default());
+        let mut sup = SessionSupervisor::with_store(control, bus.clone(), Some(store as Arc<_>));
+
+        for id in ["a", "b", "c"] {
+            sup.on_detection(DetectionEvent::Discovered {
+                session: SessionId::new(id),
+            })
+            .await;
+        }
+        // Subscribe *after* discovery: this receiver missed everything, standing in
+        // for a fold that lagged.
+        let mut rx = bus.subscribe();
+        assert!(drain(&mut rx).is_empty(), "a late subscriber starts blind");
+
+        sup.handle_command(Command::RepublishFleet).await;
+
+        let seen: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                EngineEvent::SessionUpserted { session } => Some(session.id.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            seen.len(),
+            3,
+            "every session must be re-emitted, got {seen:?}"
+        );
+        for id in ["a", "b", "c"] {
+            assert!(seen.contains(&id.to_string()), "missing {id} in {seen:?}");
+        }
     }
 
     #[tokio::test]

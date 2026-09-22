@@ -418,8 +418,8 @@ impl SessionChangeStore for Store {
         conn.execute(
             "INSERT INTO review_comment
                 (id, session_id, path, side, start_line, end_line, body, at, sent_at,
-                 scope, anchor_text, resolved_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 scope, anchor_text, resolved_at, author, parent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 c.id,
                 c.session_id.as_str(),
@@ -433,6 +433,8 @@ impl SessionChangeStore for Store {
                 enc(&c.scope)?,
                 c.anchor_text,
                 c.resolved_at.map(Timestamp::as_millis),
+                enc(&c.author)?,
+                c.parent_id,
             ],
         )
         .map_err(backend)?;
@@ -444,7 +446,7 @@ impl SessionChangeStore for Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, session_id, path, side, start_line, end_line, body, at, sent_at,
-                        scope, anchor_text, resolved_at
+                        scope, anchor_text, resolved_at, author, parent_id
                  FROM review_comment WHERE session_id = ?1
                  ORDER BY at ASC, id ASC",
             )
@@ -612,6 +614,8 @@ struct RawComment {
     scope: String,
     anchor_text: Option<String>,
     resolved_at: Option<i64>,
+    author: String,
+    parent_id: Option<String>,
 }
 
 fn raw_comment(row: &Row) -> rusqlite::Result<RawComment> {
@@ -628,6 +632,8 @@ fn raw_comment(row: &Row) -> rusqlite::Result<RawComment> {
         scope: row.get(9)?,
         anchor_text: row.get(10)?,
         resolved_at: row.get(11)?,
+        author: row.get(12)?,
+        parent_id: row.get(13)?,
     })
 }
 
@@ -642,6 +648,8 @@ fn comment_from_raw(r: RawComment) -> Result<ReviewComment, StoreError> {
         end_line: r.end_line.max(0) as u32,
         body: r.body,
         anchor_text: r.anchor_text,
+        author: dec(&r.author)?,
+        parent_id: r.parent_id,
         at: Timestamp::from_millis(r.at),
         sent_at: r.sent_at.map(Timestamp::from_millis),
         resolved_at: r.resolved_at.map(Timestamp::from_millis),
@@ -1186,10 +1194,41 @@ mod tests {
             end_line: 8,
             body: "no backoff".into(),
             anchor_text: Some("    retry(op)".into()),
+            author: CommentAuthor::Operator,
+            parent_id: None,
             at: Timestamp::from_millis(at),
             sent_at: None,
             resolved_at: None,
         }
+    }
+
+    use moonlight_domain::changes::CommentAuthor;
+
+    /// A thread survives the round trip with both voices and the link between them —
+    /// the record is the only place the conversation exists.
+    #[test]
+    fn a_thread_round_trips_with_its_author_and_parentage() {
+        let store = Store::open_in_memory().unwrap();
+        let session = SessionId::new("s1");
+        let root = comment("c1", "s1", 1);
+        let reply = ReviewComment {
+            id: "c2".into(),
+            author: CommentAuthor::Agent,
+            parent_id: Some("c1".into()),
+            body: "fixed in the drop impl".into(),
+            at: Timestamp::from_millis(2),
+            ..comment("c2", "s1", 2)
+        };
+        store.add_comment(&root).unwrap();
+        store.add_comment(&reply).unwrap();
+        let back = store.comments(&session).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].author, CommentAuthor::Operator);
+        assert_eq!(back[0].parent_id, None);
+        assert_eq!(back[1].author, CommentAuthor::Agent);
+        assert_eq!(back[1].parent_id.as_deref(), Some("c1"));
+        // Both belong to the same conversation, whichever end you ask.
+        assert_eq!(back[0].thread_id(), back[1].thread_id());
     }
 
     #[test]

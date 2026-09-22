@@ -1,0 +1,46 @@
+{
+  "name": "moonlight-status",
+  "displayName": "MoonlightCode Status",
+  "description": "Status-bar indicator for hook gating and the focused session's phase.",
+  "version": "0.1.1",
+  "private": false,
+  "publisher": "titouanfreville",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/titouanfreville/claude-code-ide"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "icon": "icon.png",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "dependencies": {
+    "moonlight-control-client": "*",
+    "moonlight-core": "*"
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "package": "vsce package --no-dependencies",
+    "publish:vsce": "vsce publish --no-dependencies",
+    "publish:ovsx": "ovsx publish --no-dependencies"
+  },
+  "extensionDependencies": [
+    "titouanfreville.moonlight-core"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "moonlight.status.refreshUsage",
+        "title": "MoonlightCode: Refresh Claude Usage"
+      }
+    ]
+  }
+}

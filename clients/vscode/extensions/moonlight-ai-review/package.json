@@ -1,0 +1,148 @@
+{
+  "name": "moonlight-ai-review",
+  "displayName": "MoonlightCode AI Review",
+  "description": "Review what an agent changed: a real diff against the session's own baseline, GitHub-style inline comments, and one batched review delivered back to the session.",
+  "version": "0.1.1",
+  "private": false,
+  "publisher": "titouanfreville",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/titouanfreville/claude-code-ide"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "icon": "icon.png",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "dependencies": {
+    "moonlight-control-client": "*",
+    "moonlight-core": "*"
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "package": "vsce package --no-dependencies",
+    "publish:vsce": "vsce publish --no-dependencies",
+    "publish:ovsx": "ovsx publish --no-dependencies",
+    "test": "node --test out"
+  },
+  "extensionDependencies": [
+    "titouanfreville.moonlight-core"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "moonlight.review.openSession",
+        "title": "MoonlightCode: Review Session Changes"
+      },
+      {
+        "command": "moonlight.review.openQueue",
+        "title": "MoonlightCode: Open Review Queue (file list)"
+      },
+      {
+        "command": "moonlight.review.submit",
+        "title": "MoonlightCode: Send Review to Session"
+      },
+      {
+        "command": "moonlight.review.addComment",
+        "title": "MoonlightCode: Add Review Comment"
+      },
+      {
+        "command": "moonlight.review.resolveComment",
+        "title": "Resolve"
+      },
+      {
+        "command": "moonlight.review.unresolveComment",
+        "title": "Unresolve"
+      },
+      {
+        "command": "moonlight.review.editComment",
+        "title": "Edit"
+      },
+      {
+        "command": "moonlight.review.deleteComment",
+        "title": "Delete"
+      },
+      {
+        "command": "moonlight.review.toggleResolved",
+        "title": "MoonlightCode: Show/Hide Resolved Review Threads"
+      },
+      {
+        "command": "moonlight.review.commentOnSelection",
+        "title": "MoonlightCode: Comment on Selected Lines"
+      },
+      {
+        "command": "moonlight.review.commentOnFile",
+        "title": "MoonlightCode: Comment on Whole File"
+      }
+    ],
+    "menus": {
+      "comments/commentThread/context": [
+        {
+          "command": "moonlight.review.addComment",
+          "group": "inline",
+          "when": "commentController == moonlightcode.review"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "moonlight.review.resolveComment",
+          "group": "inline@1",
+          "when": "commentController == moonlightcode.review && commentThreadState == unresolved"
+        },
+        {
+          "command": "moonlight.review.unresolveComment",
+          "group": "inline@1",
+          "when": "commentController == moonlightcode.review && commentThreadState == resolved"
+        },
+        {
+          "command": "moonlight.review.editComment",
+          "group": "inline@2",
+          "when": "commentController == moonlightcode.review"
+        },
+        {
+          "command": "moonlight.review.deleteComment",
+          "group": "inline@3",
+          "when": "commentController == moonlightcode.review"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "moonlight.review.addComment",
+          "when": "false"
+        },
+        {
+          "command": "moonlight.review.resolveComment",
+          "when": "false"
+        },
+        {
+          "command": "moonlight.review.unresolveComment",
+          "when": "false"
+        },
+        {
+          "command": "moonlight.review.editComment",
+          "when": "false"
+        },
+        {
+          "command": "moonlight.review.deleteComment",
+          "when": "false"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "moonlight.review.commentOnSelection",
+        "key": "ctrl+alt+m",
+        "mac": "cmd+alt+m",
+        "when": "editorTextFocus && editorHasSelection"
+      }
+    ]
+  }
+}

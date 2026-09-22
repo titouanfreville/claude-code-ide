@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use moonlight_domain::changes::{Baseline, BaselineGap, ChangeTool, FileTouch};
 use moonlight_domain::ids::{SessionId, Timestamp};
+use moonlight_domain::phase::Verbs;
 use moonlight_domain::ports::{PolicyDecisionPoint, SessionChangeStore};
 use moonlight_domain::trust::DangerClass;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -102,6 +103,50 @@ pub struct ControlServer {
     /// session's tools one at a time, so a pending fingerprint always belongs to the
     /// command now finishing.
     shell_pre: Mutex<HashMap<SessionId, Fingerprint>>,
+    /// Whether a session can reach MoonlightCode's MCP verbs, consulted when building
+    /// the per-turn phase brief. Defaults to [`Verbs::Unavailable`] — the composition
+    /// root decides whether to inject `--mcp-config`, so it is the only thing that
+    /// knows, and a brief that names a tool the session does not have is worse than
+    /// one that names none. Wire with [`ControlServer::with_mcp_verbs`].
+    mcp_verbs: Option<VerbsResolver>,
+}
+
+/// Answers whether a given session has MoonlightCode's MCP verbs wired. See
+/// [`ControlServer::with_mcp_verbs`].
+pub type VerbsResolver = Arc<dyn Fn(&SessionId) -> Verbs + Send + Sync>;
+
+/// Bind a Unix-domain listener at `path` for the hook control server, refusing to
+/// hijack a live one: if another instance already answers there, this returns
+/// `None` rather than deleting + rebinding it (which would silently steal all hook
+/// traffic — two servers racing to answer the same hook is worse than one). Only a
+/// stale/absent socket is replaced. Shared by every process that might host the
+/// gate (desktop app, headless daemon) so "only one instance ever serves this
+/// socket" is enforced identically regardless of which one gets there first.
+pub async fn bind_singleton_unix_socket(path: &Path) -> Option<UnixListener> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if UnixStream::connect(path).await.is_ok() {
+        tracing::warn!(
+            socket = %path.display(),
+            "control socket already served by another instance — not starting a second server"
+        );
+        return None;
+    }
+    let _ = std::fs::remove_file(path); // clear a stale socket
+    match UnixListener::bind(path) {
+        Ok(listener) => {
+            // The gating socket grants deny power — restrict it to the owner.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            tracing::info!(socket = %path.display(), "control server listening");
+            Some(listener)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "control socket bind failed");
+            None
+        }
+    }
 }
 
 impl ControlServer {
@@ -120,7 +165,19 @@ impl ControlServer {
             changes: None,
             probe: Arc::new(NoProbe),
             shell_pre: Mutex::new(HashMap::new()),
+            mcp_verbs: None,
         }
+    }
+
+    /// Declare which sessions can reach the `moonlight` MCP verbs, so the per-turn
+    /// phase brief names `request_phase` / `present_plan` only where they exist.
+    ///
+    /// Unwired, every session is told it has none — which is correct for the headless
+    /// daemon (it injects no `--mcp-config` at all) and merely under-informative for a
+    /// host that does inject one.
+    pub fn with_mcp_verbs(mut self, resolver: VerbsResolver) -> Self {
+        self.mcp_verbs = Some(resolver);
+        self
     }
 
     /// Share the runtime "always allow" set so operator decisions take effect without a
@@ -188,6 +245,7 @@ impl ControlServer {
             changes: None,
             probe: Arc::new(NoProbe),
             shell_pre: Mutex::new(HashMap::new()),
+            mcp_verbs: None,
         }
     }
 
@@ -242,6 +300,9 @@ impl ControlServer {
                 let session = self.resolve_session(&req);
                 self.close_shell_scan(&session, &req);
             }
+            if req.event == crate::hook_registration::PROMPT_EVENT {
+                return self.turn_brief(&self.resolve_session(&req));
+            }
             return HookResponse::Allow;
         }
         let session = self.resolve_session(&req);
@@ -268,6 +329,28 @@ impl ControlServer {
             )
         };
 
+        // Every decision is logged. Without this there is no way to answer the first
+        // question anyone asks of a gate — "was it even consulted?" — and silence is
+        // indistinguishable from a hook that never fired, which is exactly the
+        // fail-open-looks-like-safety confusion this gate exists to prevent.
+        tracing::info!(
+            session = %session,
+            tool = %req.tool_name,
+            adopted = self
+                .gates
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&session)
+                .map(|g| g.adopted)
+                .unwrap_or(false),
+            decision = match &decision {
+                GateDecision::Allow => "allow",
+                GateDecision::Deny { .. } => "deny",
+                GateDecision::Hold(_) => "hold",
+            },
+            "gate decision"
+        );
+
         // Record only when the tool is actually about to run — a denied write never
         // happened, and a held one only happens if the operator lets it through.
         match decision {
@@ -290,6 +373,36 @@ impl ControlServer {
 
     /// The launch id behind a request's session id (Antigravity reports its own
     /// conversation id).
+    /// The per-turn phase brief for `session`, or [`HookResponse::Allow`] (no brief)
+    /// when there is nothing true to say.
+    ///
+    /// Only adopted sessions get one. An unadopted session is never gated — `evaluate`
+    /// returns `Allow` for a missing gate state — so telling it which phase freezes its
+    /// writes would describe a policy that is not being applied to it. That is the
+    /// fail-open-looks-like-safety confusion this whole surface exists to prevent, and
+    /// it is worse in the brief than anywhere else: the agent would *act* on it.
+    fn turn_brief(&self, session: &SessionId) -> HookResponse {
+        let gates = self.gates.read().unwrap_or_else(|p| p.into_inner());
+        let Some(gate) = gates.get(session).filter(|g| g.adopted) else {
+            return HookResponse::Allow;
+        };
+        let phase = gate.phase;
+        let paused = gate.paused;
+        drop(gates);
+
+        let verbs = match &self.mcp_verbs {
+            Some(resolve) => resolve(session),
+            None => Verbs::Unavailable,
+        };
+        let mut text = moonlight_domain::phase::turn_brief(phase, verbs);
+        // A paused session has every tool denied regardless of phase, so a brief that
+        // only named the phase would be actively misleading about what it can do.
+        if paused {
+            text.push_str(" The operator has PAUSED this session: every tool call is denied until they resume it.");
+        }
+        HookResponse::Context { text }
+    }
+
     fn resolve_session(&self, req: &HookRequest) -> SessionId {
         match &self.id_resolver {
             Some(resolve) => {
@@ -407,7 +520,17 @@ impl ControlServer {
         self.notifier
             .approval_requested(&session, what, plan, mcp_tool);
 
-        let rx = self.pending.register(session.clone());
+        // The same context goes into the registry as into the notification: the event
+        // is announced once, so a client that connects mid-hold has only this to read.
+        let rx = self.pending.register_held(
+            session.clone(),
+            crate::pending::HeldApproval {
+                what: what.to_string(),
+                plan: plan.map(str::to_string),
+                mcp_tool: mcp_tool.map(str::to_string),
+                since_ms: crate::pending::now_ms(),
+            },
+        );
         // Bounded (`Some`) → race the budget; unbounded (`None`) → await the operator
         // forever (the outer `Ok` matches the bounded `Ok(_)` arms; `Err`/elapsed is
         // then unreachable, which is the point — no "elapsed" deny for a human review).
@@ -1138,6 +1261,115 @@ mod tests {
         );
         let resp = roundtrip(server, &req("s2", "mcp__other__run_query")).await;
         assert!(matches!(resp, HookResponse::Deny { .. }));
+    }
+
+    fn prompt(session: &str) -> HookRequest {
+        HookRequest {
+            event: crate::hook_registration::PROMPT_EVENT.into(),
+            session_id: session.into(),
+            tool_name: String::new(),
+            tool_input: serde_json::Value::Null,
+            cwd: "/repo".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_brief_states_the_live_phase_of_an_adopted_session() {
+        let gates = gates_with(
+            "brief-live",
+            GateState {
+                adopted: true,
+                phase: Phase::Plan,
+                ..Default::default()
+            },
+        );
+        let server = Arc::new(ControlServer::new(gates.clone(), Arc::new(TestPdp)));
+        match roundtrip(server.clone(), &prompt("brief-live")).await {
+            HookResponse::Context { text } => assert!(text.contains("phase: Plan"), "{text}"),
+            other => panic!("expected a brief, got {other:?}"),
+        }
+
+        // The point of deriving it per turn rather than at launch: move the session and
+        // the very next prompt says so, with nothing to invalidate.
+        gates
+            .write()
+            .unwrap()
+            .get_mut(&SessionId::new("brief-live"))
+            .unwrap()
+            .phase = Phase::AutoImplement;
+        match roundtrip(server, &prompt("brief-live")).await {
+            HookResponse::Context { text } => assert!(text.contains("phase: Auto"), "{text}"),
+            other => panic!("expected a brief, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unadopted_and_unknown_sessions_get_no_brief() {
+        // An unadopted session is never gated, so describing the phase policy to it
+        // would describe a policy that is not applied — and it would act on it.
+        let gates = gates_with(
+            "brief-unadopted",
+            GateState {
+                adopted: false,
+                phase: Phase::Plan,
+                ..Default::default()
+            },
+        );
+        let server = Arc::new(ControlServer::new(gates, Arc::new(TestPdp)));
+        assert_eq!(
+            roundtrip(server.clone(), &prompt("brief-unadopted")).await,
+            HookResponse::Allow
+        );
+        assert_eq!(
+            roundtrip(server, &prompt("ghost")).await,
+            HookResponse::Allow
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_brief_never_denies_a_prompt() {
+        // A paused session has every tool denied; the prompt itself still goes through.
+        // Refusing the operator's typing is not a governance power this hook has.
+        let gates = gates_with(
+            "brief-paused",
+            GateState {
+                adopted: true,
+                paused: true,
+                phase: Phase::Plan,
+                ..Default::default()
+            },
+        );
+        let server = Arc::new(ControlServer::new(gates, Arc::new(TestPdp)));
+        match roundtrip(server, &prompt("brief-paused")).await {
+            HookResponse::Context { text } => assert!(text.contains("PAUSED"), "{text}"),
+            other => panic!("expected a brief, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_brief_names_mcp_verbs_only_where_they_are_wired() {
+        let gate = GateState {
+            adopted: true,
+            phase: Phase::Plan,
+            ..Default::default()
+        };
+        let bare = Arc::new(ControlServer::new(
+            gates_with("brief-verbs", gate.clone()),
+            Arc::new(TestPdp),
+        ));
+        match roundtrip(bare, &prompt("brief-verbs")).await {
+            HookResponse::Context { text } => assert!(!text.contains("present_plan"), "{text}"),
+            other => panic!("expected a brief, got {other:?}"),
+        }
+
+        let wired = Arc::new(
+            ControlServer::new(gates_with("brief-verbs", gate), Arc::new(TestPdp))
+                .with_mcp_verbs(Arc::new(|_| Verbs::Available)),
+        );
+        match roundtrip(wired, &prompt("brief-verbs")).await {
+            HookResponse::Context { text } => assert!(text.contains("present_plan"), "{text}"),
+            other => panic!("expected a brief, got {other:?}"),
+        }
     }
 
     #[tokio::test]

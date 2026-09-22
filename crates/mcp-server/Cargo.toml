@@ -8,27 +8,53 @@ rust-version.workspace = true
 
 # Adapter: embedded MCP server (rmcp) exposing actor verbs. Each verb follows the
 # mandatory shape: resolve -> PDP -> execute -> audit -> compact result. Slice 3.
+[features]
+default = ["mcp-transport"]
+# The rmcp wire transport. Split out because rmcp's `#[tool]` macro needs a schemars
+# version that other hosts may not be able to resolve — the Zed fork pins an older
+# schemars, and pulling the transport in there fails to compile. `adapters` (the gate
+# fold, fleet/policy read-models) and `control_api` use no rmcp, so a host that only
+# needs those can take this crate with `default-features = false` rather than growing
+# a second copy of logic that must not drift.
+mcp-transport = ["dep:rmcp", "dep:schemars"]
+
 [dependencies]
 moonlight-domain.workspace = true
 # The MCP adapters fold the engine bus (policy snapshots) — an adapter knowing the
 # engine's event type is fine (no cycle: engine → domain only).
 moonlight-engine.workspace = true
+# The control API's gating-status endpoint reuses the shared hook-registration
+# status check (no cycle: control → domain only) instead of a second copy of it.
+moonlight-control.workspace = true
+# The Claude-observability read model behind `/control/usage`: statusline snapshots
+# off `<support>/obs/` and the account quota off Anthropic's OAuth usage endpoint.
+# Shared with the desktop status bar so both surfaces report identical figures.
+moonlight-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-rmcp = { version = "=1.7.0", features = [
+rmcp = { version = "=1.7.0", optional = true, features = [
     "server",
     "macros",
     "transport-io",
     "transport-streamable-http-server",
 ] }
 # Mount rmcp's streamable-HTTP tower service (embedded in-app MCP endpoint). Version
-# tracks rmcp's own dev-dep so the tower `Service` impls line up.
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# tracks rmcp's own dev-dep so the tower `Service` impls line up. `json` is for the
+# control API's plain JSON endpoints (the MCP transport itself doesn't need it).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
 # Tool parameter (de)serialization + JSON-Schema. schemars 1.0 matches rmcp's pin so
 # the `JsonSchema` derive the `#[tool]` macro relies on stays compatible.
 serde = { workspace = true, features = ["derive"] }
-schemars = "1"
+schemars = { version = "1", optional = true }
+# Unified-diff rendering for the control API's review queue (same crate the
+# desktop review surface's two-pane diff already uses — see `apps/desktop`).
+similar.workspace = true
+# Streaming engine events to clients over SSE (`/control/events`), which is what lets
+# an IDE fold the daemon's facts instead of running its own engine.
+async-stream = "0.3"
+futures-core = "0.3"
+serde_json.workspace = true
 
 [dev-dependencies]
 # The real PDP, so the actor tests exercise actual trust-tier/phase gating.

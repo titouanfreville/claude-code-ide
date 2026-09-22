@@ -174,6 +174,29 @@ impl CommentScope {
     }
 }
 
+/// Who wrote a comment.
+///
+/// A review is a conversation, and a conversation with one voice is just a list of
+/// orders. Without this the record cannot say whether a line is the reviewer's
+/// objection or the agent's answer to it — so the agent's reply would be delivered
+/// back to the agent as new feedback, and the operator would read their own words
+/// quoted at them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommentAuthor {
+    /// A human reviewer, through any review surface.
+    Operator,
+    /// The session under review, answering.
+    Agent,
+}
+
+impl CommentAuthor {
+    /// Whether messages from this author are feedback *for* the agent. An agent's own
+    /// replies are context, never instructions to itself.
+    pub fn is_feedback(self) -> bool {
+        matches!(self, CommentAuthor::Operator)
+    }
+}
+
 /// An operator's note on a reviewed change — a line range, a file, or the review
 /// itself (see [`CommentScope`]). Persisted the moment it is written (so closing the
 /// tab doesn't lose it) and batched: comments accumulate until the operator sends
@@ -201,6 +224,15 @@ pub struct ReviewComment {
     /// visible "outdated". `None` for comments written before this was recorded, and
     /// for scopes that aren't pinned to a line.
     pub anchor_text: Option<String>,
+    /// Who wrote it — the reviewer, or the session answering them.
+    pub author: CommentAuthor,
+    /// The comment this one answers, making the two a thread. `None` for a thread
+    /// root.
+    ///
+    /// A reply carries no anchor of its own: it inherits the root's scope, file and
+    /// line range, because a reply that could point somewhere else is not a reply.
+    /// Enforced where replies are created, so the invariant cannot be written around.
+    pub parent_id: Option<String>,
     pub at: Timestamp,
     /// `None` until the review carrying this comment is sent to the session.
     pub sent_at: Option<Timestamp>,
@@ -209,6 +241,122 @@ pub struct ReviewComment {
     /// loses why the code looks the way it does — but they leave the diff and are
     /// not delivered again.
     pub resolved_at: Option<Timestamp>,
+}
+
+/// The comments that are still waiting on the agent: written by a reviewer, not yet
+/// delivered, and not settled.
+///
+/// An agent's own replies are excluded by construction — delivering them back would
+/// have the session answering itself, which is how a review turns into a loop.
+pub fn pending_feedback(comments: &[ReviewComment]) -> Vec<&ReviewComment> {
+    comments
+        .iter()
+        .filter(|c| c.author.is_feedback() && c.sent_at.is_none() && !c.is_resolved())
+        .collect()
+}
+
+/// Group `comments` into threads: each root with its replies in the order written.
+///
+/// Returned as `(root, replies)` pairs rather than a nested type because that is the
+/// whole shape — threads are one level deep (see
+/// [`thread_id`](ReviewComment::thread_id)). A reply whose root is absent from the
+/// slice is dropped rather than promoted to a root of its own: showing an answer with
+/// nothing to answer is worse than not showing it.
+pub fn threads(comments: &[ReviewComment]) -> Vec<(&ReviewComment, Vec<&ReviewComment>)> {
+    let mut roots: Vec<&ReviewComment> = comments.iter().filter(|c| !c.is_reply()).collect();
+    // Oldest first, so a thread reads top to bottom in the order it happened.
+    roots.sort_by_key(|c| c.at.as_millis());
+    roots
+        .into_iter()
+        .map(|root| {
+            let mut replies: Vec<&ReviewComment> = comments
+                .iter()
+                .filter(|c| c.parent_id.as_deref() == Some(root.id.as_str()))
+                .collect();
+            replies.sort_by_key(|c| c.at.as_millis());
+            (root, replies)
+        })
+        .collect()
+}
+
+/// Render `comments` as the body of one review message to a session.
+///
+/// **Widest scope first** — what is true of the whole change frames how to read the
+/// notes on individual lines, and a session that reads "land the migration first"
+/// after four line comments has already planned the wrong order.
+///
+/// Threads render as conversations: a thread that has been answered shows both
+/// voices, so the agent reads its own last answer and the reviewer's response to it
+/// rather than the objection alone, which it has already tried to address once. A
+/// thread nobody has answered renders exactly as a lone comment always did — the
+/// labels appear only once there is more than one voice to tell apart.
+///
+/// Only threads **awaiting the agent** appear: the root is unresolved and at least
+/// one reviewer message in it is undelivered (see [`pending_feedback`]). Everything
+/// else is settled business or has already been said.
+///
+/// Lives in the domain rather than in a UI so every review surface (the desktop
+/// panel, the editor plugin over the control API) delivers the *same* text. Two
+/// formatters would mean a session's instructions depended on which window the
+/// operator happened to review in.
+///
+/// Callers that have more to say (automated findings, say) prepend their own
+/// section — this owns the comment half and the header only.
+pub fn review_message(comments: &[ReviewComment]) -> String {
+    let awaiting: Vec<(&ReviewComment, Vec<&ReviewComment>)> = threads(comments)
+        .into_iter()
+        .filter(|(root, replies)| {
+            !root.is_resolved()
+                && std::iter::once(*root)
+                    .chain(replies.iter().copied())
+                    .any(|c| c.author.is_feedback() && c.sent_at.is_none())
+        })
+        .collect();
+
+    // Counted from the threads actually rendered below, not from `pending_feedback`.
+    // The two disagree: a pending reply under a *resolved* root, or an orphan reply
+    // whose root is not in this slice (`threads` drops it by design), is pending
+    // feedback that never appears in the body. The agent then read "3 comments" above
+    // two and went hunting for a third that was never written out.
+    let n: usize = awaiting
+        .iter()
+        .map(|(root, replies)| {
+            std::iter::once(*root)
+                .chain(replies.iter().copied())
+                .filter(|c| c.author.is_feedback() && c.sent_at.is_none())
+                .count()
+        })
+        .sum();
+    let mut out = format!(
+        "Review of your changes ({n} comment{}):\n",
+        if n == 1 { "" } else { "s" }
+    );
+    let by_scope = |want: CommentScope| awaiting.iter().filter(move |(root, _)| root.scope == want);
+    for (root, replies) in by_scope(CommentScope::Review)
+        .chain(by_scope(CommentScope::File))
+        .chain(by_scope(CommentScope::Line))
+    {
+        out.push_str(&format!("\n{}\n", root.anchor()));
+        if replies.is_empty() {
+            // One voice — no labels to disambiguate, so this stays byte-identical to
+            // how a single comment has always been delivered.
+            for line in root.body.lines() {
+                out.push_str(&format!("  {line}\n"));
+            }
+            continue;
+        }
+        for message in std::iter::once(*root).chain(replies.iter().copied()) {
+            let who = match message.author {
+                CommentAuthor::Operator => "reviewer",
+                CommentAuthor::Agent => "you",
+            };
+            out.push_str(&format!("  {who}:\n"));
+            for line in message.body.lines() {
+                out.push_str(&format!("    {line}\n"));
+            }
+        }
+    }
+    out
 }
 
 impl ReviewComment {
@@ -229,6 +377,20 @@ impl ReviewComment {
 
     pub fn is_resolved(&self) -> bool {
         self.resolved_at.is_some()
+    }
+
+    /// Whether this is an answer to another comment rather than a thread root.
+    pub fn is_reply(&self) -> bool {
+        self.parent_id.is_some()
+    }
+
+    /// The id of the thread this comment belongs to — its parent's, or its own.
+    ///
+    /// Threads are one level deep on purpose: a reply to a reply still belongs to the
+    /// same conversation about the same line, and letting it nest produces a tree
+    /// nobody can render in a diff gutter.
+    pub fn thread_id(&self) -> &str {
+        self.parent_id.as_deref().unwrap_or(&self.id)
     }
 
     /// Whether the code this comment points at has changed since it was written.
@@ -258,6 +420,173 @@ impl ReviewComment {
 mod tests {
     use super::*;
 
+    fn scoped_comment(scope: CommentScope, path: &str, line: u32, body: &str) -> ReviewComment {
+        ReviewComment {
+            id: format!("{path}:{line}:{body}"),
+            session_id: crate::ids::SessionId::new("s1"),
+            scope,
+            path: path.to_string(),
+            side: DiffSide::After,
+            start_line: line,
+            end_line: line,
+            body: body.to_string(),
+            anchor_text: None,
+            author: CommentAuthor::Operator,
+            parent_id: None,
+            at: crate::ids::Timestamp::from_millis(0),
+            sent_at: None,
+            resolved_at: None,
+        }
+    }
+
+    /// A reply is an answer to one comment, not a new note floating at the same line.
+    fn reply_to(root: &ReviewComment, author: CommentAuthor, body: &str, at: i64) -> ReviewComment {
+        ReviewComment {
+            id: format!("{}-reply-{at}", root.id),
+            parent_id: Some(root.id.clone()),
+            author,
+            body: body.to_string(),
+            at: crate::ids::Timestamp::from_millis(at),
+            ..root.clone()
+        }
+    }
+
+    /// The point of threads: the agent reads the exchange, not just the objection it
+    /// already tried to answer once.
+    #[test]
+    fn an_answered_thread_delivers_both_voices_in_order() {
+        let root = scoped_comment(CommentScope::Line, "a.rs", 12, "this leaks a handle");
+        let answer = reply_to(
+            &root,
+            CommentAuthor::Agent,
+            "closed it in the drop impl",
+            10,
+        );
+        let back = ReviewComment {
+            sent_at: None,
+            ..reply_to(
+                &root,
+                CommentAuthor::Operator,
+                "the error path still returns early",
+                20,
+            )
+        };
+        // The root was already delivered; what is pending is the reviewer's follow-up.
+        let root = ReviewComment {
+            sent_at: Some(crate::ids::Timestamp::from_millis(5)),
+            ..root
+        };
+        let msg = review_message(&[root, answer, back]);
+        assert!(
+            msg.contains("  reviewer:\n    this leaks a handle\n")
+                && msg.contains("  you:\n    closed it in the drop impl\n")
+                && msg.contains("  reviewer:\n    the error path still returns early\n"),
+            "got:\n{msg}"
+        );
+        // One pending reviewer message, not three comments.
+        assert!(
+            msg.starts_with("Review of your changes (1 comment):"),
+            "got:\n{msg}"
+        );
+        let you = msg.find("closed it in the drop impl").unwrap();
+        let follow_up = msg.find("the error path still returns early").unwrap();
+        assert!(you < follow_up, "the exchange must read in order:\n{msg}");
+    }
+
+    /// An agent answering must not hand itself its own words back as new feedback.
+    #[test]
+    fn a_thread_the_agent_answered_last_is_not_redelivered() {
+        let root = ReviewComment {
+            sent_at: Some(crate::ids::Timestamp::from_millis(5)),
+            ..scoped_comment(CommentScope::Line, "a.rs", 12, "this leaks a handle")
+        };
+        let answer = reply_to(
+            &root,
+            CommentAuthor::Agent,
+            "closed it in the drop impl",
+            10,
+        );
+        assert_eq!(
+            review_message(&[root, answer]),
+            "Review of your changes (0 comments):\n"
+        );
+    }
+
+    /// Resolved means settled — the thread stops being delivered, however much
+    /// conversation it holds.
+    #[test]
+    fn a_resolved_thread_is_not_delivered_even_with_pending_replies() {
+        let root = ReviewComment {
+            resolved_at: Some(crate::ids::Timestamp::from_millis(30)),
+            ..scoped_comment(CommentScope::Line, "a.rs", 12, "this leaks a handle")
+        };
+        let late = reply_to(&root, CommentAuthor::Operator, "one more thing", 40);
+        let msg = review_message(&[root, late]);
+        assert!(!msg.contains("one more thing"), "got:\n{msg}");
+    }
+
+    /// Delivery for an unanswered comment is unchanged — no labels appear until there
+    /// are two voices to tell apart.
+    #[test]
+    fn an_unanswered_thread_reads_exactly_as_a_lone_comment_always_did() {
+        let msg = review_message(&[scoped_comment(
+            CommentScope::Line,
+            "a.rs",
+            3,
+            "first\nsecond",
+        )]);
+        assert!(msg.ends_with("a.rs:3\n  first\n  second\n"), "got:\n{msg}");
+    }
+
+    /// A reply with no root in the slice is dropped: an answer to nothing is noise.
+    #[test]
+    fn threads_drop_an_orphan_reply() {
+        let root = scoped_comment(CommentScope::Line, "a.rs", 12, "rooted");
+        let orphan = ReviewComment {
+            parent_id: Some("gone".to_string()),
+            ..scoped_comment(CommentScope::Line, "a.rs", 12, "orphan")
+        };
+        let all = [root, orphan];
+        let grouped = threads(&all);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].0.body, "rooted");
+        assert!(grouped[0].1.is_empty());
+    }
+
+    /// Widest scope first: a review-wide instruction has to frame the line notes,
+    /// not trail them.
+    #[test]
+    fn review_message_orders_widest_scope_first() {
+        let msg = review_message(&[
+            scoped_comment(CommentScope::Line, "a.rs", 12, "rename this"),
+            scoped_comment(CommentScope::Review, "", 0, "land the migration first"),
+            scoped_comment(CommentScope::File, "a.rs", 0, "this module knows too much"),
+        ]);
+        let review = msg.find("land the migration first").unwrap();
+        let file = msg.find("this module knows too much").unwrap();
+        let line = msg.find("rename this").unwrap();
+        assert!(review < file && file < line, "got:\n{msg}");
+        assert!(
+            msg.starts_with("Review of your changes (3 comments):"),
+            "got:\n{msg}"
+        );
+    }
+
+    #[test]
+    fn review_message_anchors_each_comment() {
+        let msg = review_message(&[scoped_comment(
+            CommentScope::Line,
+            "a.rs",
+            12,
+            "rename this",
+        )]);
+        assert!(msg.contains("a.rs:12"), "got:\n{msg}");
+        assert!(
+            msg.contains("  rename this"),
+            "body must be indented under its anchor:\n{msg}"
+        );
+    }
+
     #[test]
     fn baseline_text_distinguishes_created_from_unavailable() {
         assert_eq!(Baseline::Content("a\n".into()).text(), Some("a\n"));
@@ -285,6 +614,8 @@ mod tests {
             end_line: 42,
             body: "no backoff".into(),
             anchor_text: None,
+            author: CommentAuthor::Operator,
+            parent_id: None,
             at: Timestamp::from_millis(0),
             sent_at: None,
             resolved_at: None,
@@ -344,5 +675,30 @@ mod tests {
         assert!(!c.outdated_against(None));
         c.scope = CommentScope::Review;
         assert!(!c.outdated_against(None));
+    }
+
+    /// The header used to count `pending_feedback`, which includes comments the body
+    /// never renders — a pending reply under a resolved root among them.
+    #[test]
+    fn the_header_counts_only_what_the_body_renders() {
+        let root = ReviewComment {
+            id: "root".into(),
+            resolved_at: Some(Timestamp::from_millis(1)),
+            ..comment()
+        };
+        let reply = ReviewComment {
+            id: "reply".into(),
+            body: "a pending follow-up".into(),
+            parent_id: Some(root.id.clone()),
+            ..comment()
+        };
+        let comments = vec![root, reply];
+
+        // One pending operator comment exists, but its thread is resolved, so nothing
+        // is rendered — and the header must agree.
+        assert_eq!(pending_feedback(&comments).len(), 1);
+        let message = review_message(&comments);
+        assert!(message.contains("(0 comments)"), "{message}");
+        assert!(!message.contains("a pending follow-up"), "{message}");
     }
 }

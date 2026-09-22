@@ -111,6 +111,37 @@ impl ManagedSession {
             last_activity: self.last_seen,
         }
     }
+
+    /// Build a persistable record from a live [`Session`] — the inverse of
+    /// [`Self::to_session`], kept beside it so the two can't drift.
+    ///
+    /// Used on the **adoption** path: adopting a merely-detected session is what
+    /// first makes it managed, so there is no existing row to UPDATE and one has to
+    /// be inserted (see `SessionSupervisor::persist`).
+    ///
+    /// `agent` is a parameter rather than read off the session because the live
+    /// read-model doesn't carry it ([`Self::to_session`] drops it) — the caller
+    /// supplies what detection observed.
+    pub fn from_session(s: &Session, agent: AgentKind, created_at: Timestamp) -> Self {
+        Self {
+            id: s.id.clone(),
+            root: s.attached_path.clone(),
+            title: s.title.clone(),
+            mode: s.mode,
+            phase: s.phase,
+            agent,
+            // Claude pins our id as its conversation; AGY's is correlated and
+            // persisted later by discovery, so it is never known at adoption time.
+            conversation_id: None,
+            trust_tier: s.trust_tier,
+            adopted: s.adopted,
+            paused: s.paused,
+            phase_pinned: s.phase_pinned,
+            hidden: s.hidden,
+            created_at,
+            last_seen: s.last_activity,
+        }
+    }
 }
 
 /// Mutable slice of a managed session refreshed by the supervisor as it observes

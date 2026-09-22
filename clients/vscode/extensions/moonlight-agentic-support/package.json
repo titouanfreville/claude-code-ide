@@ -1,0 +1,51 @@
+{
+  "name": "moonlight-agentic-support",
+  "displayName": "MoonlightCode Agentic Support",
+  "description": "The plan gate and held-approval surface: answer a session's plan proposal or a danger-zone hold before it times out.",
+  "version": "0.1.1",
+  "private": false,
+  "publisher": "titouanfreville",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/titouanfreville/claude-code-ide"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "icon": "icon.png",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "dependencies": {
+    "moonlight-control-client": "*",
+    "moonlight-core": "*"
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "package": "vsce package --no-dependencies",
+    "publish:vsce": "vsce publish --no-dependencies",
+    "publish:ovsx": "ovsx publish --no-dependencies",
+    "test": "node --test out"
+  },
+  "extensionDependencies": [
+    "titouanfreville.moonlight-core"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "moonlight.gate.reviewPlan",
+        "title": "MoonlightCode: Review Proposed Plan"
+      },
+      {
+        "command": "moonlight.gate.answerHold",
+        "title": "MoonlightCode: Answer a Held Action"
+      }
+    ]
+  }
+}

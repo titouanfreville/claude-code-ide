@@ -13,6 +13,8 @@
 pub mod classify;
 pub mod config;
 pub mod gate;
+pub mod git_probe;
+pub mod hook_registration;
 pub mod ipc;
 pub mod paths;
 pub mod pending;
@@ -21,13 +23,24 @@ pub mod server;
 pub mod shell_scan;
 
 pub use classify::classify;
-pub use config::{append_safe_tool, load_config, user_config_path, AiWorkspaceResolver};
+pub use config::{
+    append_safe_tool, auto_adopt_roots, load_config, user_config_path, AiWorkspaceResolver,
+    MOONLIGHT_DIR,
+};
 pub use gate::{decide, evaluate, GateDecision, GateState, HoldKind, EXIT_PLAN_MODE, PRESENT_PLAN};
+pub use git_probe::GitProbe;
+pub use hook_registration::{
+    ensure_mcp_registered, ensure_registered, install as install_hooks, run_hook_client,
+    status as print_hook_status, status_entries as hook_status_entries,
+    uninstall as uninstall_hooks, HookStatusEntry, Repair, HOOK_TIMEOUT,
+};
 pub use ipc::{HookRequest, HookResponse};
 pub use paths::{classify_write_scope, AiWorkspace, AiWorkspaceConfig};
-pub use pending::{ApprovalNotifier, Decision, PendingApprovals};
+pub use pending::{ApprovalNotifier, Decision, HeldApproval, PendingApprovals};
 pub use probe::{NoProbe, SharedProbe, WorkspaceProbe};
-pub use server::{query_hook, ControlServer, GateView, RuntimeSafeTools, DEFAULT_HOLD};
+pub use server::{
+    bind_singleton_unix_socket, query_hook, ControlServer, GateView, RuntimeSafeTools, DEFAULT_HOLD,
+};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -161,9 +174,18 @@ impl KeystoneApprovalGate {
 #[async_trait]
 impl ApprovalGate for KeystoneApprovalGate {
     async fn request(&self, session: &SessionId, what: &str) -> ApprovalDecision {
-        let rx = self.pending.register(session.clone());
         // No plan markdown (nor an external-MCP tool name) for an actor verb — the
-        // description carries the context.
+        // description carries the context, so it is what the registry stores for a
+        // client that arrives after the notification went out.
+        let rx = self.pending.register_held(
+            session.clone(),
+            HeldApproval {
+                what: what.to_string(),
+                plan: None,
+                mcp_tool: None,
+                since_ms: pending::now_ms(),
+            },
+        );
         self.notifier.approval_requested(session, what, None, None);
         // Bounded (`Some`) → race the budget; unbounded (`None`) → await the operator
         // forever (the `Err`/elapsed arm is then unreachable — no rushed deny).
