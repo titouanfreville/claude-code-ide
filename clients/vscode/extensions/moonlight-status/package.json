@@ -2,7 +2,7 @@
   "name": "moonlight-status",
   "displayName": "MoonlightCode Status",
   "description": "Status-bar indicator for hook gating and the focused session's phase.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": false,
   "publisher": "titouanfreville",
   "license": "MIT",

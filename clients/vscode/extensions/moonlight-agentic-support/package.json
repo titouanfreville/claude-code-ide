@@ -2,7 +2,7 @@
   "name": "moonlight-agentic-support",
   "displayName": "MoonlightCode Agentic Support",
   "description": "The plan gate and held-approval surface: answer a session's plan proposal or a danger-zone hold before it times out.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": false,
   "publisher": "titouanfreville",
   "license": "MIT",

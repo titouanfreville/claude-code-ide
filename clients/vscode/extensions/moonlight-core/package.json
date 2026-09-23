@@ -2,7 +2,7 @@
   "name": "moonlight-core",
   "displayName": "MoonlightCode Core",
   "description": "Shared backend connection, session state and owned-terminal registry. Every other MoonlightCode extension depends on this one.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": false,
   "publisher": "titouanfreville",
   "license": "MIT",

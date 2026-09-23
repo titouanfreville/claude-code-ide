@@ -1,6 +1,6 @@
 {
   "name": "moonlight-control-client",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Typed client for moonlightd's control API. Deliberately free of any `vscode` import so it can be exercised from plain Node.",
   "main": "./out/index.js",

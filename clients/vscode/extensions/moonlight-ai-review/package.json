@@ -2,7 +2,7 @@
   "name": "moonlight-ai-review",
   "displayName": "MoonlightCode AI Review",
   "description": "Review what an agent changed: a real diff against the session's own baseline, GitHub-style inline comments, and one batched review delivered back to the session.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": false,
   "publisher": "titouanfreville",
   "license": "MIT",

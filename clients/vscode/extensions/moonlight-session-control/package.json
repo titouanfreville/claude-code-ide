@@ -2,7 +2,7 @@
   "name": "moonlight-session-control",
   "displayName": "MoonlightCode Session Control",
   "description": "Adopt Claude Code sessions into governance, set their workflow phase, and start governed sessions.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": false,
   "publisher": "titouanfreville",
   "license": "MIT",
