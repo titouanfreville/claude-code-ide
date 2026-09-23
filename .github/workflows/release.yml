@@ -135,6 +135,12 @@ jobs:
             echo "::warning::OVSX_PAT is not set — skipping the Open VSX publish."
             exit 0
           fi
+          # Open VSX rejects a publish into a namespace that does not exist yet, and
+          # unlike the VS Marketplace it is not created by registering a publisher.
+          # Creating it is idempotent in effect: it already exists on every run after
+          # the first, which is not an error worth failing a release over.
+          ./node_modules/.bin/ovsx create-namespace titouanfreville -p "$OVSX_PAT" \
+            || echo "namespace titouanfreville already exists"
           ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" \
             --packagePath "$GITHUB_WORKSPACE"/vsix/moonlight-core-*.vsix
           for pkg in "$GITHUB_WORKSPACE"/vsix/*.vsix; do
