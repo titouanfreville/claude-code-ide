@@ -6,18 +6,32 @@ on:
   push:
     tags:
       - "v*"
+  # Re-run a release by hand — for a run that failed halfway, or one whose publish
+  # was skipped because a token was missing or expired. Rebuilds from the tag, so it
+  # produces the same artifacts rather than whatever main has drifted to since.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and release from (e.g. v0.1.1)
+        required: true
+        type: string
 
 jobs:
   version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
     steps:
-      # Strip the leading `v` from the tag (v0.1.0 -> 0.1.0).
+      # The tag comes from the ref on a tag push and from the input on a manual run;
+      # the version is that tag without its leading `v` (v0.1.0 -> 0.1.0).
       - id: v
         env:
-          TAG: ${{ github.ref_name }}
-        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version
@@ -25,7 +39,10 @@ jobs:
     secrets: inherit
     with:
       version: ${{ needs.version.outputs.version }}
-      tag: ${{ github.ref_name }}
+      tag: ${{ needs.version.outputs.tag }}
+      # On a tag push this is the tag anyway; on a manual run it is what stops the
+      # build from silently using the branch it was dispatched from.
+      ref: ${{ needs.version.outputs.tag }}
 
   publish:
     needs: [version, build]
@@ -41,7 +58,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ needs.version.outputs.tag }}
           name: MoonlightCode ${{ needs.version.outputs.version }}
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -67,7 +84,12 @@ jobs:
     needs: [version, build, publish]
     runs-on: ubuntu-latest
     steps:
+      # The tag, not the dispatching branch: this checkout only supplies the lockfile
+      # that `npm ci` installs vsce/ovsx from, and those should be the versions the
+      # release was built with.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
 
       - uses: actions/setup-node@v4
         with:

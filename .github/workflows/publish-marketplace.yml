@@ -1,0 +1,105 @@
+# Publish an already-released set of extensions to the marketplaces.
+#
+# Separate from `release.yml` because the two failures it covers do not need a
+# rebuild, and a rebuild is the slow, risky way to fix them:
+#
+#   * the release ran before VSCE_PAT / OVSX_PAT existed, so `marketplace` warned
+#     and skipped;
+#   * the token has since expired, or the publish failed on its own.
+#
+# It takes the .vsix straight off the GitHub Release, so what reaches the
+# marketplace is the exact artifact that was tested — not a fresh build that
+# happens to carry the same version number. That matters here more than usual:
+# an extension packaged outside the release workflow has DAEMON_PINS undefined
+# and would never fetch a daemon.
+name: publish-marketplace
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag whose .vsix assets to publish (e.g. v0.1.1)
+        required: true
+        type: string
+      open_vsx:
+        description: Also publish to Open VSX
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install publishing tools
+        working-directory: clients/vscode
+        run: npm ci
+
+      - name: Download the released .vsix
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p vsix
+          gh release download "$TAG" --pattern '*.vsix' --dir vsix
+          ls -l vsix
+
+      # Fails early and clearly on a bad or expired token. Without it the first
+      # `publish` reports an authentication error mid-run, after some extensions
+      # may already be live — which is the messiest state to land in.
+      - name: Verify the Marketplace token
+        working-directory: clients/vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VSCE_PAT:-}" ]; then
+            echo "::error::VSCE_PAT is not set — nothing to publish with."
+            exit 1
+          fi
+          ./node_modules/.bin/vsce verify-pat titouanfreville
+
+      # Core first, and awaited: the four feature extensions declare an
+      # `extensionDependencies` on `titouanfreville.moonlight-core`, and the pack
+      # lists it in `extensionPack` — a marketplace that cannot yet resolve that
+      # reference rejects them.
+      - name: Publish to the VS Marketplace
+        working-directory: clients/vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          set -euo pipefail
+          ./node_modules/.bin/vsce publish \
+            --packagePath "$GITHUB_WORKSPACE"/vsix/moonlight-core-*.vsix
+          for pkg in "$GITHUB_WORKSPACE"/vsix/*.vsix; do
+            case "$pkg" in *moonlight-core-*) continue ;; esac
+            ./node_modules/.bin/vsce publish --packagePath "$pkg"
+          done
+
+      - name: Publish to Open VSX
+        if: inputs.open_vsx
+        working-directory: clients/vscode
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OVSX_PAT:-}" ]; then
+            echo "::warning::OVSX_PAT is not set — skipping the Open VSX publish."
+            exit 0
+          fi
+          ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" \
+            --packagePath "$GITHUB_WORKSPACE"/vsix/moonlight-core-*.vsix
+          for pkg in "$GITHUB_WORKSPACE"/vsix/*.vsix; do
+            case "$pkg" in *moonlight-core-*) continue ;; esac
+            ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" --packagePath "$pkg"
+          done

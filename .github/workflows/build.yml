@@ -21,6 +21,15 @@ on:
           URL, so it must be the tag that actually ends up holding the assets.
         required: true
         type: string
+      ref:
+        description: >-
+          Git ref to build. Empty means the ref that triggered the run, which is what
+          a tag push and a push to main both want. A manual re-run is the exception:
+          it is dispatched from a branch, so without this it would rebuild main and
+          label the result with a tag it never contained.
+        required: false
+        default: ''
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,6 +62,9 @@ jobs:
             kind: linux
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Empty falls back to the triggering ref — see the `ref` input.
+          ref: ${{ inputs.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -236,6 +248,9 @@ jobs:
           # `unsupported-platform` rather than reaching for an asset that is not there.
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Empty falls back to the triggering ref — see the `ref` input.
+          ref: ${{ inputs.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -284,6 +299,9 @@ jobs:
       TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Empty falls back to the triggering ref — see the `ref` input.
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-node@v4
         with:
