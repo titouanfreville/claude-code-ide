@@ -17,7 +17,7 @@
     "Other"
   ],
   "icon": "icon.png",
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -26,8 +26,10 @@
     "moonlight-core": "*"
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -w -p ./",
+    "vscode:prepublish": "npm run bundle",
+    "compile": "tsc -p ./ && node ../../scripts/esbuild.js --dev",
+    "watch": "node ../../scripts/esbuild.js --dev --watch",
+    "bundle": "node ../../scripts/esbuild.js",
     "package": "vsce package --no-dependencies",
     "publish:vsce": "vsce publish --no-dependencies",
     "publish:ovsx": "ovsx publish --no-dependencies",
@@ -92,7 +94,7 @@
       },
       {
         "command": "moonlight.sessions.addToGroup",
-        "title": "Add to Group\u2026",
+        "title": "Add to Group…",
         "category": "MoonlightCode",
         "icon": "$(folder)"
       },
@@ -205,7 +207,7 @@
       {
         "view": "moonlight.governed",
         "when": "!moonlight.backendUp",
-        "contents": "No MoonlightCode backend is answering.\n\nThe daemon holds the sessions, the gate and the review record \u2014 without it nothing here is governed.\n\n[Retry now](command:moonlight.sessions.refresh)\n\nOne is started automatically when a `moonlightd` can be found on your PATH."
+        "contents": "No MoonlightCode backend is answering.\n\nThe daemon holds the sessions, the gate and the review record — without it nothing here is governed.\n\n[Retry now](command:moonlight.sessions.refresh)\n\nOne is started automatically when a `moonlightd` can be found on your PATH."
       },
       {
         "view": "moonlight.governed",
@@ -215,7 +217,7 @@
       {
         "view": "moonlight.governed",
         "when": "moonlight.backendUp && !moonlight.hasSessions",
-        "contents": "No Claude Code sessions detected.\n\nA session appears once it writes its first transcript line \u2014 detection has nothing to see before that.\n\n[Start a governed session](command:moonlight.sessionControl.startSession)"
+        "contents": "No Claude Code sessions detected.\n\nA session appears once it writes its first transcript line — detection has nothing to see before that.\n\n[Start a governed session](command:moonlight.sessionControl.startSession)"
       },
       {
         "view": "moonlight.unadopted",
@@ -239,7 +241,7 @@
             "One flat list, ordered worst-first."
           ],
           "default": "project",
-          "markdownDescription": "How the session lists in the MoonlightCode sidebar are arranged.\n\nGrouping applies **within** the Governed and Not-adopted views \u2014 those stay separate lists. A single group is rendered flat, since one header over the whole list carries no information.",
+          "markdownDescription": "How the session lists in the MoonlightCode sidebar are arranged.\n\nGrouping applies **within** the Governed and Not-adopted views — those stay separate lists. A single group is rendered flat, since one header over the whole list carries no information.",
           "scope": "resource"
         }
       }

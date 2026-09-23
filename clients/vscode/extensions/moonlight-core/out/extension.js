@@ -44,6 +44,7 @@ exports.deactivate = deactivate;
  */
 const vscode = __importStar(require("vscode"));
 const controlApi = __importStar(require("moonlight-control-client"));
+const daemon_install_1 = require("./daemon-install");
 const gate_state_1 = require("./gate-state");
 const terminals_1 = require("./terminals");
 /**
@@ -76,6 +77,33 @@ function activate(context) {
     let usage;
     let backendError;
     const terminals = new terminals_1.SessionTerminals(context);
+    // A daemon downloaded on demand, once it has been verified. Held here rather than
+    // re-derived per tick so the five-second poll does not stat the cache forever, and
+    // so a single in-flight download is shared by every tick that arrives during it.
+    let downloadedDaemon;
+    let installing;
+    /**
+     * Fetch the daemon the first time `PATH` turns up empty.
+     *
+     * Only on `no-binary`: an operator who pointed at their own build, or turned
+     * autostart off, has already answered the question this would be asking.
+     */
+    const installDaemon = () => {
+        if (downloadedDaemon || installing) {
+            return;
+        }
+        installing = (async () => {
+            const result = await (0, daemon_install_1.ensureDownloadedDaemon)(context.globalStorageUri.fsPath, controlApi.daemonBinaryName());
+            if (result.kind === 'installed' || result.kind === 'cached') {
+                downloadedDaemon = result.binary;
+            }
+            else if (result.kind === 'failed') {
+                console.warn(`[moonlight] daemon download failed: ${result.error}`);
+            }
+        })().finally(() => {
+            installing = undefined;
+        });
+    };
     const refresh = async () => {
         try {
             // Usage rides the same tick: the server caches the account quota, so the
@@ -116,7 +144,16 @@ function activate(context) {
             // what governs sessions, so reporting "no backend" and leaving it at that means
             // the fleet runs ungoverned while this extension looks like it is working.
             // Racing another window is safe — the loser exits (see apps/daemon).
-            const started = controlApi.ensureDaemon(daemonOptions());
+            const options = daemonOptions();
+            const started = controlApi.ensureDaemon({
+                ...options,
+                // An explicit setting always wins: a download must never quietly replace the
+                // build an operator named.
+                path: options.path ?? downloadedDaemon,
+            });
+            if (started.kind === 'no-binary' && options.autostart !== false && !options.path) {
+                installDaemon();
+            }
             // Say *why* there is no backend when the reason is a choice or a missing
             // binary. "Connection refused" alone sends an operator looking for a crash when
             // the answer is that this window was told not to start one.

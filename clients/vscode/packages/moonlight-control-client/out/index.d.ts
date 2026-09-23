@@ -1,4 +1,4 @@
-export { controlBaseUrl, daemonReachable, discoveryPath, ensureDaemon, stateAnchor, } from './daemon';
+export { controlBaseUrl, daemonBinaryName, daemonReachable, discoveryPath, ensureDaemon, stateAnchor, } from './daemon';
 export type { DaemonOptions, DaemonStartResult } from './daemon';
 export { parseEngineEvent, readFrames, statusIsWaiting, subscribeEvents } from './events';
 export type { EngineEvent, EventStreamHandlers, EventSubscription, SseFrame } from './events';

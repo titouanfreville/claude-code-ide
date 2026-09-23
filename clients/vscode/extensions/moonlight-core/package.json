@@ -17,7 +17,7 @@
     "Other"
   ],
   "icon": "icon.png",
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -25,8 +25,10 @@
     "moonlight-control-client": "*"
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -w -p ./",
+    "vscode:prepublish": "npm run bundle",
+    "compile": "tsc -p ./ && node ../../scripts/esbuild.js --dev",
+    "watch": "node ../../scripts/esbuild.js --dev --watch",
+    "bundle": "node ../../scripts/esbuild.js",
     "package": "vsce package --no-dependencies",
     "publish:vsce": "vsce publish --no-dependencies",
     "publish:ovsx": "ovsx publish --no-dependencies",
@@ -43,13 +45,13 @@
             "null"
           ],
           "default": null,
-          "markdownDescription": "Absolute path to the `moonlightd` binary this window should start. Leave empty to use the `MOONLIGHT_DAEMON_BIN` environment variable, then the first `moonlightd` on `PATH`.\n\nSet this when you build the daemon yourself and want the editor to start *your* build rather than the installed one. If the path is set but not executable, no daemon is started \u2014 a named daemon is never silently swapped for a different one.",
+          "markdownDescription": "Absolute path to the `moonlightd` binary this window should start. Leave empty to use the `MOONLIGHT_DAEMON_BIN` environment variable, then the first `moonlightd` on `PATH`.\n\nSet this when you build the daemon yourself and want the editor to start *your* build rather than the installed one. If the path is set but not executable, no daemon is started — a named daemon is never silently swapped for a different one.",
           "scope": "machine-overridable"
         },
         "moonlight.daemon.autostart": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Start `moonlightd` from this window when the backend is unreachable.\n\nTurn this off if you run the daemon yourself \u2014 from a terminal, a debugger, or a service manager. The editor keeps talking to whichever daemon is running; it just stops starting one, so your process is not displaced by an autostart on the poll loop.\n\nWith this off and no daemon running, sessions are ungoverned: the hooks fail open.",
+          "markdownDescription": "Start `moonlightd` from this window when the backend is unreachable.\n\nTurn this off if you run the daemon yourself — from a terminal, a debugger, or a service manager. The editor keeps talking to whichever daemon is running; it just stops starting one, so your process is not displaced by an autostart on the poll loop.\n\nWith this off and no daemon running, sessions are ungoverned: the hooks fail open.",
           "scope": "machine-overridable"
         }
       }

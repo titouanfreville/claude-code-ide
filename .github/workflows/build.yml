@@ -14,6 +14,13 @@ on:
         description: Version string used in artifact names (e.g. 0.1.0 or nightly-abc1234)
         required: true
         type: string
+      tag:
+        description: >-
+          Release tag the assets will be attached to (e.g. v0.1.0, or `nightly` for
+          the rolling pre-release). The extensions embed it in their daemon download
+          URL, so it must be the tag that actually ends up holding the assets.
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -184,4 +191,130 @@ jobs:
         with:
           name: moonlight-${{ matrix.target }}
           path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # The headless daemon, for the editor extensions.
+  #
+  # Separate from `build` on purpose: `moonlight-desktop` needs GPUI, Metal and
+  # Vulkan and is therefore limited to the three targets that can build it, while
+  # `moonlightd` is headless (see apps/daemon/Cargo.toml) and runs anywhere. The
+  # VS Code extensions only ever need this binary, so tying their platform support
+  # to the desktop app's would strand Windows and Linux arm64 users for a reason
+  # that has nothing to do with them.
+  #
+  # Every target builds on its own runner rather than cross-compiling: `rusqlite`
+  # is vendored with `bundled`, so each target also compiles SQLite's C sources,
+  # and a native toolchain avoids maintaining five cross-linker setups.
+  # --------------------------------------------------------------------------
+  daemon:
+    name: daemon (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ inputs.version }}
+      TGT: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: daemon-${{ matrix.target }}
+
+      - name: Build moonlightd
+        run: cargo build --release -p moonlight-daemon --target "$TGT"
+        shell: bash
+
+      # Gzip rather than tar: the extension fetches exactly one file and gunzips it
+      # in process, so an archive format would only add an extraction step that has
+      # to behave identically on three platforms.
+      - name: Package daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          bin="target/${TGT}/release/moonlightd"
+          [ -f "$bin" ] || bin="target/${TGT}/release/moonlightd.exe"
+          gzip -9 -c "$bin" > "dist/moonlightd-${VERSION}-${TGT}.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moonlightd-${{ matrix.target }}
+          path: dist/moonlightd-${{ inputs.version }}-${{ matrix.target }}.gz
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # The VS Code / Open VSX extensions.
+  #
+  # Runs after `daemon` because `pin-daemon.js` hashes the artifacts that job just
+  # produced and writes them into the extension. The hashes therefore describe the
+  # exact bytes this same release publishes — a checksum file fetched from the
+  # release at runtime would only ever agree with itself.
+  # --------------------------------------------------------------------------
+  vsix:
+    name: vsix
+    needs: daemon
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: daemon-artifacts
+          pattern: moonlightd-*
+          merge-multiple: true
+
+      - name: Install
+        working-directory: clients/vscode
+        run: npm ci
+
+      - name: Pin the daemon build the extensions may download
+        working-directory: clients/vscode
+        run: node scripts/pin-daemon.js "$VERSION" "$TAG" "$GITHUB_WORKSPACE/daemon-artifacts"
+
+      - name: Test
+        working-directory: clients/vscode
+        run: npm test
+
+      - name: Package
+        working-directory: clients/vscode
+        run: npm run package
+
+      # Flattened because both publish jobs attach `artifacts/*`: left nested, the
+      # glob would match the per-extension directories rather than the .vsix files.
+      - name: Collect the packages
+        run: |
+          set -euo pipefail
+          mkdir -p vsix
+          find clients/vscode/extensions -name '*.vsix' -exec cp {} vsix/ \;
+          ls -l vsix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: vsix/*.vsix
           if-no-files-found: error

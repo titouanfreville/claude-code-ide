@@ -17,7 +17,7 @@
     "Other"
   ],
   "icon": "icon.png",
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -26,8 +26,10 @@
     "moonlight-core": "*"
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -w -p ./",
+    "vscode:prepublish": "npm run bundle",
+    "compile": "tsc -p ./ && node ../../scripts/esbuild.js --dev",
+    "watch": "node ../../scripts/esbuild.js --dev --watch",
+    "bundle": "node ../../scripts/esbuild.js",
     "package": "vsce package --no-dependencies",
     "publish:vsce": "vsce publish --no-dependencies",
     "publish:ovsx": "ovsx publish --no-dependencies"

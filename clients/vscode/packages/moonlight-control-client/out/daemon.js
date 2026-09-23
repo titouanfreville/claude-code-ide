@@ -33,6 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.daemonBinaryName = daemonBinaryName;
 exports.stateAnchor = stateAnchor;
 exports.discoveryPath = discoveryPath;
 exports.controlBaseUrl = controlBaseUrl;
@@ -58,8 +59,16 @@ const childProcess = __importStar(require("child_process"));
 const fs = __importStar(require("fs"));
 const os = __importStar(require("os"));
 const path = __importStar(require("path"));
-/** Name of the daemon executable on `PATH`. */
-const DAEMON_BIN = 'moonlightd';
+/**
+ * Name of the daemon executable on `PATH`.
+ *
+ * Windows needs the `.exe`: `PATH` entries there hold `moonlightd.exe`, so a probe
+ * for the extension-less name matches nothing and autostart reports `no-binary`
+ * forever on an otherwise correct install.
+ */
+function daemonBinaryName(platform = process.platform) {
+    return platform === 'win32' ? 'moonlightd.exe' : 'moonlightd';
+}
 /** Points the autostart at a specific build — for a sandbox run, mainly. */
 const DAEMON_BIN_VAR = 'MOONLIGHT_DAEMON_BIN';
 /** Mirrors `moonlight_core::support`'s `MOONLIGHT_HOME`. */
@@ -127,7 +136,7 @@ function isExecutableFile(candidate) {
  * extension host is Node, not a build output — so an explicit override and `PATH` are
  * the only two answers.
  */
-function resolveDaemonBinary(override, searchPath, exists = isExecutableFile) {
+function resolveDaemonBinary(override, searchPath, exists = isExecutableFile, binaryName = daemonBinaryName()) {
     if (override) {
         if (exists(override)) {
             return override;
@@ -141,7 +150,7 @@ function resolveDaemonBinary(override, searchPath, exists = isExecutableFile) {
         if (!dir) {
             continue;
         }
-        const candidate = path.join(dir, DAEMON_BIN);
+        const candidate = path.join(dir, binaryName);
         if (exists(candidate)) {
             return candidate;
         }

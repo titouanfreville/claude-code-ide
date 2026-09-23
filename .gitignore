@@ -9,3 +9,12 @@ Cargo.lock.orig
 # Local app data (MoonlightCode runtime store lives outside the repo)
 /.moonlight-local
 .omc
+
+# Nested clones, not submodules (no .gitmodules entry)
+/forks
+
+# Node: dependencies and build output are reproducible from package-lock.json
+node_modules/
+dist/
+*.vsix
+/apps/zed_based_desktop

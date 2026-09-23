@@ -28,6 +28,7 @@ jobs:
     secrets: inherit
     with:
       version: ${{ needs.version.outputs.version }}
+      tag: nightly
 
   publish:
     needs: [version, build]

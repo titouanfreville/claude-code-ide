@@ -17,8 +17,16 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-/** Name of the daemon executable on `PATH`. */
-const DAEMON_BIN = 'moonlightd';
+/**
+ * Name of the daemon executable on `PATH`.
+ *
+ * Windows needs the `.exe`: `PATH` entries there hold `moonlightd.exe`, so a probe
+ * for the extension-less name matches nothing and autostart reports `no-binary`
+ * forever on an otherwise correct install.
+ */
+export function daemonBinaryName(platform: string = process.platform): string {
+  return platform === 'win32' ? 'moonlightd.exe' : 'moonlightd';
+}
 
 /** Points the autostart at a specific build — for a sandbox run, mainly. */
 const DAEMON_BIN_VAR = 'MOONLIGHT_DAEMON_BIN';
@@ -96,7 +104,8 @@ function isExecutableFile(candidate: string): boolean {
 export function resolveDaemonBinary(
   override: string | undefined,
   searchPath: string | undefined,
-  exists: (candidate: string) => boolean = isExecutableFile
+  exists: (candidate: string) => boolean = isExecutableFile,
+  binaryName: string = daemonBinaryName()
 ): string | undefined {
   if (override) {
     if (exists(override)) {
@@ -111,7 +120,7 @@ export function resolveDaemonBinary(
     if (!dir) {
       continue;
     }
-    const candidate = path.join(dir, DAEMON_BIN);
+    const candidate = path.join(dir, binaryName);
     if (exists(candidate)) {
       return candidate;
     }

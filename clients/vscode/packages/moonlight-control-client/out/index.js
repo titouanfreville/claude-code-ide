@@ -33,7 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.FROZEN_PHASES = exports.subscribeEvents = exports.statusIsWaiting = exports.readFrames = exports.parseEngineEvent = exports.stateAnchor = exports.ensureDaemon = exports.discoveryPath = exports.daemonReachable = exports.controlBaseUrl = void 0;
+exports.FROZEN_PHASES = exports.subscribeEvents = exports.statusIsWaiting = exports.readFrames = exports.parseEngineEvent = exports.stateAnchor = exports.ensureDaemon = exports.discoveryPath = exports.daemonReachable = exports.daemonBinaryName = exports.controlBaseUrl = void 0;
 exports.toThreads = toThreads;
 exports.isReviewable = isReviewable;
 exports.shortId = shortId;
@@ -73,6 +73,7 @@ const http = __importStar(require("http"));
 const daemon_1 = require("./daemon");
 var daemon_2 = require("./daemon");
 Object.defineProperty(exports, "controlBaseUrl", { enumerable: true, get: function () { return daemon_2.controlBaseUrl; } });
+Object.defineProperty(exports, "daemonBinaryName", { enumerable: true, get: function () { return daemon_2.daemonBinaryName; } });
 Object.defineProperty(exports, "daemonReachable", { enumerable: true, get: function () { return daemon_2.daemonReachable; } });
 Object.defineProperty(exports, "discoveryPath", { enumerable: true, get: function () { return daemon_2.discoveryPath; } });
 Object.defineProperty(exports, "ensureDaemon", { enumerable: true, get: function () { return daemon_2.ensureDaemon; } });

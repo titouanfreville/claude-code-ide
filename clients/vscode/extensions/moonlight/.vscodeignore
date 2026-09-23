@@ -1,0 +1,3 @@
+# Extension pack: the manifest is the whole artifact.
+node_modules/**
+.vscodeignore

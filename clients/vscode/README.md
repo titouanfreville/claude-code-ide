@@ -34,7 +34,7 @@ addition to core into a silent shutdown of the extensions that did not need it.
 
 ## Publishing
 
-Not published yet, but the manifests are ready: the six extensions are `0.1.0`, MIT,
+Not published yet, but the manifests are ready: the six extensions are `0.1.1`, MIT,
 and carry the IDE's own icon (`icon.png`, cropped square from the repo-root original
 that `apps/desktop` embeds). Each ships its own `LICENSE` — a `.vsix` only packages
 files under the extension root, so one copy per extension is the only way it travels.
@@ -43,17 +43,59 @@ files under the extension root, so one copy per extension is the only way it tra
 marketplace artifact, and the flag is what stops an absent-minded `npm publish` from
 putting it on the public registry.
 
-Two registries, same artifact:
-
 ```sh
-npm run package        # .vsix per extension
-npm run publish:vsce   # VS Marketplace  (needs `vsce login titouanfreville`)
+npm run bundle         # esbuild -> dist/extension.js per extension
+npm run package        # .vsix per extension (bundles first, via vscode:prepublish)
+npm run publish:vsce   # VS Marketplace  (needs a publisher PAT: `vsce login titouanfreville`)
 npm run publish:ovsx   # Open VSX        (Cursor / Windsurf / VSCodium)
 ```
 
-`--no-dependencies` is set because the shared client resolves through the npm
-workspace. That is fine for development (F5) but **a `.vsix` built this way will not
-contain it** — bundling (esbuild or similar) is required before any real publish.
+`vsce` and `ovsx` are devDependencies rather than assumed globals, so `npm run
+package` works on a clean checkout and in CI.
+
+### Bundling is not optional
+
+`--no-dependencies` is set, and `moonlight-control-client` resolves through the npm
+workspace — so an unbundled `.vsix` does not contain it, installs fine, and then
+fails to activate. `scripts/esbuild.js` inlines the client; `vscode:prepublish` runs
+it, which is what makes it impossible to package around.
+
+`moonlight-core` stays *external* to the bundle. Dependents import it with `import
+type` only and reach it at runtime through `vscode.extensions.getExtension(...)
+.exports`, so bundling it would put a second, disconnected copy of core inside every
+dependent — each with its own connection state.
+
+The packages are platform-neutral: no `TargetPlatform` is declared, the bundles are
+plain JS, and the only requires are node builtins plus `vscode`. One build serves
+macOS, Linux and Windows.
+
+## The daemon, for people who only install the extension
+
+The marketplace audience is exactly the audience without the desktop app, so core
+downloads `moonlightd` on demand: on the first tick that finds no binary on `PATH`,
+it fetches the asset for this platform, checks it against a hash, caches it under the
+extension's global storage, and hands the path to `ensureDaemon`. An operator who set
+`moonlight.daemon.path`, or turned autostart off, is never overridden.
+
+Trust comes from `extensions/moonlight-core/src/daemon-pins.ts`, which
+`scripts/pin-daemon.js` generates **in CI** from the artifacts the same workflow run
+just built — so the hashes describe the exact bytes that release publishes. A
+checksum file fetched from the release at runtime would only ever agree with itself.
+
+In the repo `DAEMON_PINS` is `undefined`, on purpose: a locally packaged `.vsix`
+never downloads and behaves the way it always has, falling back to `PATH` and the
+setting. Only CI-built packages can install a daemon.
+
+`build.yml` builds `moonlightd` for five targets — macOS arm64/x64, Linux x64/arm64,
+Windows x64 — each on its own runner rather than cross-compiled, because `rusqlite`
+is vendored with `bundled` and every target therefore also compiles SQLite's C
+sources. That matrix is wider than the desktop app's three: `moonlightd` is headless
+(no GPUI, no Metal, no Vulkan), and tying the extensions' platform support to the
+desktop app's would strand Windows for a reason that has nothing to do with them.
+
+The release tag is passed in rather than derived from the version, because the
+nightly build keeps one rolling `nightly` tag whose assets are named per commit —
+`v${version}` is a tag that exists only for versioned releases.
 
 ## The shared client has to be reachable from the *installed* path
 

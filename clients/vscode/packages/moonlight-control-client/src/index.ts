@@ -10,6 +10,7 @@ import { controlBaseUrl } from './daemon';
 
 export {
   controlBaseUrl,
+  daemonBinaryName,
   daemonReachable,
   discoveryPath,
   ensureDaemon,

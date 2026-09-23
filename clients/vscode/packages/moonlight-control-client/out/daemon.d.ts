@@ -1,4 +1,12 @@
 /**
+ * Name of the daemon executable on `PATH`.
+ *
+ * Windows needs the `.exe`: `PATH` entries there hold `moonlightd.exe`, so a probe
+ * for the extension-less name matches nothing and autostart reports `no-binary`
+ * forever on an otherwise correct install.
+ */
+export declare function daemonBinaryName(platform?: string): string;
+/**
  * The root MoonlightCode anchors its state to — `MOONLIGHT_HOME` when set and
  * absolute, else the home directory. Same rule as `moonlight_core::support::anchor`;
  * a client that ignored the override would read the discovery file of a daemon it is
@@ -25,7 +33,7 @@ export declare function controlBaseUrl(): string | undefined;
  * extension host is Node, not a build output — so an explicit override and `PATH` are
  * the only two answers.
  */
-export declare function resolveDaemonBinary(override: string | undefined, searchPath: string | undefined, exists?: (candidate: string) => boolean): string | undefined;
+export declare function resolveDaemonBinary(override: string | undefined, searchPath: string | undefined, exists?: (candidate: string) => boolean, binaryName?: string): string | undefined;
 /** The environment a started daemon needs to govern the same state as this window. */
 export declare function spawnEnv(): Record<string, string | undefined>;
 /** Why an autostart did not happen, for the caller to surface. */
