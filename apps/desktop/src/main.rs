@@ -273,6 +273,7 @@ fn main() {
                 changes.clone(),
                 steer_probe.clone(),
                 control_fleet.clone(),
+                bus.clone(),
             );
 
             let run_registry = run::RunRegistry::new();
@@ -807,6 +808,10 @@ fn spawn_control_api(
     // is gone, i.e. once nothing can write into a terminal any more.
     steer_closed: mpsc::UnboundedSender<Feedback>,
     fleet: Arc<moonlight_mcp_server::BusFleetView>,
+    // The engine bus, streamed to clients over `/control/events`. The same bus the
+    // cockpit subscribes to, so an editor extension and the desktop UI never see a
+    // different view of what the fleet is doing.
+    events: EventBus,
 ) {
     std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -859,6 +864,7 @@ fn spawn_control_api(
                     }
                 },
                 fleet,
+                events,
             );
             if let Err(e) = moonlight_mcp_server::control_api::serve(state, listener).await {
                 tracing::error!(error = %e, "control API stopped");
