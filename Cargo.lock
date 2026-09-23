@@ -4086,7 +4086,7 @@ dependencies = [
 
 [[package]]
 name = "moonlight-control"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "moonlight-domain",
@@ -4098,7 +4098,7 @@ dependencies = [
 
 [[package]]
 name = "moonlight-core"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4108,7 +4108,7 @@ dependencies = [
 
 [[package]]
 name = "moonlight-daemon"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "moonlight-control",
@@ -4128,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "moonlight-desktop"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4175,7 +4175,7 @@ dependencies = [
 
 [[package]]
 name = "moonlight-detection"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "moonlight-domain",
@@ -4187,7 +4187,7 @@ dependencies = [
 
 [[package]]
 name = "moonlight-domain"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -4196,7 +4196,7 @@ dependencies = [
 
 [[package]]
 name = "moonlight-engine"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "moonlight-domain",
@@ -4207,7 +4207,7 @@ dependencies = [
 
 [[package]]
 name = "moonlight-mcp-server"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4230,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "moonlight-persistence"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "moonlight-domain",
  "rusqlite",
@@ -4240,21 +4240,21 @@ dependencies = [
 
 [[package]]
 name = "moonlight-rtk"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "moonlight-domain",
 ]
 
 [[package]]
 name = "moonlight-trust"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "moonlight-domain",
 ]
 
 [[package]]
 name = "moonlight-worktree"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "moonlight-domain",
 ]

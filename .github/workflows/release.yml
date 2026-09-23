@@ -46,3 +46,76 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: artifacts/*
+
+  # --------------------------------------------------------------------------
+  # Marketplace publish.
+  #
+  # Publishes the .vsix that `build` produced, never a locally packaged one: the
+  # repo keeps DAEMON_PINS undefined, so an extension packaged outside this
+  # workflow installs fine and then never fetches a daemon. `--packagePath` is
+  # what makes that impossible to get wrong.
+  #
+  # Needs `publish` so the assets are on the release before the extensions that
+  # download them are installable — the reverse order gives whoever installs in
+  # the first minutes an extension whose daemon 404s.
+  #
+  # Skips itself when the token is absent, the same way the macOS signing step
+  # does: a fork, or a repo whose secrets are not set yet, still gets a full
+  # release with the .vsix attached, just not a published one.
+  # --------------------------------------------------------------------------
+  marketplace:
+    needs: [version, build, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vsix
+          path: vsix
+
+      - name: Install publishing tools
+        working-directory: clients/vscode
+        run: npm ci
+
+      # Core first, and awaited: the four feature extensions declare an
+      # `extensionDependencies` on `titouanfreville.moonlight-core`, and the pack
+      # lists it in `extensionPack` — a marketplace that cannot yet resolve that
+      # reference rejects them.
+      - name: Publish to the VS Marketplace
+        working-directory: clients/vscode
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VSCE_PAT:-}" ]; then
+            echo "::warning::VSCE_PAT is not set — skipping the VS Marketplace publish."
+            exit 0
+          fi
+          ./node_modules/.bin/vsce publish \
+            --packagePath "$GITHUB_WORKSPACE"/vsix/moonlight-core-*.vsix
+          for pkg in "$GITHUB_WORKSPACE"/vsix/*.vsix; do
+            case "$pkg" in *moonlight-core-*) continue ;; esac
+            ./node_modules/.bin/vsce publish --packagePath "$pkg"
+          done
+
+      - name: Publish to Open VSX
+        working-directory: clients/vscode
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OVSX_PAT:-}" ]; then
+            echo "::warning::OVSX_PAT is not set — skipping the Open VSX publish."
+            exit 0
+          fi
+          ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" \
+            --packagePath "$GITHUB_WORKSPACE"/vsix/moonlight-core-*.vsix
+          for pkg in "$GITHUB_WORKSPACE"/vsix/*.vsix; do
+            case "$pkg" in *moonlight-core-*) continue ;; esac
+            ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" --packagePath "$pkg"
+          done
