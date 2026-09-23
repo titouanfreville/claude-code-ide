@@ -104,10 +104,9 @@ jobs:
         working-directory: clients/vscode
         run: npm ci
 
-      # Core first, and awaited: the four feature extensions declare an
-      # `extensionDependencies` on `titouanfreville.moonlight-core`, and the pack
-      # lists it in `extensionPack` — a marketplace that cannot yet resolve that
-      # reference rejects them.
+      # Dependency order, not alphabetical — see scripts/publish-order.js. Publishing
+      # in glob order put the pack second, before the extensions it packs, and the
+      # marketplace rejected it.
       - name: Publish to the VS Marketplace
         working-directory: clients/vscode
         env:
@@ -118,10 +117,8 @@ jobs:
             echo "::warning::VSCE_PAT is not set — skipping the VS Marketplace publish."
             exit 0
           fi
-          ./node_modules/.bin/vsce publish \
-            --packagePath "$GITHUB_WORKSPACE"/vsix/moonlight-core-*.vsix
-          for pkg in "$GITHUB_WORKSPACE"/vsix/*.vsix; do
-            case "$pkg" in *moonlight-core-*) continue ;; esac
+          node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" | while read -r pkg; do
+            echo "--> $(basename "$pkg")"
             ./node_modules/.bin/vsce publish --packagePath "$pkg"
           done
 
@@ -141,9 +138,7 @@ jobs:
           # the first, which is not an error worth failing a release over.
           ./node_modules/.bin/ovsx create-namespace titouanfreville -p "$OVSX_PAT" \
             || echo "namespace titouanfreville already exists"
-          ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" \
-            --packagePath "$GITHUB_WORKSPACE"/vsix/moonlight-core-*.vsix
-          for pkg in "$GITHUB_WORKSPACE"/vsix/*.vsix; do
-            case "$pkg" in *moonlight-core-*) continue ;; esac
+          node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" | while read -r pkg; do
+            echo "--> $(basename "$pkg")"
             ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" --packagePath "$pkg"
           done

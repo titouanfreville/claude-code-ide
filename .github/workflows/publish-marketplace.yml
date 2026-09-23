@@ -26,6 +26,15 @@ on:
         required: false
         default: true
         type: boolean
+      skip:
+        description: >-
+          Comma-separated extension names to leave out (e.g. moonlight-core when it
+          is already live at this version). A marketplace rejects re-publishing a
+          version it already has, so resuming a half-finished publish means naming
+          what already went out.
+        required: false
+        default: ''
+        type: string
 
 jobs:
   publish:
@@ -33,9 +42,14 @@ jobs:
     env:
       TAG: ${{ inputs.tag }}
     steps:
+      # The default branch, deliberately, not the tag. Nothing published here comes
+      # from the checkout — the .vsix are downloaded from the release below — so this
+      # supplies only the tooling: vsce, ovsx and publish-order.js. Those need to be
+      # the current ones. Checking out the tag instead would mean a release can only
+      # ever be republished by the publishing code that shipped with it, which is
+      # exactly backwards: this workflow exists to fix releases whose publish was
+      # broken, and the fix necessarily postdates the tag.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-node@v4
         with:
@@ -69,20 +83,24 @@ jobs:
           fi
           ./node_modules/.bin/vsce verify-pat titouanfreville
 
-      # Core first, and awaited: the four feature extensions declare an
-      # `extensionDependencies` on `titouanfreville.moonlight-core`, and the pack
-      # lists it in `extensionPack` — a marketplace that cannot yet resolve that
-      # reference rejects them.
+      # Dependency order, not alphabetical order. Core is published first because the
+      # feature extensions declare an `extensionDependencies` on it; the pack is
+      # published last because it lists all five in `extensionPack`, and a marketplace
+      # that cannot yet resolve a reference rejects the extension making it.
+      #
+      # A plain `for *.vsix` sorted the pack second, right after core and before the
+      # extensions it packs. The pack is found by reading `extensionPack` out of each
+      # manifest rather than by matching its file name, so a rename cannot quietly put
+      # it back in the wrong place.
       - name: Publish to the VS Marketplace
         working-directory: clients/vscode
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          SKIP: ${{ inputs.skip }}
         run: |
           set -euo pipefail
-          ./node_modules/.bin/vsce publish \
-            --packagePath "$GITHUB_WORKSPACE"/vsix/moonlight-core-*.vsix
-          for pkg in "$GITHUB_WORKSPACE"/vsix/*.vsix; do
-            case "$pkg" in *moonlight-core-*) continue ;; esac
+          node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" ${SKIP:+--skip "$SKIP"} | while read -r pkg; do
+            echo "--> $(basename "$pkg")"
             ./node_modules/.bin/vsce publish --packagePath "$pkg"
           done
 
@@ -91,6 +109,7 @@ jobs:
         working-directory: clients/vscode
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
+          SKIP: ${{ inputs.skip }}
         run: |
           set -euo pipefail
           if [ -z "${OVSX_PAT:-}" ]; then
@@ -103,9 +122,7 @@ jobs:
           # the first, which is not an error worth failing a release over.
           ./node_modules/.bin/ovsx create-namespace titouanfreville -p "$OVSX_PAT" \
             || echo "namespace titouanfreville already exists"
-          ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" \
-            --packagePath "$GITHUB_WORKSPACE"/vsix/moonlight-core-*.vsix
-          for pkg in "$GITHUB_WORKSPACE"/vsix/*.vsix; do
-            case "$pkg" in *moonlight-core-*) continue ;; esac
+          node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" ${SKIP:+--skip "$SKIP"} | while read -r pkg; do
+            echo "--> $(basename "$pkg")"
             ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" --packagePath "$pkg"
           done

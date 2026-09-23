@@ -1,5 +1,5 @@
 {
-  "name": "moonlight",
+  "name": "moonlight-ai",
   "displayName": "MoonlightCode",
   "description": "Governance and review for Claude Code sessions. Installs every MoonlightCode extension.",
   "version": "0.1.1",
