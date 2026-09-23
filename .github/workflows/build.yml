@@ -198,10 +198,10 @@ jobs:
   #
   # Separate from `build` on purpose: `moonlight-desktop` needs GPUI, Metal and
   # Vulkan and is therefore limited to the three targets that can build it, while
-  # `moonlightd` is headless (see apps/daemon/Cargo.toml) and runs anywhere. The
-  # VS Code extensions only ever need this binary, so tying their platform support
-  # to the desktop app's would strand Windows and Linux arm64 users for a reason
-  # that has nothing to do with them.
+  # `moonlightd` is headless (see apps/daemon/Cargo.toml) and builds on more of
+  # them. The VS Code extensions only ever need this binary, so tying their platform
+  # support to the desktop app's would strand Linux arm64 users for a reason that has
+  # nothing to do with them.
   #
   # Every target builds on its own runner rather than cross-compiling: `rusqlite`
   # is vendored with `bundled`, so each target also compiles SQLite's C sources,
@@ -225,8 +225,15 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+          # No Windows leg yet. `moonlight-control` serves the hook ControlServer
+          # over a Unix domain socket (`UnixListener`, `os::unix`,
+          # `Permissions::from_mode`), so the daemon does not compile for
+          # x86_64-pc-windows-msvc at all. Windows needs a second transport — a named
+          # pipe, or loopback TCP with a token — and a matching change to how hooks
+          # are registered; that touches the hook security boundary and belongs in its
+          # own change, not in a release matrix. The extension already handles the
+          # absence: with no Windows entry in the pins, `planInstall` reports
+          # `unsupported-platform` rather than reaching for an asset that is not there.
     steps:
       - uses: actions/checkout@v4
 

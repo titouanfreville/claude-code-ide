@@ -86,12 +86,22 @@ In the repo `DAEMON_PINS` is `undefined`, on purpose: a locally packaged `.vsix`
 never downloads and behaves the way it always has, falling back to `PATH` and the
 setting. Only CI-built packages can install a daemon.
 
-`build.yml` builds `moonlightd` for five targets — macOS arm64/x64, Linux x64/arm64,
-Windows x64 — each on its own runner rather than cross-compiled, because `rusqlite`
-is vendored with `bundled` and every target therefore also compiles SQLite's C
-sources. That matrix is wider than the desktop app's three: `moonlightd` is headless
-(no GPUI, no Metal, no Vulkan), and tying the extensions' platform support to the
-desktop app's would strand Windows for a reason that has nothing to do with them.
+`build.yml` builds `moonlightd` for four targets — macOS arm64/x64 and Linux
+x64/arm64 — each on its own runner rather than cross-compiled, because `rusqlite` is
+vendored with `bundled` and every target therefore also compiles SQLite's C sources.
+That matrix is wider than the desktop app's three: `moonlightd` is headless (no GPUI,
+no Metal, no Vulkan), so Linux arm64 costs nothing to add.
+
+Windows is **not** supported yet, and the reason is not packaging: `moonlight-control`
+serves the hook ControlServer over a Unix domain socket, so the daemon does not
+compile for `x86_64-pc-windows-msvc` at all. It needs a second transport — a named
+pipe, or loopback TCP with a token — and a matching change to hook registration.
+
+The client is nevertheless Windows-correct already, so that port is the only thing
+missing: `daemonBinaryName()` returns `moonlightd.exe` there, and `targetTriple()`
+maps `win32-x64`. With no Windows entry in the pins, `planInstall` reports
+`unsupported-platform` instead of reaching for an asset that does not exist — so the
+day the daemon compiles, adding the matrix row is the whole change.
 
 The release tag is passed in rather than derived from the version, because the
 nightly build keeps one rolling `nightly` tag whose assets are named per commit —
