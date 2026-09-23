@@ -18,3 +18,4 @@ node_modules/
 dist/
 *.vsix
 /apps/zed_based_desktop
+.ai
