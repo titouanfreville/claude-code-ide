@@ -159,7 +159,19 @@ export declare class ReviewComments {
  * unexported internals — but a version bump could still move it, so the per-file
  * path stays as a fallback.
  */
-export declare function openSessionReview(sessionId: string, title: string, items: readonly controlApi.ReviewQueueItem[], comments: ReviewComments): Promise<void>;
+/**
+ * The part of a queue item this view actually needs: which session, which file.
+ *
+ * Narrower than `ReviewQueueItem` on purpose. A review reopened after its files have
+ * left the queue is rebuilt from the comments written on them, and those carry no
+ * `touches`/`tool`/`created` — demanding the full item would mean inventing values
+ * that are not merely unused but wrong.
+ */
+export interface ReviewFile {
+    readonly session_id: string;
+    readonly file_path: string;
+}
+export declare function openSessionReview(sessionId: string, title: string, items: readonly ReviewFile[], comments: ReviewComments): Promise<void>;
 /**
  * Open one reviewed file as a diff: the session's pre-image on the left, the file as
  * it stands on the right. Kept for reviewing a single file, and as the fallback if

@@ -8,6 +8,8 @@
 import * as vscode from 'vscode';
 import * as controlApi from 'moonlight-control-client';
 
+import { windowOwnsSession } from './ownership';
+
 import { ensureDownloadedDaemon } from './daemon-install';
 import type {
   DiscoverableSession,
@@ -251,6 +253,13 @@ export function activate(context: vscode.ExtensionContext): MoonlightApi {
   return {
     version: 2,
     activeSession,
+    ownsSession: (sessionId) =>
+      windowOwnsSession(
+        sessionId,
+        activeSession()?.sessionId,
+        sessions.find((s) => s.session_id === sessionId)?.root ?? undefined,
+        (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath)
+      ),
     setPinnedSession: (sessionId) => {
       pinned = sessionId;
       void context.workspaceState.update(PIN_KEY, sessionId);

@@ -98,10 +98,15 @@ function activate(context) {
         if (pending > 0) {
             pendingBar.text = `$(comment-discussion) Send review (${pending})`;
             pendingBar.command = 'moonlight.review.submit';
-            pendingBar.tooltip = [
+            // Sending stays the click, because it is the action with a deadline. Reopening
+            // rides in the tooltip as a command link rather than a second status-bar item —
+            // the operator can get back to the diffs mid-review without the permanent second
+            // fixture that made the phase indicator iconic in the first place.
+            const reopen = new vscode.MarkdownString([
                 `${pending} comment(s) will be delivered to the session as one message.`,
-                // Settled comments are deliberately not in that number, so say where they went
-                // — a count that silently excludes things reads as comments having vanished.
+                // Settled comments are deliberately not in that number, so say where they
+                // went — a count that silently excludes things reads as comments having
+                // vanished.
                 ...(resolved > 0
                     ? [
                         '',
@@ -109,7 +114,13 @@ function activate(context) {
                         'and are shown collapsed in the diff.',
                     ]
                     : []),
-            ].join('\n');
+                '',
+                `[Reopen the diffs](command:moonlight.review.openSession${reviewTarget ? `?${encodeURIComponent(JSON.stringify([reviewTarget]))}` : ''})`,
+            ].join('\n\n'));
+            // Required for `command:` links to be clickable; the string is built here, never
+            // from anything the session wrote.
+            reopen.isTrusted = true;
+            pendingBar.tooltip = reopen;
             pendingBar.show();
             return;
         }
@@ -137,6 +148,41 @@ function activate(context) {
             'Click to open the diffs.',
         ].join('\n');
         pendingBar.show();
+    };
+    /**
+     * Reopen a review whose files have already left the queue, rebuilt from the comments
+     * written on them.
+     *
+     * Returns whether anything was opened, so the caller can fall back to saying there is
+     * nothing to review rather than opening an empty diff view.
+     *
+     * Only files that carry comments come back. The alternative — every file the session
+     * ever touched — would reopen a review the operator already finished, and buries the
+     * threads they actually came back for among files with nothing on them.
+     */
+    const reopenFromComments = async (sessionId) => {
+        if (!sessionId) {
+            return false;
+        }
+        let all;
+        try {
+            all = await controlApi.comments(sessionId);
+        }
+        catch {
+            return false;
+        }
+        // Resolved threads stay in the record and render collapsed, so a review that is
+        // entirely resolved is still worth reopening — the operator may be checking what
+        // they settled.
+        const paths = [...new Set(all.map((c) => c.path))];
+        if (paths.length === 0) {
+            return false;
+        }
+        const known = (await withCore())?.sessions().find((s) => s.session_id === sessionId);
+        reviewTarget = sessionId;
+        await (0, review_1.openSessionReview)(sessionId, known?.title ?? sessionId, paths.map((file_path) => ({ session_id: sessionId, file_path })), reviewComments);
+        await refreshPending();
+        return true;
     };
     /**
      * How the open review stands: what is queued to send, and what is already settled.
@@ -232,7 +278,16 @@ function activate(context) {
             return;
         }
         if (queue.length === 0) {
-            void vscode.window.showInformationMessage('Nothing to review — no unreviewed files.');
+            // An empty queue does not mean there is nothing to look at. Files leave the
+            // queue once they are marked reviewed, but a review with comments on it is
+            // still open — and until those comments are sent, reopening the diffs is
+            // exactly what the operator wants: to re-read what they wrote, add to it, or
+            // check a thread before submitting. Bailing here made a review unreachable the
+            // moment it stopped being new.
+            const resumed = await reopenFromComments(requested ?? reviewTarget ?? core.activeSession()?.sessionId);
+            if (!resumed) {
+                void vscode.window.showInformationMessage('Nothing to review — no unreviewed files.');
+            }
             return;
         }
         // Group by session, so the picker offers reviews rather than files.

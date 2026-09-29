@@ -2,7 +2,7 @@
   "name": "moonlight-status",
   "displayName": "MoonlightCode Status",
   "description": "Status-bar indicator for hook gating and the focused session's phase.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "publisher": "titouanfreville",
   "license": "MIT",
@@ -14,7 +14,8 @@
     "vscode": "^1.85.0"
   },
   "categories": [
-    "Other"
+    "AI",
+    "Visualization"
   ],
   "icon": "icon.png",
   "main": "./dist/extension.js",
@@ -44,5 +45,18 @@
         "title": "MoonlightCode: Refresh Claude Usage"
       }
     ]
-  }
+  },
+  "keywords": [
+    "claude",
+    "claude code",
+    "ai",
+    "agent",
+    "agentic",
+    "coding agent",
+    "moonlight",
+    "status bar",
+    "usage",
+    "quota",
+    "tokens"
+  ]
 }

@@ -99,6 +99,26 @@ async function announce(core, hold) {
     const short = hold.sessionId.slice(0, 8);
     const isPlan = hold.plan !== undefined || hold.what === 'approve plan';
     if (isPlan) {
+        // Only the window the session belongs to opens the panel by itself. Holds are
+        // fleet-wide, so every open window sees this one — and every window used to open
+        // its own plan panel for it, including windows working on something unrelated.
+        // The operator answered in one and left the rest showing a plan that was already
+        // decided.
+        //
+        // `!== false` rather than `=== true`: a core too old to answer the question keeps
+        // the previous behaviour instead of a plan panel that never opens anywhere, which
+        // is the worse failure of the two.
+        if (core.ownsSession?.(hold.sessionId) === false) {
+            // Still announced, because "the right window" is a guess — the session may have
+            // no root, or its root may be open nowhere. A held agent nobody is told about is
+            // the one outcome worth avoiding entirely.
+            const open = 'Open plan';
+            const choice = await vscode.window.showInformationMessage(`MoonlightCode: session ${short} is held on a plan (in another workspace).`, open);
+            if (choice === open) {
+                plan_view_1.PlanReviewPanel.show(core, hold.sessionId);
+            }
+            return;
+        }
         // Opened directly rather than offered behind a notification. The session is
         // *stopped* until this is answered, and a toast is the wrong shape for that: it
         // auto-dismisses, it stacks behind whatever else fired, and a plan is read rather

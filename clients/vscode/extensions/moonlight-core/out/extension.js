@@ -44,6 +44,7 @@ exports.deactivate = deactivate;
  */
 const vscode = __importStar(require("vscode"));
 const controlApi = __importStar(require("moonlight-control-client"));
+const ownership_1 = require("./ownership");
 const daemon_install_1 = require("./daemon-install");
 const gate_state_1 = require("./gate-state");
 const terminals_1 = require("./terminals");
@@ -256,6 +257,7 @@ function activate(context) {
     return {
         version: 2,
         activeSession,
+        ownsSession: (sessionId) => (0, ownership_1.windowOwnsSession)(sessionId, activeSession()?.sessionId, sessions.find((s) => s.session_id === sessionId)?.root ?? undefined, (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath)),
         setPinnedSession: (sessionId) => {
             pinned = sessionId;
             void context.workspaceState.update(PIN_KEY, sessionId);

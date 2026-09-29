@@ -495,26 +495,6 @@ class ReviewComments {
     }
 }
 exports.ReviewComments = ReviewComments;
-/**
- * Open a session's whole change set as one multi-file diff — the primary review
- * surface, and the closest VSCode equivalent of the desktop cockpit's review panel
- * or a GitHub pull request.
- *
- * You land *in the diffs*, with the file list built into the editor, rather than on
- * a list you have to click through one file at a time. Reviewing is reading the
- * change as a whole; a file picker in front of that is a step, not a feature.
- *
- * Uses the built-in `vscode.changes` command. It takes `[resource, original,
- * modified]` triples, and the "original" side is our virtual baseline document — so
- * every pane diffs against what the file looked like when the session first touched
- * it, exactly as the single-file view does.
- *
- * `vscode.changes` is a built-in command rather than typed API, so there is no
- * compile-time check on this call. It carries public metadata (VSCode's marker for a
- * documented built-in), which makes it far safer ground than another extension's
- * unexported internals — but a version bump could still move it, so the per-file
- * path stays as a fallback.
- */
 async function openSessionReview(sessionId, title, items, comments) {
     if (items.length === 0) {
         void vscode.window.showInformationMessage('Nothing to review — no unreviewed files.');

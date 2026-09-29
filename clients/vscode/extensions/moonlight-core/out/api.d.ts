@@ -77,6 +77,22 @@ export interface MoonlightApi {
      * rather than comparing.
      */
     readonly version: 1 | 2;
+    /**
+     * Whether this *window* is the one that should act on a session unprompted.
+     *
+     * Holds are fleet-wide: every open VSCode window polls the same daemon and sees the
+     * same held approvals. Without this, a session holding for a plan opened the plan
+     * panel in every window at once, including windows with nothing to do with it — the
+     * operator answered in one and watched the others sit on a stale panel.
+     *
+     * True when the session is this window's active one, or when its root is inside this
+     * window's workspace. It is a best-effort claim, not a lock: two windows with the
+     * same folder open both answer true, and neither can see the other. Anything that
+     * must happen exactly once needs the daemon to arbitrate, not this.
+     *
+     * Optional — a dependent feature-detects it rather than comparing `version`.
+     */
+    ownsSession?(sessionId: string): boolean;
     /** Last known sessions, from the shared poll. */
     sessions(): readonly DiscoverableSession[];
     /** Last known hook-gating status, from the same poll. */
