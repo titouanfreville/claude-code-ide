@@ -170,6 +170,24 @@ jobs:
             --sign "$MACOS_SIGN_IDENTITY" "$APP"
           codesign --verify --strict --verbose=2 "$APP"
 
+      # `hdiutil` needs room for a staged copy of the .app plus the compressed image,
+      # and a release build of a GPUI app leaves little of a macOS runner's disk. v0.1.3
+      # failed here with "hdiutil: create failed - No space left on device" — after a
+      # successful build, so the release shipped nothing over a packaging step.
+      #
+      # The intermediates are what go: once the bundle exists, `deps/`, `build/` and
+      # `incremental/` are spent. Deliberately after `cargo bundle` — removing them
+      # before it would make cargo rebuild the whole thing.
+      - name: Reclaim disk before packaging
+        if: matrix.kind == 'macos'
+        run: |
+          set -euo pipefail
+          df -h / | tail -1
+          rm -rf "target/${TGT}/release/deps" \
+                 "target/${TGT}/release/build" \
+                 "target/${TGT}/release/incremental"
+          df -h / | tail -1
+
       - name: Build .dmg
         if: matrix.kind == 'macos'
         run: |
@@ -177,6 +195,10 @@ jobs:
           APP="target/${TGT}/release/bundle/osx/MoonlightCode.app"
           name="MoonlightCode-${VERSION}-${TGT}"
           mkdir -p dist dmg-staging
+          # A real copy, not a symlink: `hdiutil -srcfolder` preserves symlinks rather
+          # than following them, so staging the .app by link would produce a .dmg
+          # containing a dangling one. The `/Applications` link below is meant to stay
+          # a link — that is the drag-to-install target.
           cp -R "$APP" dmg-staging/
           ln -s /Applications dmg-staging/Applications
           hdiutil create -volname "MoonlightCode" -srcfolder dmg-staging \
