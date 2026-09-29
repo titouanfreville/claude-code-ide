@@ -17,6 +17,7 @@
  */
 import * as vscode from 'vscode';
 
+import { PLAN_HOLD } from 'moonlight-control-client';
 import type { HeldApproval, MoonlightApi } from 'moonlight-core';
 
 import { requireCore } from './core';
@@ -73,7 +74,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
  */
 async function announce(core: MoonlightApi, hold: HeldApproval): Promise<void> {
   const short = hold.sessionId.slice(0, 8);
-  const isPlan = hold.plan !== undefined || hold.what === 'approve plan';
+  // The gate's own marker, not "does this hold happen to carry a plan". The held-set
+  // fold caches a session's plan so a later `ApprovalRequested` can be matched to it,
+  // and that cache outlives the hold — so `plan !== undefined` was true for every hold
+  // a session raised after its first plan, and a `Bash` approval opened the plan review
+  // panel instead of asking about the command.
+  const isPlan = hold.what === PLAN_HOLD;
 
   if (isPlan) {
     // Only the window the session belongs to opens the panel by itself. Holds are

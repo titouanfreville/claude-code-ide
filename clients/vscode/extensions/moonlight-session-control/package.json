@@ -244,6 +244,11 @@
           "default": "project",
           "markdownDescription": "How the session lists in the MoonlightCode sidebar are arranged.\n\nGrouping applies **within** the Governed and Not-adopted views — those stay separate lists. A single group is rendered flat, since one header over the whole list carries no information.",
           "scope": "resource"
+        },
+        "moonlight.session.autoAdopt": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Adopt new Claude Code sessions into MoonlightCode governance automatically, without being asked.\n\nOnly sessions belonging to **this window** are taken — the session root has to sit inside this workspace, or be the session you are working in. Every open window sees the whole fleet, so an unscoped rule would have them all racing to adopt every session.\n\n**An auto-adopted session lands on `Plan`, where project writes are denied** until you advance its phase. That is adoption’s normal behaviour, not an extra restriction — but applied automatically it means a new session stops until you act, so it is off by default."
         }
       }
     }

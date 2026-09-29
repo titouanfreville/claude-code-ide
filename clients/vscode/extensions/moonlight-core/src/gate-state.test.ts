@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { PLAN_HOLD } from 'moonlight-control-client';
+import type { EngineEvent } from 'moonlight-control-client';
+
 import { GateState } from './gate-state';
 
 /**
@@ -86,4 +89,34 @@ test('holds are listed longest-waiting first', () => {
     gate.approvals().map((hold) => hold.sessionId),
     ['early', 'late']
   );
+});
+
+test('a tool approval after a plan does not carry that plan', () => {
+  // The bug: `plans` is per session and outlives the hold that produced it, so every
+  // later hold was handed the old plan. The plan panel routes on "does this hold carry
+  // a plan", so a Bash approval opened a plan review for a plan already approved,
+  // instead of asking about the command.
+  const gate = new GateState();
+  gate.apply({ kind: 'PlanProposed', session: 's1', plan: '# Do the thing' } as EngineEvent);
+  gate.apply({ kind: 'ApprovalRequested', session: 's1', what: PLAN_HOLD } as EngineEvent);
+  assert.equal(gate.approval('s1')?.plan, '# Do the thing');
+
+  // Same session, a different kind of hold.
+  gate.apply({
+    kind: 'ApprovalRequested',
+    session: 's1',
+    what: 'run `npx js-yaml`',
+  } as EngineEvent);
+  const held = gate.approval('s1');
+  assert.equal(held?.what, 'run `npx js-yaml`');
+  assert.equal(held?.plan, undefined);
+});
+
+test('the plan stays readable on its own after the hold moves on', () => {
+  // The cache is still worth keeping — a plan outlives its verdict, and the panel
+  // reads it through `plan()`. Only the per-hold field was wrong.
+  const gate = new GateState();
+  gate.apply({ kind: 'PlanProposed', session: 's1', plan: '# Plan' } as EngineEvent);
+  gate.apply({ kind: 'ApprovalRequested', session: 's1', what: 'run `ls`' } as EngineEvent);
+  assert.equal(gate.plan('s1'), '# Plan');
 });

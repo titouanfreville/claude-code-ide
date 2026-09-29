@@ -142,3 +142,42 @@ jobs:
             echo "--> $(basename "$pkg")"
             ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" --packagePath "$pkg"
           done
+
+  # --------------------------------------------------------------------------
+  # Did the desktop app actually ship?
+  #
+  # `build` is `continue-on-error`, so a failed desktop target no longer stops the
+  # extensions reaching the marketplaces. That trade is only safe if the failure is
+  # still impossible to miss — otherwise a release quietly goes out without the
+  # macOS or Linux desktop build and nobody notices until someone tries to download
+  # it.
+  #
+  # So this runs last, after the artifacts are attached and the extensions are
+  # published, and fails the run when an expected asset is absent. The release is
+  # real and the extensions are out; the run is red and says exactly what is missing.
+  # --------------------------------------------------------------------------
+  verify-desktop:
+    needs: [version, publish]
+    if: always() && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the desktop assets reached the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$TAG" --json assets -q '.assets[].name')"
+          echo "$assets"
+          missing=0
+          for expected in \
+            "MoonlightCode-${VERSION}-aarch64-apple-darwin.dmg" \
+            "MoonlightCode-${VERSION}-x86_64-apple-darwin.dmg" \
+            "moonlight-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"; do
+            if ! printf '%s\n' "$assets" | grep -qxF "$expected"; then
+              echo "::error::missing desktop asset: $expected"
+              missing=1
+            fi
+          done
+          exit "$missing"

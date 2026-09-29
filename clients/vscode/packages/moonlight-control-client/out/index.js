@@ -33,7 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.FROZEN_PHASES = exports.subscribeEvents = exports.statusIsWaiting = exports.readFrames = exports.parseEngineEvent = exports.stateAnchor = exports.ensureDaemon = exports.discoveryPath = exports.daemonReachable = exports.daemonBinaryName = exports.controlBaseUrl = void 0;
+exports.FROZEN_PHASES = exports.PLAN_HOLD = exports.subscribeEvents = exports.statusIsWaiting = exports.readFrames = exports.parseEngineEvent = exports.stateAnchor = exports.ensureDaemon = exports.discoveryPath = exports.daemonReachable = exports.daemonBinaryName = exports.controlBaseUrl = void 0;
 exports.toThreads = toThreads;
 exports.isReviewable = isReviewable;
 exports.shortId = shortId;
@@ -97,6 +97,16 @@ function toThreads(comments) {
         replies: comments.filter((c) => c.parent_id === root.id),
     }));
 }
+/**
+ * What the gate calls a hold that is a plan proposal.
+ *
+ * The server's marker: `HoldKind::Plan` is the only hold kind that renders this string
+ * (`crates/control/src/server.rs`), and the only kind that carries a plan. It lives
+ * here, with the rest of the protocol vocabulary, so every surface that routes on it
+ * shares one constant — spelling the literal separately is how the plan panel and the
+ * held-approval fold came to disagree about what counts as a plan.
+ */
+exports.PLAN_HOLD = 'approve plan';
 /** Phases in which the PDP denies writes to project files. */
 exports.FROZEN_PHASES = ['Plan', 'Commit'];
 /**

@@ -38,6 +38,17 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # The desktop app must not be able to stop the extensions shipping. It is the
+    # heaviest thing here — GPUI, Metal, Vulkan, a .dmg — and the extensions depend on
+    # none of it; they need `daemon` and `vsix`, which are separate jobs. In v0.1.3 a
+    # packaging step ran out of disk *after* every target had compiled, and because
+    # `publish` needs this whole workflow, six built .vsix and four daemons were thrown
+    # away over a .dmg.
+    #
+    # A silent desktop failure would be its own bug, so release.yml ends with a job
+    # that checks the desktop assets actually reached the release and fails the run if
+    # they did not — after the extensions are safely out. Loud, but no longer blocking.
+    continue-on-error: true
     # Route caller-supplied values through env vars so they are never interpolated
     # directly into run: scripts (avoids shell-injection via a crafted version/tag).
     env:

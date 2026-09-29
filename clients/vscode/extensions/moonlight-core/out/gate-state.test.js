@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const strict_1 = __importDefault(require("node:assert/strict"));
 const node_test_1 = require("node:test");
+const moonlight_control_client_1 = require("moonlight-control-client");
 const gate_state_1 = require("./gate-state");
 /**
  * The failure this guards: a transcript from a session that finished hours ago
@@ -71,5 +72,32 @@ const gate_state_1 = require("./gate-state");
         { session_id: 'early', what: 'b', plan: null, mcp_tool: null, since_ms: 100 },
     ]);
     strict_1.default.deepEqual(gate.approvals().map((hold) => hold.sessionId), ['early', 'late']);
+});
+(0, node_test_1.test)('a tool approval after a plan does not carry that plan', () => {
+    // The bug: `plans` is per session and outlives the hold that produced it, so every
+    // later hold was handed the old plan. The plan panel routes on "does this hold carry
+    // a plan", so a Bash approval opened a plan review for a plan already approved,
+    // instead of asking about the command.
+    const gate = new gate_state_1.GateState();
+    gate.apply({ kind: 'PlanProposed', session: 's1', plan: '# Do the thing' });
+    gate.apply({ kind: 'ApprovalRequested', session: 's1', what: moonlight_control_client_1.PLAN_HOLD });
+    strict_1.default.equal(gate.approval('s1')?.plan, '# Do the thing');
+    // Same session, a different kind of hold.
+    gate.apply({
+        kind: 'ApprovalRequested',
+        session: 's1',
+        what: 'run `npx js-yaml`',
+    });
+    const held = gate.approval('s1');
+    strict_1.default.equal(held?.what, 'run `npx js-yaml`');
+    strict_1.default.equal(held?.plan, undefined);
+});
+(0, node_test_1.test)('the plan stays readable on its own after the hold moves on', () => {
+    // The cache is still worth keeping — a plan outlives its verdict, and the panel
+    // reads it through `plan()`. Only the per-hold field was wrong.
+    const gate = new gate_state_1.GateState();
+    gate.apply({ kind: 'PlanProposed', session: 's1', plan: '# Plan' });
+    gate.apply({ kind: 'ApprovalRequested', session: 's1', what: 'run `ls`' });
+    strict_1.default.equal(gate.plan('s1'), '# Plan');
 });
 //# sourceMappingURL=gate-state.test.js.map

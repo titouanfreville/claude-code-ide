@@ -140,6 +140,17 @@ export interface RejectResponse {
 /** Mirrors `moonlight_domain::phase::Phase`. */
 export type Phase = 'Plan' | 'AutoImplement' | 'Test' | 'Review' | 'Commit';
 
+/**
+ * What the gate calls a hold that is a plan proposal.
+ *
+ * The server's marker: `HoldKind::Plan` is the only hold kind that renders this string
+ * (`crates/control/src/server.rs`), and the only kind that carries a plan. It lives
+ * here, with the rest of the protocol vocabulary, so every surface that routes on it
+ * shares one constant — spelling the literal separately is how the plan panel and the
+ * held-approval fold came to disagree about what counts as a plan.
+ */
+export const PLAN_HOLD = 'approve plan';
+
 /** Phases in which the PDP denies writes to project files. */
 export const FROZEN_PHASES: readonly Phase[] = ['Plan', 'Commit'];
 

@@ -53,6 +53,7 @@ exports.deactivate = deactivate;
  * extension never has to reconcile its own view of what is held.
  */
 const vscode = __importStar(require("vscode"));
+const moonlight_control_client_1 = require("moonlight-control-client");
 const core_1 = require("./core");
 const gate_1 = require("./gate");
 const plan_view_1 = require("./plan-view");
@@ -97,7 +98,12 @@ async function activate(context) {
  */
 async function announce(core, hold) {
     const short = hold.sessionId.slice(0, 8);
-    const isPlan = hold.plan !== undefined || hold.what === 'approve plan';
+    // The gate's own marker, not "does this hold happen to carry a plan". The held-set
+    // fold caches a session's plan so a later `ApprovalRequested` can be matched to it,
+    // and that cache outlives the hold — so `plan !== undefined` was true for every hold
+    // a session raised after its first plan, and a `Bash` approval opened the plan review
+    // panel instead of asking about the command.
+    const isPlan = hold.what === moonlight_control_client_1.PLAN_HOLD;
     if (isPlan) {
         // Only the window the session belongs to opens the panel by itself. Holds are
         // fleet-wide, so every open window sees this one — and every window used to open

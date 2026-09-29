@@ -7,7 +7,7 @@
  * and a missing one leaves a session stopped.
  */
 import type { EngineEvent, PendingApproval } from 'moonlight-control-client';
-import { statusIsWaiting } from 'moonlight-control-client';
+import { PLAN_HOLD, statusIsWaiting } from 'moonlight-control-client';
 
 import type { HeldApproval } from './api';
 
@@ -62,7 +62,18 @@ export class GateState {
         this.held.set(event.session, {
           sessionId: event.session,
           what: event.what,
-          plan: this.plans.get(event.session),
+          // Only when *this* hold is the plan proposal. `ApprovalRequested` carries no
+          // plan of its own — the notifier publishes `PlanProposed` first and this
+          // correlates the two through `plans` — but that map is per session and
+          // deliberately outlives any one hold, so reading it unconditionally attached
+          // a long-settled plan to every later hold. A `Bash` approval then arrived
+          // carrying a plan, and the surface reading `plan !== undefined` opened the
+          // plan review panel for it: the operator was shown a plan they had already
+          // approved instead of the command they were being asked about.
+          //
+          // The server already draws this line (`HoldKind::Plan` is the only kind that
+          // carries a plan); this makes the folded event agree with it.
+          plan: event.what === PLAN_HOLD ? this.plans.get(event.session) : undefined,
           mcpTool: event.authorizeTool,
           sinceMs: now,
         });

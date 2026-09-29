@@ -17,6 +17,7 @@ import type { DiscoverableSession } from 'moonlight-control-client';
 import type { MoonlightApi } from 'moonlight-core';
 
 import { requireCore } from './core';
+import { sessionsToAdopt, staleAttempts } from './auto-adopt';
 import { nodeSession, PHASES, SessionDecorations, SessionsProvider } from './sessions-view';
 import { GroupStore } from './groups-store';
 
@@ -372,6 +373,56 @@ async function registerSessionsView(
     updateContext();
   };
 
+  /**
+   * Adopt the new sessions this window owns, when the operator has asked for it.
+   *
+   * Runs off the shared poll rather than its own timer — the poll is already the thing
+   * that learns a session exists, and a second loop would only add a way for the two
+   * to disagree about what is adopted.
+   */
+  const attempted = new Set<string>();
+  const autoAdopt = async (): Promise<void> => {
+    if (!vscode.workspace.getConfiguration('moonlight').get<boolean>('session.autoAdopt')) {
+      return;
+    }
+    // No `ownsSession` means a core too old to answer which window a session belongs
+    // to. Adopting everything would be worse than doing nothing: every open window
+    // would race on every session in the fleet.
+    if (!core.ownsSession) {
+      return;
+    }
+    const sessions = core.sessions();
+    for (const id of staleAttempts(attempted, sessions)) {
+      attempted.delete(id);
+    }
+    const owns = core.ownsSession.bind(core);
+    for (const session of sessionsToAdopt(sessions, owns, attempted)) {
+      attempted.add(session.session_id);
+      try {
+        await controlApi.adopt(session.session_id);
+        await core.refresh();
+        // Says what adoption did, not just that it happened. A session that has gone
+        // quiet because its writes are denied looks like a broken agent unless the
+        // message that governed it also says it is frozen and how to release it.
+        const advance = 'Set phase\u2026';
+        const choice = await vscode.window.showInformationMessage(
+          `Adopted "${controlApi.sessionLabel(session, sessions)}" automatically. It is on Plan, where project writes are denied.`,
+          advance
+        );
+        if (choice === advance) {
+          await vscode.commands.executeCommand('moonlight.sessionControl.setPhase');
+        }
+      } catch (err) {
+        // Left in `attempted`: a failing adopt endpoint retried every five seconds is
+        // a request storm, and the operator can still adopt by hand.
+        void vscode.window.showWarningMessage(
+          `MoonlightCode could not auto-adopt a session: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+  };
+
+  context.subscriptions.push(core.onDidChange(() => void autoAdopt()));
   context.subscriptions.push(core.onDidChange(redraw));
   if (core.onDidChangeHeldApprovals) {
     context.subscriptions.push(core.onDidChangeHeldApprovals(redraw));
