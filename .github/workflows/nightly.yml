@@ -11,9 +11,13 @@ concurrency:
   group: nightly
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   version:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
@@ -33,6 +37,7 @@ jobs:
   publish:
     needs: [version, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -60,3 +65,39 @@ jobs:
           body: "Rolling nightly build from `main` (${{ needs.version.outputs.version }}). Unstable."
           fail_on_unmatched_files: true
           files: artifacts/*
+
+  # The same check release.yml runs, on the path that runs first.
+  #
+  # `build` is `continue-on-error` so a failed desktop target cannot stop the extensions
+  # shipping — but that job lives in the shared build.yml, called by this workflow too,
+  # while the compensating check existed only for tags. So a desktop failure on main
+  # produced a green nightly with the .dmg silently missing: `fail_on_unmatched_files`
+  # is satisfied by the daemons and .vsix alone. Nightly is the canary for main, and
+  # that removed the signal exactly where it was cheapest to see.
+  verify-desktop:
+    needs: [version, publish]
+    if: always() && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check the desktop assets reached the nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view nightly --json assets -q '.assets[].name')"
+          echo "$assets"
+          missing=0
+          for expected in \
+            "MoonlightCode-${VERSION}-aarch64-apple-darwin.dmg" \
+            "MoonlightCode-${VERSION}-x86_64-apple-darwin.dmg" \
+            "moonlight-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"; do
+            if ! printf '%s\n' "$assets" | grep -qxF "$expected"; then
+              echo "::error::missing desktop asset: $expected"
+              missing=1
+            fi
+          done
+          exit "$missing"

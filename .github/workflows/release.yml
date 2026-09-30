@@ -15,10 +15,32 @@ on:
         description: Existing tag to build and release from (e.g. v0.1.1)
         required: true
         type: string
+      skip:
+        description: >-
+          Comma-separated extension names to leave out of the marketplace publish, for
+          re-running a release whose publish half-succeeded. A marketplace rejects
+          re-publishing a version it already has, so without this the first already-live
+          extension fails the step and the ones still missing never go out.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+# Queue, never cancel. `workflow_dispatch` means a hand-dispatched repair can now
+# overlap the tag-push run for the same tag; both reach `marketplace`, both call
+# `vsce publish` for the same version, and the loser fails partway through — leaving
+# exactly the half-published state `publish-marketplace.yml`'s `--skip` exists to clean
+# up. Cancelling instead would be worse: it can stop a publish mid-sequence.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   version:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
@@ -47,6 +69,7 @@ jobs:
   publish:
     needs: [version, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -83,6 +106,7 @@ jobs:
   marketplace:
     needs: [version, build, publish]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       # The tag, not the dispatching branch: this checkout only supplies the lockfile
       # that `npm ci` installs vsce/ovsx from, and those should be the versions the
@@ -111,13 +135,28 @@ jobs:
         working-directory: clients/vscode
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          SKIP: ${{ inputs.skip }}
         run: |
           set -euo pipefail
+          # A missing token is only benign when nobody configured one — a fork, or a
+          # repo before its secrets are set. On a tag push in a repo that has published
+          # before, it is an expired PAT, and warning past it produced a green run that
+          # shipped nothing: the exact failure publish-marketplace.yml was written to
+          # repair. `github.event_name` tells the two apart.
           if [ -z "${VSCE_PAT:-}" ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "::error::VSCE_PAT is not set — this run was asked to publish."
+              exit 1
+            fi
             echo "::warning::VSCE_PAT is not set — skipping the VS Marketplace publish."
             exit 0
           fi
-          node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" | while read -r pkg; do
+          # Fails on a bad or expired token before anything is live, rather than
+          # partway through a set where some extensions already published.
+          ./node_modules/.bin/vsce verify-pat titouanfreville
+          args=()
+          [ -n "${SKIP:-}" ] && args=(--skip "$SKIP")
+          node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" "${args[@]}" | while read -r pkg; do
             echo "--> $(basename "$pkg")"
             ./node_modules/.bin/vsce publish --packagePath "$pkg"
           done
@@ -126,6 +165,7 @@ jobs:
         working-directory: clients/vscode
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
+          SKIP: ${{ inputs.skip }}
         run: |
           set -euo pipefail
           if [ -z "${OVSX_PAT:-}" ]; then
@@ -134,13 +174,21 @@ jobs:
           fi
           # Open VSX rejects a publish into a namespace that does not exist yet, and
           # unlike the VS Marketplace it is not created by registering a publisher.
-          # Creating it is idempotent in effect: it already exists on every run after
-          # the first, which is not an error worth failing a release over.
-          ./node_modules/.bin/ovsx create-namespace titouanfreville -p "$OVSX_PAT" \
-            || echo "namespace titouanfreville already exists"
-          node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" | while read -r pkg; do
+          # Tolerated only for "it already exists": swallowing every failure hid an
+          # authentication error behind the benign case, in a job that goes to the
+          # trouble of verifying the other registry's token first.
+          if ! ./node_modules/.bin/ovsx create-namespace titouanfreville 2>namespace.err; then
+            grep -qiE "already (exists|owned)" namespace.err \
+              || { echo "::error::could not create the Open VSX namespace:"; cat namespace.err; exit 1; }
+            echo "namespace titouanfreville already exists"
+          fi
+          args=()
+          [ -n "${SKIP:-}" ] && args=(--skip "$SKIP")
+          # No `-p`: ovsx reads OVSX_PAT from the environment, and passing it as an
+          # argument puts a live marketplace token in the process argument list.
+          node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" "${args[@]}" | while read -r pkg; do
             echo "--> $(basename "$pkg")"
-            ./node_modules/.bin/ovsx publish -p "$OVSX_PAT" --packagePath "$pkg"
+            ./node_modules/.bin/ovsx publish --packagePath "$pkg"
           done
 
   # --------------------------------------------------------------------------
@@ -157,9 +205,16 @@ jobs:
   # real and the extensions are out; the run is red and says exactly what is missing.
   # --------------------------------------------------------------------------
   verify-desktop:
-    needs: [version, publish]
+    # `marketplace` included so this genuinely runs last, as its comment claims. With
+    # only [version, publish] it ran *concurrently* with the publish it says it follows,
+    # so a red result could land while extensions were still going out — and anyone
+    # reasoning "the run is red, so nothing shipped" would have been wrong.
+    needs: [version, publish, marketplace]
     if: always() && needs.publish.result == 'success'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - name: Check the desktop assets reached the release
         env:

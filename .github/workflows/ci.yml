@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -12,6 +15,7 @@ jobs:
   # Formatting + domain-purity are OS-independent — run once on Linux (cheapest).
   format:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,6 +32,7 @@ jobs:
   # platform-gated code (Metal vs Vulkan, PTY, etc.) only compiles on its own OS.
   test:
     name: test (${{ matrix.os }})
+    timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -75,3 +80,35 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all
+
+  # The VS Code extensions, on every pull request.
+  #
+  # Until now `npm test` ran in exactly one place: the `vsix` job inside build.yml,
+  # which runs only on a tag or a push to main. So the TypeScript was neither compiled
+  # nor tested on any PR — a broken `ownership.test.ts`, or code that does not typecheck
+  # at all, reached main green and surfaced mid-release, in the middle of the publish
+  # sequence those very tests exist to make trustworthy.
+  #
+  # `npm test` runs `npm run compile` first, so this is the type check as well.
+  vscode:
+    name: vscode extensions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install
+        working-directory: clients/vscode
+        run: npm ci
+      - name: Test
+        working-directory: clients/vscode
+        run: npm test
+      # Reported, not enforced: advisories appear without anything in this repo
+      # changing, and a PR turned red by someone else's publish is how a security
+      # signal gets trained away.
+      - name: Audit
+        working-directory: clients/vscode
+        continue-on-error: true
+        run: npm audit --audit-level=high
