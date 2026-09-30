@@ -13,7 +13,7 @@
     "package": "npm run package --workspaces --if-present",
     "publish:vsce": "npm run publish:vsce --workspaces --if-present",
     "publish:ovsx": "npm run publish:ovsx --workspaces --if-present",
-    "test": "npm run compile && npm run test --workspaces --if-present",
+    "test": "npm run compile && npm run test --workspaces --if-present && node --test scripts/",
     "link:local": "node scripts/link-local.js",
     "postinstall": "node scripts/link-local.js",
     "bundle": "npm run bundle --workspaces --if-present"

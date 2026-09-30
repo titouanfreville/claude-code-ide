@@ -252,9 +252,16 @@ jobs:
   # support to the desktop app's would strand Linux arm64 users for a reason that has
   # nothing to do with them.
   #
-  # Every target builds on its own runner rather than cross-compiling: `rusqlite`
-  # is vendored with `bundled`, so each target also compiles SQLite's C sources,
-  # and a native toolchain avoids maintaining five cross-linker setups.
+  # Each target gets a runner of its own architecture where one exists, because
+  # `rusqlite` is vendored with `bundled` and every target therefore also compiles
+  # SQLite's C sources — a native toolchain avoids maintaining cross-linker setups for
+  # each of them.
+  #
+  # The exception is `x86_64-apple-darwin`, built on the arm64 `macos-14` runner:
+  # GitHub retired the Intel macOS image, and clang targets both slices, so this leg is
+  # a genuine cross-compile. Said explicitly because the first version of this comment
+  # claimed every target was native, which is the kind of false assurance that stops
+  # someone looking when an Intel-only failure shows up.
   # --------------------------------------------------------------------------
   daemon:
     name: daemon (${{ matrix.target }})

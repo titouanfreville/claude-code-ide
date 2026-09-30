@@ -8,3 +8,6 @@ tsconfig.json
 **/*.ts
 .gitignore
 .vscodeignore
+
+# A packaged .vsix in the extension root would otherwise be packed into the next one.
+*.vsix

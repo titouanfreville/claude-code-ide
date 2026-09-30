@@ -33,7 +33,8 @@
     "bundle": "node ../../scripts/esbuild.js",
     "package": "vsce package --no-dependencies",
     "publish:vsce": "vsce publish --no-dependencies",
-    "publish:ovsx": "ovsx publish --no-dependencies"
+    "publish:ovsx": "ovsx publish --no-dependencies",
+    "test": "node --test out"
   },
   "extensionDependencies": [
     "titouanfreville.moonlight-core"

@@ -34,10 +34,16 @@ addition to core into a silent shutdown of the extensions that did not need it.
 
 ## Publishing
 
-Not published yet, but the manifests are ready: the six extensions are `0.1.1`, MIT,
-and carry the IDE's own icon (`icon.png`, cropped square from the repo-root original
-that `apps/desktop` embeds). Each ships its own `LICENSE` — a `.vsix` only packages
-files under the extension root, so one copy per extension is the only way it travels.
+Published to the VS Marketplace and Open VSX under the `titouanfreville` publisher, MIT,
+carrying the IDE's own icon (`icon.png`, cropped square from the repo-root original that
+`apps/desktop` embeds). Each ships its own `LICENSE` — a `.vsix` only packages files
+under the extension root, so one copy per extension is the only way it travels.
+
+The pack is `moonlight-ai`, not `moonlight`: that name belongs to another publisher, and
+extension names are globally unique on the VS Marketplace regardless of publisher. The
+rename means `titouanfreville.moonlight` — published once, at 0.1.1 — is a **separate,
+orphaned listing**. Nobody who installed it gets any later version, and there is no
+upgrade path from it; it needs deprecating by hand in the publisher management page.
 
 `packages/moonlight-control-client` deliberately stays `private: true`. It is not a
 marketplace artifact, and the flag is what stops an absent-minded `npm publish` from

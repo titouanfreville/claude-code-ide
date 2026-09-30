@@ -21,7 +21,8 @@
   "scripts": {
     "package": "vsce package --no-dependencies",
     "publish:vsce": "vsce publish --no-dependencies",
-    "publish:ovsx": "ovsx publish --no-dependencies"
+    "publish:ovsx": "ovsx publish --no-dependencies",
+    "test": "echo \"extension pack: no code to test\""
   },
   "extensionPack": [
     "titouanfreville.moonlight-core",

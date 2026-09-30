@@ -1,3 +1,6 @@
 # Extension pack: the manifest is the whole artifact.
 node_modules/**
 .vscodeignore
+
+# A packaged .vsix in the extension root would otherwise be packed into the next one.
+*.vsix
