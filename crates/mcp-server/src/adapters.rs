@@ -225,6 +225,47 @@ fn now() -> Timestamp {
     Timestamp::from_millis(ms)
 }
 
+/// Turn an operator verdict into a resolved hook where one is held.
+///
+/// A held `PreToolUse` waits on a oneshot in [`PendingApprovals`], not on the
+/// supervisor. A verdict sent straight to the supervisor therefore leaves the hook
+/// hanging until Claude Code's own timeout, which the operator experiences as their
+/// click doing nothing. Every command from a client must pass through here first.
+///
+/// Returns `Some(command)` when nothing was held, so the caller forwards it unchanged
+/// and the supervisor's own approve/deny path (feedback, resume) runs.
+pub fn route_approval(
+    pending: &moonlight_control::PendingApprovals,
+    bus: &EngineBus,
+    command: Command,
+) -> Option<Command> {
+    use moonlight_control::Decision;
+    use moonlight_domain::session::SessionStatus;
+
+    let (session, decision) = match &command {
+        Command::ApproveAction { session } => (session.clone(), Decision::Approve),
+        Command::DenyAction { session, reason } => (
+            session.clone(),
+            Decision::Deny {
+                reason: reason.clone(),
+            },
+        ),
+        _ => return Some(command),
+    };
+
+    if pending.resolve(&session, decision) {
+        // Publishing this is what clears a cockpit's pending state; without it the UI
+        // keeps offering a decision that has already been made.
+        bus.publish(EngineEvent::SessionStateChanged {
+            session,
+            status: SessionStatus::Running,
+        });
+        None
+    } else {
+        Some(command)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,46 +413,5 @@ mod tests {
             |e| matches!(&e.action, AuditAction::VerbExecuted { summary, .. }
                 if summary.contains("5 passed"))
         ));
-    }
-}
-
-/// Turn an operator verdict into a resolved hook where one is held.
-///
-/// A held `PreToolUse` waits on a oneshot in [`PendingApprovals`], not on the
-/// supervisor. A verdict sent straight to the supervisor therefore leaves the hook
-/// hanging until Claude Code's own timeout, which the operator experiences as their
-/// click doing nothing. Every command from a client must pass through here first.
-///
-/// Returns `Some(command)` when nothing was held, so the caller forwards it unchanged
-/// and the supervisor's own approve/deny path (feedback, resume) runs.
-pub fn route_approval(
-    pending: &moonlight_control::PendingApprovals,
-    bus: &EngineBus,
-    command: Command,
-) -> Option<Command> {
-    use moonlight_control::Decision;
-    use moonlight_domain::session::SessionStatus;
-
-    let (session, decision) = match &command {
-        Command::ApproveAction { session } => (session.clone(), Decision::Approve),
-        Command::DenyAction { session, reason } => (
-            session.clone(),
-            Decision::Deny {
-                reason: reason.clone(),
-            },
-        ),
-        _ => return Some(command),
-    };
-
-    if pending.resolve(&session, decision) {
-        // Publishing this is what clears a cockpit's pending state; without it the UI
-        // keeps offering a decision that has already been made.
-        bus.publish(EngineEvent::SessionStateChanged {
-            session,
-            status: SessionStatus::Running,
-        });
-        None
-    } else {
-        Some(command)
     }
 }

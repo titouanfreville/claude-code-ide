@@ -24,8 +24,14 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Domain purity (no tokio/io/gpui in domain)
+        # Comments stripped first. The manifest documents the rule in a comment that
+        # names the very crates it forbids — "NO tokio, NO I/O, NO GPUI (enforced in
+        # CI)" — so the check was failing on its own explanatory note while the
+        # dependency list was clean. A gate that fires on prose teaches people to
+        # ignore it.
         run: |
-          ! grep -E '(^|[^-])(tokio|gpui|reqwest|sqlx|rusqlite)\b' crates/domain/Cargo.toml \
+          ! sed 's/#.*//' crates/domain/Cargo.toml \
+            | grep -E '(^|[^-])(tokio|gpui|reqwest|sqlx|rusqlite)\b' \
             || (echo "domain must stay pure (no I/O/runtime/UI deps)"; exit 1)
 
   # Clippy + tests on both platforms — the app must support macOS and Linux, and

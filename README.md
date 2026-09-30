@@ -1,5 +1,13 @@
 # MoonlightCode
 
+[![CI](https://github.com/titouanfreville/moonlight-ide-plugins/actions/workflows/ci.yml/badge.svg)](https://github.com/titouanfreville/moonlight-ide-plugins/actions/workflows/ci.yml)
+[![Nightly](https://github.com/titouanfreville/moonlight-ide-plugins/actions/workflows/nightly.yml/badge.svg)](https://github.com/titouanfreville/moonlight-ide-plugins/actions/workflows/nightly.yml)
+[![Release](https://github.com/titouanfreville/moonlight-ide-plugins/actions/workflows/release.yml/badge.svg)](https://github.com/titouanfreville/moonlight-ide-plugins/actions/workflows/release.yml)
+[![Latest release](https://img.shields.io/github/v/release/titouanfreville/moonlight-ide-plugins?label=release&sort=semver)](https://github.com/titouanfreville/moonlight-ide-plugins/releases/latest)
+[![VS Marketplace](https://vsmarketplacebadges.dev/version-short/titouanfreville.moonlight-ai.svg?label=VS%20Marketplace&color=blue)](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-ai)
+[![Open VSX](https://img.shields.io/open-vsx/v/titouanfreville/moonlight-ai?label=Open%20VSX)](https://open-vsx.org/extension/titouanfreville/moonlight-ai)
+![License](https://img.shields.io/badge/license-MIT-blue)
+
 Governance for a fleet of Claude Code sessions. Sessions are center-stage, and the
 workflow is a state machine — Plan → Auto → Test → Review → Commit — where Claude acts
 through an MCP server under graduated trust tiers. Local-first, zero-telemetry.
@@ -52,13 +60,13 @@ connection, four features, and a pack that installs the set.
 code --install-extension titouanfreville.moonlight-ai
 ```
 
-| Extension | What it adds |
-| --- | --- |
-| [`moonlight-core`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-core) | The shared connection, session state and owned terminals. Everything else depends on it. |
-| [`moonlight-status`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-status) | Gating indicator and Claude usage readout in the status bar. |
-| [`moonlight-session-control`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-session-control) | Adopt sessions, set their phase, start governed ones. |
-| [`moonlight-ai-review`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-ai-review) | Review a session's diff against its own baseline, with inline comments delivered back to it. |
-| [`moonlight-agentic-support`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-agentic-support) | The plan gate and held approvals — where a blocked session is answered. |
+| Extension | Version | What it adds |
+| --- | --- | --- |
+| [`moonlight-core`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-core) | [![v](https://vsmarketplacebadges.dev/version-short/titouanfreville.moonlight-core.svg?label=)](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-core) | The shared connection, session state and owned terminals. Everything else depends on it. |
+| [`moonlight-status`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-status) | [![v](https://vsmarketplacebadges.dev/version-short/titouanfreville.moonlight-status.svg?label=)](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-status) | Gating indicator and Claude usage readout in the status bar. |
+| [`moonlight-session-control`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-session-control) | [![v](https://vsmarketplacebadges.dev/version-short/titouanfreville.moonlight-session-control.svg?label=)](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-session-control) | Adopt sessions, set their phase, start governed ones. |
+| [`moonlight-ai-review`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-ai-review) | [![v](https://vsmarketplacebadges.dev/version-short/titouanfreville.moonlight-ai-review.svg?label=)](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-ai-review) | Review a session's diff against its own baseline, with inline comments delivered back to it. |
+| [`moonlight-agentic-support`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-agentic-support) | [![v](https://vsmarketplacebadges.dev/version-short/titouanfreville.moonlight-agentic-support.svg?label=)](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-agentic-support) | The plan gate and held approvals — where a blocked session is answered. |
 
 You do not need the desktop app to use these. On first run, if no daemon is reachable
 and none is on `PATH`, `moonlight-core` downloads `moonlightd` for your platform,
