@@ -381,7 +381,16 @@ async function registerSessionsView(
    * to disagree about what is adopted.
    */
   const attempted = new Set<string>();
+  // This function is the `onDidChange` handler *and* it calls `core.refresh()`, which
+  // fires `onDidChange`. Without a guard the refresh re-entered it mid-loop, while the
+  // outer pass still held a snapshot taken before the re-entrant one marked anything
+  // attempted — so a second owned session in the same poll was adopted twice, with two
+  // notifications for it.
+  let adopting = false;
   const autoAdopt = async (): Promise<void> => {
+    if (adopting) {
+      return;
+    }
     if (!vscode.workspace.getConfiguration('moonlight').get<boolean>('session.autoAdopt')) {
       return;
     }
@@ -396,29 +405,52 @@ async function registerSessionsView(
       attempted.delete(id);
     }
     const owns = core.ownsSession.bind(core);
-    for (const session of sessionsToAdopt(sessions, owns, attempted)) {
-      attempted.add(session.session_id);
-      try {
-        await controlApi.adopt(session.session_id);
-        await core.refresh();
-        // Says what adoption did, not just that it happened. A session that has gone
-        // quiet because its writes are denied looks like a broken agent unless the
-        // message that governed it also says it is frozen and how to release it.
-        const advance = 'Set phase\u2026';
-        const choice = await vscode.window.showInformationMessage(
-          `Adopted "${controlApi.sessionLabel(session, sessions)}" automatically. It is on Plan, where project writes are denied.`,
-          advance
-        );
-        if (choice === advance) {
-          await vscode.commands.executeCommand('moonlight.sessionControl.setPhase');
+    const taking = sessionsToAdopt(sessions, owns, attempted);
+    if (taking.length === 0) {
+      return;
+    }
+    adopting = true;
+    try {
+      for (const session of taking) {
+        attempted.add(session.session_id);
+        try {
+          await controlApi.adopt(session.session_id);
+          // Says what adoption did, not just that it happened. A session that has gone
+          // quiet because its writes are denied looks like a broken agent unless the
+          // message that governed it also says it is frozen and how to release it.
+          //
+          // Not awaited: the operator reads this when they get to it, and awaiting it
+          // left every other owned session unadopted until they dismissed the first
+          // toast.
+          const advance = 'Set phase\u2026';
+          void vscode.window
+            .showInformationMessage(
+              `Adopted "${controlApi.sessionLabel(session, sessions)}" automatically. It is on Plan, where project writes are denied.`,
+              advance
+            )
+            .then((choice) => {
+              if (choice !== advance) {
+                return;
+              }
+              // The session-scoped command, carrying the session this toast is about.
+              // `moonlight.sessionControl.setPhase` takes no argument and re-resolves
+              // the target itself, so it would have set the phase of whichever session
+              // is active \u2014 quietly, and not the one just adopted.
+              void vscode.commands.executeCommand('moonlight.sessions.setPhase', nodeSession(session));
+            });
+        } catch (err) {
+          // Left in `attempted`: a failing adopt endpoint retried every five seconds is
+          // a request storm, and the operator can still adopt by hand.
+          void vscode.window.showWarningMessage(
+            `MoonlightCode could not auto-adopt a session: ${err instanceof Error ? err.message : String(err)}`
+          );
         }
-      } catch (err) {
-        // Left in `attempted`: a failing adopt endpoint retried every five seconds is
-        // a request storm, and the operator can still adopt by hand.
-        void vscode.window.showWarningMessage(
-          `MoonlightCode could not auto-adopt a session: ${err instanceof Error ? err.message : String(err)}`
-        );
       }
+      // Once, after the whole pass. Inside the loop this re-entered `autoAdopt`
+      // through `onDidChange` before the remaining sessions were marked.
+      await core.refresh();
+    } finally {
+      adopting = false;
     }
   };
 

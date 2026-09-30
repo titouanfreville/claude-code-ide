@@ -13,6 +13,7 @@
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.resolveReviewSession = resolveReviewSession;
+exports.reviewFilesFromComments = reviewFilesFromComments;
 /**
  * The session whose diffs to open, or `undefined` when the operator has to be asked.
  *
@@ -40,5 +41,19 @@ function resolveReviewSession(requested, active, withChanges) {
     // Several sessions have changes and none of them is the obvious one — the only case
     // where the operator genuinely has to choose.
     return undefined;
+}
+/**
+ * The files to reopen for a finished review, from the comments written on it.
+ *
+ * Pure so the decision behind "a review stops being reachable once its files leave the
+ * queue" is asserted rather than left in a callback — it fails *quietly*, back into the
+ * exact "Nothing to review" message it was added to replace, so nothing would notice.
+ *
+ * `Review`-scoped comments are excluded: they are about the review rather than a file
+ * and carry no meaningful path, so counting them would open a diff for `''` and make an
+ * empty review look reopenable.
+ */
+function reviewFilesFromComments(comments) {
+    return [...new Set(comments.filter((c) => c.scope !== 'Review' && c.path).map((c) => c.path))];
 }
 //# sourceMappingURL=target.js.map

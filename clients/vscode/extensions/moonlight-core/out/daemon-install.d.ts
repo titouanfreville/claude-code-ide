@@ -35,13 +35,19 @@ export type InstallResult = {
  * be tested directly; the network path below is then only the part that genuinely
  * needs a network.
  */
-export declare function planInstall(pins: DaemonPins | undefined, target: string | undefined, cachedExists: boolean): {
-    action: 'download';
-    tag: string;
-    version: string;
-    target: string;
-    sha256: string;
-} | InstallResult;
+export interface DownloadPlan {
+    readonly action: 'download';
+    readonly tag: string;
+    readonly version: string;
+    readonly target: string;
+    /** SHA-256 of the gzipped asset, checked before decompressing. */
+    readonly asset: string;
+    /** SHA-256 of the decompressed binary, checked again on every reuse. */
+    readonly binary: string;
+    /** A binary is already on disk; verify it rather than fetching again. */
+    readonly cached: boolean;
+}
+export declare function planInstall(pins: DaemonPins | undefined, target: string | undefined, cachedExists: boolean): DownloadPlan | InstallResult;
 /** Lowercase hex SHA-256, the form the pins are generated in. */
 export declare function sha256(data: Buffer): string;
 /**

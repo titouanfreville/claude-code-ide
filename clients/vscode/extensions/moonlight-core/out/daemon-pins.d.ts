@@ -21,7 +21,19 @@ export interface DaemonPins {
      * `v${version}` is a tag that exists only for versioned releases.
      */
     readonly tag: string;
-    /** Rust target triple -> SHA-256 of the gzipped asset, lowercase hex. */
-    readonly assets: Readonly<Record<string, string>>;
+    /**
+     * Rust target triple -> the two hashes that target's daemon must match.
+     *
+     * Two, because they are checked at different moments against different bytes.
+     * `asset` is the gzipped download and is verified *before* decompressing, so a
+     * substituted or corrupt asset is never handed to gunzip. `binary` is the
+     * decompressed executable, and is what lets a cached daemon be re-verified on every
+     * activation — the download hash cannot do that, because gzip is not reproducible
+     * and the file on disk is no longer the bytes that were fetched.
+     */
+    readonly assets: Readonly<Record<string, {
+        readonly asset: string;
+        readonly binary: string;
+    }>>;
 }
 export declare const DAEMON_PINS: DaemonPins | undefined;

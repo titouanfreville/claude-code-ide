@@ -84,13 +84,27 @@ function activate(context) {
     let downloadedDaemon;
     let installing;
     /**
+     * Earliest time a failed install may be tried again.
+     *
+     * The guard used to read only `downloadedDaemon || installing`, neither of which a
+     * failure sets — so a 404 or a checksum mismatch re-fetched the whole asset on every
+     * five-second tick, forever. `nightly.yml` deletes and recreates its release on each
+     * push, which makes that 404 permanent for a nightly-pinned build: a request storm
+     * against GitHub with no end and no way for the operator to see why.
+     *
+     * Ten minutes, and the state is per window, so quitting and reopening retries at
+     * once — the two moments when a retry is actually worth something.
+     */
+    let retryInstallAfter = 0;
+    const INSTALL_RETRY_MS = 10 * 60_000;
+    /**
      * Fetch the daemon the first time `PATH` turns up empty.
      *
      * Only on `no-binary`: an operator who pointed at their own build, or turned
      * autostart off, has already answered the question this would be asking.
      */
     const installDaemon = () => {
-        if (downloadedDaemon || installing) {
+        if (downloadedDaemon || installing || Date.now() < retryInstallAfter) {
             return;
         }
         installing = (async () => {
@@ -99,7 +113,11 @@ function activate(context) {
                 downloadedDaemon = result.binary;
             }
             else if (result.kind === 'failed') {
-                console.warn(`[moonlight] daemon download failed: ${result.error}`);
+                retryInstallAfter = Date.now() + INSTALL_RETRY_MS;
+                // Surfaced, not just logged. This path exists for people who have nothing but
+                // the extension, so "no backend" with the reason buried in a console they
+                // never open is the one audience it cannot afford to fail silently for.
+                void vscode.window.showWarningMessage(`MoonlightCode could not download moonlightd: ${result.error}`);
             }
         })().finally(() => {
             installing = undefined;

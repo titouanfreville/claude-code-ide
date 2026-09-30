@@ -20,11 +20,20 @@ exports.windowOwnsSession = windowOwnsSession;
  * open on `/work/app`. Equal paths count: a window opened directly on the session's
  * own root is the clearest possible owner.
  */
-function isInside(root, folder) {
-    const norm = (p) => p.replace(/[/\\]+$/, '').split(/[/\\]/).filter(Boolean);
+function isInside(root, folder, platform = process.platform) {
+    // Case-folded off Linux. macOS volumes are case-insensitive by default and Windows
+    // always is — and on Windows the drive letter's case genuinely differs between the
+    // APIs a root and a workspace folder come from. Comparing exactly there meant a
+    // window disowning its own session: no plan panel anywhere, auto-adopt silently
+    // adopting nothing.
+    const fold = platform === 'linux' ? (s) => s : (s) => s.toLowerCase();
+    const norm = (p) => p.replace(/[/\\]+$/, '').split(/[/\\]/).filter(Boolean).map(fold);
     const r = norm(root);
     const f = norm(folder);
-    if (f.length > r.length) {
+    // An empty folder is not the filesystem root, it is a missing value. `every` on an
+    // empty list is vacuously true, so without this an empty string claimed every
+    // session in the fleet.
+    if (f.length === 0 || f.length > r.length) {
         return false;
     }
     return f.every((segment, i) => segment === r[i]);
@@ -41,13 +50,13 @@ function isInside(root, folder) {
  * and cannot see each other; anything needing exactly-once has to be arbitrated by the
  * daemon, which is the only party that sees the whole fleet.
  */
-function windowOwnsSession(sessionId, activeSessionId, sessionRoot, workspaceFolders) {
+function windowOwnsSession(sessionId, activeSessionId, sessionRoot, workspaceFolders, platform = process.platform) {
     if (activeSessionId === sessionId) {
         return true;
     }
     if (!sessionRoot) {
         return false;
     }
-    return workspaceFolders.some((folder) => isInside(sessionRoot, folder));
+    return workspaceFolders.some((folder) => isInside(sessionRoot, folder, platform));
 }
 //# sourceMappingURL=ownership.js.map

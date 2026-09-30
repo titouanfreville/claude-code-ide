@@ -43,3 +43,20 @@ export function resolveReviewSession(
   // where the operator genuinely has to choose.
   return undefined;
 }
+
+/**
+ * The files to reopen for a finished review, from the comments written on it.
+ *
+ * Pure so the decision behind "a review stops being reachable once its files leave the
+ * queue" is asserted rather than left in a callback — it fails *quietly*, back into the
+ * exact "Nothing to review" message it was added to replace, so nothing would notice.
+ *
+ * `Review`-scoped comments are excluded: they are about the review rather than a file
+ * and carry no meaningful path, so counting them would open a diff for `''` and make an
+ * empty review look reopenable.
+ */
+export function reviewFilesFromComments(
+  comments: readonly { readonly scope: string; readonly path: string }[]
+): readonly string[] {
+  return [...new Set(comments.filter((c) => c.scope !== 'Review' && c.path).map((c) => c.path))];
+}

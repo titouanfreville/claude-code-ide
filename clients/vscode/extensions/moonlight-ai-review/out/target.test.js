@@ -38,4 +38,20 @@ const queued = (...ids) => new Set(ids);
 (0, node_test_1.test)('an empty queue never yields a session', () => {
     strict_1.default.equal((0, target_1.resolveReviewSession)('a', 'b', queued()), undefined);
 });
+(0, node_test_1.test)('reopening takes the distinct files that carry comments', () => {
+    strict_1.default.deepEqual((0, target_1.reviewFilesFromComments)([
+        { scope: 'Line', path: 'a.ts' },
+        { scope: 'Line', path: 'a.ts' },
+        { scope: 'File', path: 'b.ts' },
+    ]), ['a.ts', 'b.ts']);
+});
+(0, node_test_1.test)('resolved threads still count as worth reopening', () => {
+    // They render collapsed and are often exactly what the operator came back to check,
+    // so a fully resolved review is still reachable.
+    strict_1.default.deepEqual((0, target_1.reviewFilesFromComments)([{ scope: 'Line', path: 'a.ts' }]), ['a.ts']);
+});
+(0, node_test_1.test)('a review-scoped comment is not a file to open', () => {
+    strict_1.default.deepEqual((0, target_1.reviewFilesFromComments)([{ scope: 'Review', path: '' }]), []);
+    strict_1.default.deepEqual((0, target_1.reviewFilesFromComments)([]), []);
+});
 //# sourceMappingURL=target.test.js.map

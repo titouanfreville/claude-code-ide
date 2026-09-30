@@ -17,11 +17,20 @@
  * open on `/work/app`. Equal paths count: a window opened directly on the session's
  * own root is the clearest possible owner.
  */
-export function isInside(root: string, folder: string): boolean {
-  const norm = (p: string) => p.replace(/[/\\]+$/, '').split(/[/\\]/).filter(Boolean);
+export function isInside(root: string, folder: string, platform: string = process.platform): boolean {
+  // Case-folded off Linux. macOS volumes are case-insensitive by default and Windows
+  // always is — and on Windows the drive letter's case genuinely differs between the
+  // APIs a root and a workspace folder come from. Comparing exactly there meant a
+  // window disowning its own session: no plan panel anywhere, auto-adopt silently
+  // adopting nothing.
+  const fold = platform === 'linux' ? (s: string) => s : (s: string) => s.toLowerCase();
+  const norm = (p: string) => p.replace(/[/\\]+$/, '').split(/[/\\]/).filter(Boolean).map(fold);
   const r = norm(root);
   const f = norm(folder);
-  if (f.length > r.length) {
+  // An empty folder is not the filesystem root, it is a missing value. `every` on an
+  // empty list is vacuously true, so without this an empty string claimed every
+  // session in the fleet.
+  if (f.length === 0 || f.length > r.length) {
     return false;
   }
   return f.every((segment, i) => segment === r[i]);
@@ -43,7 +52,8 @@ export function windowOwnsSession(
   sessionId: string,
   activeSessionId: string | undefined,
   sessionRoot: string | undefined,
-  workspaceFolders: readonly string[]
+  workspaceFolders: readonly string[],
+  platform: string = process.platform
 ): boolean {
   if (activeSessionId === sessionId) {
     return true;
@@ -51,5 +61,5 @@ export function windowOwnsSession(
   if (!sessionRoot) {
     return false;
   }
-  return workspaceFolders.some((folder) => isInside(sessionRoot, folder));
+  return workspaceFolders.some((folder) => isInside(sessionRoot, folder, platform));
 }

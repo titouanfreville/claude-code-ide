@@ -16,7 +16,7 @@
  * open on `/work/app`. Equal paths count: a window opened directly on the session's
  * own root is the clearest possible owner.
  */
-export declare function isInside(root: string, folder: string): boolean;
+export declare function isInside(root: string, folder: string, platform?: string): boolean;
 /**
  * Whether this window should act on the session on its own.
  *
@@ -29,4 +29,4 @@ export declare function isInside(root: string, folder: string): boolean;
  * and cannot see each other; anything needing exactly-once has to be arbitrated by the
  * daemon, which is the only party that sees the whole fleet.
  */
-export declare function windowOwnsSession(sessionId: string, activeSessionId: string | undefined, sessionRoot: string | undefined, workspaceFolders: readonly string[]): boolean;
+export declare function windowOwnsSession(sessionId: string, activeSessionId: string | undefined, sessionRoot: string | undefined, workspaceFolders: readonly string[], platform?: string): boolean;

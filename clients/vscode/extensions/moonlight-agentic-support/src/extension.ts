@@ -17,11 +17,11 @@
  */
 import * as vscode from 'vscode';
 
-import { PLAN_HOLD } from 'moonlight-control-client';
 import type { HeldApproval, MoonlightApi } from 'moonlight-core';
 
 import { requireCore } from './core';
 import { decideAction } from './gate';
+import { isPlanHold, shouldActUnprompted } from './hold-routing';
 import { PlanReviewPanel } from './plan-view';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -74,12 +74,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
  */
 async function announce(core: MoonlightApi, hold: HeldApproval): Promise<void> {
   const short = hold.sessionId.slice(0, 8);
-  // The gate's own marker, not "does this hold happen to carry a plan". The held-set
-  // fold caches a session's plan so a later `ApprovalRequested` can be matched to it,
-  // and that cache outlives the hold — so `plan !== undefined` was true for every hold
-  // a session raised after its first plan, and a `Bash` approval opened the plan review
-  // panel instead of asking about the command.
-  const isPlan = hold.what === PLAN_HOLD;
+  const isPlan = isPlanHold(hold);
 
   if (isPlan) {
     // Only the window the session belongs to opens the panel by itself. Holds are
@@ -91,7 +86,7 @@ async function announce(core: MoonlightApi, hold: HeldApproval): Promise<void> {
     // `!== false` rather than `=== true`: a core too old to answer the question keeps
     // the previous behaviour instead of a plan panel that never opens anywhere, which
     // is the worse failure of the two.
-    if (core.ownsSession?.(hold.sessionId) === false) {
+    if (!shouldActUnprompted(core.ownsSession?.(hold.sessionId))) {
       // Still announced, because "the right window" is a guess — the session may have
       // no root, or its root may be open nowhere. A held agent nobody is told about is
       // the one outcome worth avoiding entirely.
@@ -116,6 +111,25 @@ async function announce(core: MoonlightApi, hold: HeldApproval): Promise<void> {
   }
 
   const tool = hold.mcpTool ? ` (${hold.mcpTool})` : '';
+
+  // The same window scoping as the plan branch, and it matters more here: this toast
+  // carries the verdict itself. Unscoped, every open window offered Allow/Refuse for a
+  // session it has nothing to do with, and whichever one was clicked first decided.
+  //
+  // A non-owning window is still told — the owning window is a guess — but it has to
+  // ask for the question before it can answer it.
+  if (!shouldActUnprompted(core.ownsSession?.(hold.sessionId))) {
+    const answer = 'Answer…';
+    const elsewhere = await vscode.window.showInformationMessage(
+      `MoonlightCode: session ${short} is held — ${hold.what}${tool} (in another workspace).`,
+      answer
+    );
+    if (answer === elsewhere) {
+      await answerSomeHold(core);
+    }
+    return;
+  }
+
   const choice = await vscode.window.showWarningMessage(
     `MoonlightCode: session ${short} is held — ${hold.what}${tool}`,
     { modal: false },
@@ -144,7 +158,12 @@ async function answerSomeHold(core: MoonlightApi): Promise<void> {
   if (!picked) {
     return;
   }
-  if (picked.plan !== undefined || picked.what === 'approve plan') {
+  // The same test `announce` uses. This was the second copy of the literal, still
+  // carrying the `plan !== undefined` fallback the change removed elsewhere — harmless
+  // only because the fold now clears `plan` for non-plan holds, and one widening of
+  // that away from a divergence where this opens a plan panel while `announce` asks
+  // about the command.
+  if (isPlanHold(picked)) {
     PlanReviewPanel.show(core, picked.sessionId);
     return;
   }

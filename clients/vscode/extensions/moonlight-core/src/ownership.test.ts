@@ -46,3 +46,22 @@ test('any one of several workspace folders is enough', () => {
     true
   );
 });
+
+test('an empty workspace folder claims nothing', () => {
+  // `[].every(...)` is vacuously true, so an empty string used to match every root —
+  // one bad entry and the window claimed the whole fleet.
+  assert.equal(isInside('/work/app', ''), false);
+  assert.equal(windowOwnsSession('s1', undefined, '/work/app', ['']), false);
+});
+
+test('path case is ignored off Linux', () => {
+  // On Windows the drive letter's case genuinely differs between the APIs a session
+  // root and a workspace folder come from; macOS volumes are case-insensitive by
+  // default. Comparing exactly meant no window owned the session: the plan panel
+  // opened nowhere and auto-adopt never fired.
+  assert.equal(isInside('C:\\Work\\App\\src', 'c:\\work\\app', 'win32'), true);
+  assert.equal(isInside('/Users/Me/Repo', '/users/me/repo', 'darwin'), true);
+  // Linux filesystems are case-sensitive, so two differently-cased paths are two
+  // different directories and must stay that way.
+  assert.equal(isInside('/Users/Me/Repo', '/users/me/repo', 'linux'), false);
+});

@@ -18,6 +18,9 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
+
+const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 
 const [version, tag, artifactsDir] = process.argv.slice(2);
 if (!version || !tag || !artifactsDir) {
@@ -33,7 +36,15 @@ for (const entry of fs.readdirSync(artifactsDir, { withFileTypes: true, recursiv
   const match = pattern.exec(entry.name);
   if (!match) continue;
   const full = path.join(entry.parentPath ?? entry.path, entry.name);
-  assets[match[1]] = crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex');
+  const gz = fs.readFileSync(full);
+  // Both hashes, because they are checked at different moments against different
+  // bytes: the asset hash before the extension decompresses anything, the binary hash
+  // every time it reuses the daemon already on disk. gzip is not reproducible, so the
+  // asset hash cannot answer for the file that ends up in the cache.
+  assets[match[1]] = {
+    asset: sha256(gz),
+    binary: sha256(zlib.gunzipSync(gz)),
+  };
 }
 
 const targets = Object.keys(assets).sort();
@@ -45,7 +56,15 @@ if (targets.length === 0) {
 
 const out = path.join(__dirname, '..', 'extensions', 'moonlight-core', 'src', 'daemon-pins.ts');
 const source = fs.readFileSync(out, 'utf8');
-const body = source.slice(0, source.indexOf('export const DAEMON_PINS'));
+const marker = source.indexOf('export const DAEMON_PINS');
+if (marker === -1) {
+  // `slice(0, -1)` would otherwise lop off the last character and emit a file that is
+  // still valid TypeScript but no longer declares the pins — a corrupt build that only
+  // shows up as an extension that never downloads anything.
+  console.error(`${out} no longer declares \`export const DAEMON_PINS\` — cannot pin`);
+  process.exit(1);
+}
+const body = source.slice(0, marker);
 
 fs.writeFileSync(
   out,
@@ -57,4 +76,4 @@ fs.writeFileSync(
 );
 
 console.log(`pinned moonlightd ${version} (tag ${tag}) for ${targets.length} target(s):`);
-for (const t of targets) console.log(`  ${t}  ${assets[t]}`);
+for (const t of targets) console.log(`  ${t}  asset=${assets[t].asset} binary=${assets[t].binary}`);

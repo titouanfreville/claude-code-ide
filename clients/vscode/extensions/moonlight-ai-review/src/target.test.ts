@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { resolveReviewSession } from './target';
+import { resolveReviewSession, reviewFilesFromComments } from './target';
 
 const queued = (...ids: string[]): ReadonlySet<string> => new Set(ids);
 
@@ -42,4 +42,26 @@ test('an active session with nothing queued does not suppress the picker', () =>
 
 test('an empty queue never yields a session', () => {
   assert.equal(resolveReviewSession('a', 'b', queued()), undefined);
+});
+
+test('reopening takes the distinct files that carry comments', () => {
+  assert.deepEqual(
+    reviewFilesFromComments([
+      { scope: 'Line', path: 'a.ts' },
+      { scope: 'Line', path: 'a.ts' },
+      { scope: 'File', path: 'b.ts' },
+    ]),
+    ['a.ts', 'b.ts']
+  );
+});
+
+test('resolved threads still count as worth reopening', () => {
+  // They render collapsed and are often exactly what the operator came back to check,
+  // so a fully resolved review is still reachable.
+  assert.deepEqual(reviewFilesFromComments([{ scope: 'Line', path: 'a.ts' }]), ['a.ts']);
+});
+
+test('a review-scoped comment is not a file to open', () => {
+  assert.deepEqual(reviewFilesFromComments([{ scope: 'Review', path: '' }]), []);
+  assert.deepEqual(reviewFilesFromComments([]), []);
 });

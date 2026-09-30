@@ -17,7 +17,7 @@ import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import * as controlApi from 'moonlight-control-client';
 
-import { resolveReviewSession } from './target';
+import { resolveReviewSession, reviewFilesFromComments } from './target';
 import {
   BaselineProvider,
   BASELINE_SCHEME,
@@ -157,7 +157,11 @@ export function activate(context: vscode.ExtensionContext): void {
     // Resolved threads stay in the record and render collapsed, so a review that is
     // entirely resolved is still worth reopening — the operator may be checking what
     // they settled.
-    const paths = [...new Set(all.map((c) => c.path))];
+    //
+    // `Review`-scoped comments are about the review itself rather than a file, so they
+    // carry no meaningful path; taking it anyway would open a diff for `''` and count
+    // a review-level note as evidence that there are files to show.
+    const paths = reviewFilesFromComments(all);
     if (paths.length === 0) {
       return false;
     }
@@ -294,25 +298,40 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
         return;
       }
-      if (queue.length === 0) {
-        // An empty queue does not mean there is nothing to look at. Files leave the
-        // queue once they are marked reviewed, but a review with comments on it is
-        // still open — and until those comments are sent, reopening the diffs is
-        // exactly what the operator wants: to re-read what they wrote, add to it, or
-        // check a thread before submitting. Bailing here made a review unreachable the
-        // moment it stopped being new.
-        const resumed = await reopenFromComments(requested ?? reviewTarget ?? core.activeSession()?.sessionId);
-        if (!resumed) {
-          void vscode.window.showInformationMessage('Nothing to review — no unreviewed files.');
-        }
-        return;
-      }
       // Group by session, so the picker offers reviews rather than files.
       const bySession = new Map<string, controlApi.ReviewQueueItem[]>();
       for (const item of queue) {
         const list = bySession.get(item.session_id) ?? [];
         list.push(item);
         bySession.set(item.session_id, list);
+      }
+
+      // A session was named — by the status bar, or by the "Reopen the diffs" link —
+      // and has nothing queued. That is a *finished* review, and the right answer is to
+      // reopen it from its comments.
+      //
+      // It must be answered before `resolveReviewSession`, which deliberately skips a
+      // named session with nothing queued and falls through to "the only session with
+      // changes". That fallback is right when the operator asked for *a* review; it is
+      // wrong here, because it would open a different session's diffs and repoint
+      // `reviewTarget` at it, leaving the named session's unsent comments stranded.
+      //
+      // Scoped to the named session rather than to an empty queue: keying on
+      // `queue.length === 0` meant any *other* session having one unreviewed file was
+      // enough to send the operator into someone else's review.
+      const named = requested ?? reviewTarget;
+      if (named !== undefined && !bySession.has(named) && (await reopenFromComments(named))) {
+        return;
+      }
+
+      if (queue.length === 0) {
+        // Nothing queued anywhere, and nothing named worth reopening — try whatever
+        // session this window is working in before giving up.
+        const resumed = await reopenFromComments(core.activeSession()?.sessionId);
+        if (!resumed) {
+          void vscode.window.showInformationMessage('Nothing to review — no unreviewed files.');
+        }
+        return;
       }
       // Asking is the last resort — see `resolveReviewSession` for the order and why.
       let sessionId = resolveReviewSession(

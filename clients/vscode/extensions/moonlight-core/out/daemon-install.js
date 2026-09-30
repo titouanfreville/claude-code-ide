@@ -66,6 +66,8 @@ const daemon_pins_1 = require("./daemon-pins");
 const RELEASE_BASE = 'https://github.com/titouanfreville/claude-code-ide/releases/download';
 /** Redirect hops allowed before giving up (GitHub sends releases to a CDN host). */
 const MAX_REDIRECTS = 5;
+/** How long a single hop may stall before the download is abandoned. */
+const REQUEST_TIMEOUT_MS = 60_000;
 /** Refuse to buffer more than this, so a wrong URL cannot exhaust the host. */
 const MAX_ASSET_BYTES = 128 * 1024 * 1024;
 /**
@@ -100,13 +102,6 @@ function assetName(version, target) {
 function assetUrl(tag, version, target) {
     return `${RELEASE_BASE}/${tag}/${assetName(version, target)}`;
 }
-/**
- * Decide what a download attempt should do, given what is already on disk.
- *
- * Split out from the I/O so the precedence — pinned, supported, already cached — can
- * be tested directly; the network path below is then only the part that genuinely
- * needs a network.
- */
 function planInstall(pins, target, cachedExists) {
     if (!pins) {
         return { kind: 'unpinned' };
@@ -114,15 +109,31 @@ function planInstall(pins, target, cachedExists) {
     if (!target) {
         return { kind: 'unsupported-platform', platform: process.platform, arch: process.arch };
     }
-    const sha256 = pins.assets[target];
-    if (!sha256) {
+    const hashes = pins.assets[target];
+    if (!hashes) {
         return { kind: 'unsupported-platform', platform: process.platform, arch: process.arch };
     }
-    return { action: 'download', tag: pins.tag, version: pins.version, target, sha256 };
+    // `cached` is returned rather than re-derived by the caller: the precedence this
+    // function documents is only testable if every leg of it is actually decided here.
+    return {
+        action: 'download',
+        tag: pins.tag,
+        version: pins.version,
+        target,
+        asset: hashes.asset,
+        binary: hashes.binary,
+        cached: cachedExists,
+    };
 }
 /** GET a URL, following redirects, resolving to the response body. */
 function fetchBuffer(url, redirectsLeft = MAX_REDIRECTS) {
     return new Promise((resolve, reject) => {
+        // Every hop stays on HTTPS. `Location` is a third-party response, and a redirect
+        // to `http:` would downgrade the transport for the rest of the chain.
+        if (new URL(url).protocol !== 'https:') {
+            reject(new Error(`refusing a non-HTTPS download URL: ${url}`));
+            return;
+        }
         const request = https.get(url, { headers: { 'user-agent': 'moonlight-core' } }, (res) => {
             const status = res.statusCode ?? 0;
             const location = res.headers.location;
@@ -154,11 +165,41 @@ function fetchBuffer(url, redirectsLeft = MAX_REDIRECTS) {
             res.on('error', reject);
         });
         request.on('error', reject);
+        // Without this a connection that opens and then stalls never settles the promise,
+        // and the caller's in-flight guard — which clears in a `finally` — never clears
+        // either: that window could not install a daemon again for as long as it ran.
+        request.setTimeout(REQUEST_TIMEOUT_MS, () => {
+            request.destroy(new Error(`download timed out after ${REQUEST_TIMEOUT_MS}ms`));
+        });
     });
 }
 /** Lowercase hex SHA-256, the form the pins are generated in. */
 function sha256(data) {
     return crypto.createHash('sha256').update(data).digest('hex');
+}
+/**
+ * Drop the daemon directories for versions this extension no longer uses.
+ *
+ * The cache is version-scoped so an upgraded extension fetches its own daemon rather
+ * than silently reusing the previous release's. Nothing removed the old one, so every
+ * upgrade left another uncompressed ~14 MB binary in global storage — and on nightly
+ * the version is per commit, so that is once per push to main.
+ *
+ * Best-effort: a directory still in use by another window will fail to remove on some
+ * platforms, and a cache that could not be tidied is not a reason to fail an install
+ * that already succeeded.
+ */
+function pruneOtherVersions(storageDir, keep) {
+    try {
+        for (const entry of fs.readdirSync(storageDir, { withFileTypes: true })) {
+            if (entry.isDirectory() && entry.name.startsWith('daemon-') && entry.name !== keep) {
+                fs.rmSync(path.join(storageDir, entry.name), { recursive: true, force: true });
+            }
+        }
+    }
+    catch {
+        // Nothing to report: the daemon is installed either way.
+    }
 }
 /**
  * Ensure a verified daemon exists in `storageDir`, downloading it if needed.
@@ -177,32 +218,71 @@ async function ensureDownloadedDaemon(storageDir, binaryName, pins = daemon_pins
     if (!('action' in plan)) {
         return plan;
     }
-    if (fs.existsSync(binary)) {
-        return { kind: 'cached', binary };
+    if (plan.cached) {
+        // Re-hashed, not trusted because it is there. Global storage is an ordinary
+        // user-writable directory: anything running as this user — another extension, a
+        // stray script — can replace the file after it was verified, and the only check
+        // before was that the path existed. Verifying once at download time protects the
+        // download; this protects every run after it, which is nearly all of them.
+        //
+        // Against the *binary* hash, since the file on disk is the decompressed
+        // executable and no longer the bytes the asset hash describes.
+        try {
+            const actual = sha256(fs.readFileSync(binary));
+            if (actual === plan.binary) {
+                return { kind: 'cached', binary };
+            }
+            // Removed rather than kept and reported: leaving it means the next activation
+            // finds it again, and a binary that failed verification must not be one
+            // `existsSync` can resurrect.
+            fs.rmSync(binary, { force: true });
+        }
+        catch (err) {
+            return { kind: 'failed', error: err instanceof Error ? err.message : String(err) };
+        }
     }
+    const staging = `${binary}.${process.pid}.part`;
     try {
         const gzipped = await fetchBuffer(assetUrl(plan.tag, plan.version, plan.target));
         const actual = sha256(gzipped);
-        if (actual !== plan.sha256) {
+        if (actual !== plan.asset) {
             // Deliberately not retried and not kept: a mismatch is either a corrupted
             // transfer or a substituted artifact, and there is no version of either that
-            // should end up governing sessions.
+            // should end up governing sessions. Checked before gunzip, so a hostile asset is
+            // never decompressed.
             return {
                 kind: 'failed',
-                error: `checksum mismatch for ${plan.target}: expected ${plan.sha256}, got ${actual}`,
+                error: `checksum mismatch for ${plan.target}: expected ${plan.asset}, got ${actual}`,
             };
         }
         const bytes = zlib.gunzipSync(gzipped);
+        const unpacked = sha256(bytes);
+        if (unpacked !== plan.binary) {
+            return {
+                kind: 'failed',
+                error: `unpacked checksum mismatch for ${plan.target}: expected ${plan.binary}, got ${unpacked}`,
+            };
+        }
         fs.mkdirSync(dir, { recursive: true });
         // Write beside the target and rename: a half-written binary that another window
         // finds by `existsSync` would be run as if it were complete.
-        const staging = `${binary}.${process.pid}.part`;
         fs.writeFileSync(staging, bytes, { mode: 0o755 });
         fs.renameSync(staging, binary);
+        pruneOtherVersions(storageDir, path.basename(dir));
         return { kind: 'installed', binary };
     }
     catch (err) {
         return { kind: 'failed', error: err instanceof Error ? err.message : String(err) };
+    }
+    finally {
+        // A throw between writing and renaming would otherwise leave the partial file
+        // behind, once per failed attempt.
+        try {
+            fs.rmSync(staging, { force: true });
+        }
+        catch {
+            // Nothing useful to do: the install already succeeded or already failed.
+        }
     }
 }
 //# sourceMappingURL=daemon-install.js.map
