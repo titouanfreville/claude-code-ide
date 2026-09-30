@@ -25,12 +25,12 @@ test('asset names and URLs match what build.yml uploads', () => {
   assert.equal(assetName('0.1.1', 'x86_64-pc-windows-msvc'), 'moonlightd-0.1.1-x86_64-pc-windows-msvc.gz');
   assert.equal(
     assetUrl('v0.1.1', '0.1.1', 'aarch64-apple-darwin'),
-    'https://github.com/titouanfreville/moonligh-ide-plugins/releases/download/v0.1.1/moonlightd-0.1.1-aarch64-apple-darwin.gz'
+    'https://github.com/titouanfreville/moonlight-ide-plugins/releases/download/v0.1.1/moonlightd-0.1.1-aarch64-apple-darwin.gz'
   );
   // The nightly release keeps one rolling tag whose assets are named per commit.
   assert.equal(
     assetUrl('nightly', 'nightly-abc1234', 'x86_64-pc-windows-msvc'),
-    'https://github.com/titouanfreville/moonligh-ide-plugins/releases/download/nightly/moonlightd-nightly-abc1234-x86_64-pc-windows-msvc.gz'
+    'https://github.com/titouanfreville/moonlight-ide-plugins/releases/download/nightly/moonlightd-nightly-abc1234-x86_64-pc-windows-msvc.gz'
   );
 });
 

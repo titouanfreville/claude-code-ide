@@ -63,7 +63,7 @@ const path = __importStar(require("path"));
 const zlib = __importStar(require("zlib"));
 const daemon_pins_1 = require("./daemon-pins");
 /** Where the release assets live. */
-const RELEASE_BASE = 'https://github.com/titouanfreville/moonligh-ide-plugins/releases/download';
+const RELEASE_BASE = 'https://github.com/titouanfreville/moonlight-ide-plugins/releases/download';
 /** Redirect hops allowed before giving up (GitHub sends releases to a CDN host). */
 const MAX_REDIRECTS = 5;
 /** How long a single hop may stall before the download is abandoned. */

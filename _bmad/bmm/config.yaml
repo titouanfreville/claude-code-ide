@@ -5,6 +5,6 @@
 user_name: Titouan
 communication_language: English
 document_output_language: English
-output_folder: /Users/titouan/perso/claude-code-ide/.bmad-output
-planning_artifacts: /Users/titouan/perso/claude-code-ide/.bmad-output/planning
-project_knowledge: /Users/titouan/perso/claude-code-ide/.bmad-output
+output_folder: /Users/titouanfreville/perso/moonlight-ide-plugins/.bmad-output
+planning_artifacts: /Users/titouanfreville/perso/moonlight-ide-plugins/.bmad-output/planning
+project_knowledge: /Users/titouanfreville/perso/moonlight-ide-plugins/.bmad-output

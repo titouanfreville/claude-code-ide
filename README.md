@@ -73,7 +73,7 @@ with the same control API embedded rather than reached over the network. Session
 phases, the review queue and the gate in one window.
 
 Download the latest `.dmg` (macOS) or `.tar.gz` (Linux) from
-[Releases](https://github.com/titouanfreville/moonligh-ide-plugins/releases). Building it
+[Releases](https://github.com/titouanfreville/moonlight-ide-plugins/releases). Building it
 from source needs the Metal toolchain on macOS — see below.
 
 ### Platform support
@@ -144,9 +144,13 @@ xcrun -sdk macosx metal -v || sudo xcodebuild -downloadComponent MetalToolchain
 
 ### Installing an unsigned build
 
-Release/nightly DMGs aren't code-signed or notarized yet, so macOS will refuse to
-open the app with a "MoonlightCode is damaged and can't be opened" message. Until
-signing is set up, work around it after copying the app to `/Applications`:
+Nothing here is code-signed or notarized yet. What that costs you depends on how the
+binary reached your machine, because macOS attaches the `com.apple.quarantine` flag at
+*download* time — the downloader sets it, not the file itself.
+
+**The desktop app.** A `.dmg` opened from a browser is quarantined, so macOS refuses it
+with "MoonlightCode is damaged and can't be opened". After copying the app to
+`/Applications`:
 
 ```bash
 xattr -cr /Applications/MoonlightCode.app
@@ -155,6 +159,28 @@ xattr -cr /Applications/MoonlightCode.app
 (or: System Settings → Privacy & Security → scroll to the blocked-app notice → "Open Anyway".)
 
 Confirmed working on the nightly `aarch64-apple-darwin` build.
+
+**The daemon, downloaded by the extension.** Nothing to do. `moonlight-core` fetches it
+over HTTPS and writes it itself, and a file written by a process that does not opt into
+quarantining is not flagged — so the binary runs as soon as it is unpacked. Verified
+end to end on macOS: downloaded, hash-checked, spawned, serving.
+
+**The daemon, downloaded by hand.** If you take `moonlightd-<version>-<target>.gz` from
+the Releases page in a browser, that *is* quarantined, and so is the binary you unpack
+from it:
+
+```bash
+gunzip moonlightd-<version>-<target>.gz
+chmod +x moonlightd-<version>-<target>
+xattr -cr moonlightd-<version>-<target>      # macOS only
+```
+
+Then put it on your `PATH` as `moonlightd`, or point an editor at it with the
+`moonlight.daemon.path` setting. A daemon named there always wins over a downloaded one,
+so this is also how you run a build of your own.
+
+**Linux.** No quarantine, but the tarball does not preserve the executable bit through
+every extraction path — `chmod +x` if the binary refuses to run.
 
 ## License
 

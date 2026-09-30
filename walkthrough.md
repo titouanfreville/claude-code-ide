@@ -7,16 +7,16 @@ This feature adds a JetBrains-inspired modal to create, serialize, and merge cus
 ## Changes Made
 
 ### 1. Persistence & Auto-detection Layer
-- **File**: [run_config.rs](file:///Users/titouan/perso/claude-code-ide/apps/desktop/src/views/run_config.rs)
+- **File**: [run_config.rs](file:///Users/titouanfreville/perso/moonlight-ide-plugins/apps/desktop/src/views/run_config.rs)
   - Derives `serde::Serialize` and `serde::Deserialize` for `RunKind` and `RunConfig`.
   - Added `load_custom(root: &Path)` and `save_custom(root: &Path, configs: &[RunConfig])` helper functions to safely read and write configurations to `<root>/.moonlight/run_configs.json`.
   - Updated `detect(root: &Path)` to first load custom run configurations, then merge auto-detected marker targets (such as `Cargo.toml` or `package.json` configurations), deduplicating on command ID and prioritizing custom overrides.
 
 ### 2. User Interface Layer
-- **Toolbar Dropdown**: [toolbar.rs](file:///Users/titouan/perso/claude-code-ide/apps/desktop/src/views/panels/toolbar.rs)
+- **Toolbar Dropdown**: [toolbar.rs](file:///Users/titouanfreville/perso/moonlight-ide-plugins/apps/desktop/src/views/panels/toolbar.rs)
   - Added a visual divider and a `＋ Add Configuration…` button at the bottom of the target picker run dropdown.
   - Linked the option to close existing toolbar dropdowns and trigger `open_create_run_config_modal` on `Workspace`.
-- **Modal Overlay State & Actions**: [workspace.rs](file:///Users/titouan/perso/claude-code-ide/apps/desktop/src/views/workspace.rs)
+- **Modal Overlay State & Actions**: [workspace.rs](file:///Users/titouanfreville/perso/moonlight-ide-plugins/apps/desktop/src/views/workspace.rs)
   - Added state tracked inside the `Workspace` entity:
     - `show_create_run_config: bool`
     - `run_config_label_input: Option<Entity<InputState>>`
@@ -32,7 +32,7 @@ This feature adds a JetBrains-inspired modal to create, serialize, and merge cus
 All unit tests and compilation checks have been executed successfully!
 
 ### 1. Automated Tests
-Added robust unit tests to [run_config.rs](file:///Users/titouan/perso/claude-code-ide/apps/desktop/src/views/run_config.rs) to verify correct storage behavior:
+Added robust unit tests to [run_config.rs](file:///Users/titouanfreville/perso/moonlight-ide-plugins/apps/desktop/src/views/run_config.rs) to verify correct storage behavior:
 - `saves_and_loads_custom_run_configs`: Assures serialization and deserialization work correctly against a temporary directory on disk.
 - `custom_configs_override_and_dedup_detected`: Validates that custom configurations taking the same command string correctly override and deduplicate auto-detected default options (placing custom targets first in the run target priority).
 

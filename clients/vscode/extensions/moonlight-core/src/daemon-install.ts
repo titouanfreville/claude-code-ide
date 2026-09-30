@@ -24,7 +24,7 @@ import * as zlib from 'zlib';
 import { DAEMON_PINS, type DaemonPins } from './daemon-pins';
 
 /** Where the release assets live. */
-const RELEASE_BASE = 'https://github.com/titouanfreville/moonligh-ide-plugins/releases/download';
+const RELEASE_BASE = 'https://github.com/titouanfreville/moonlight-ide-plugins/releases/download';
 
 /** Redirect hops allowed before giving up (GitHub sends releases to a CDN host). */
 const MAX_REDIRECTS = 5;
