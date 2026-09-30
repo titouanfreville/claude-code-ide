@@ -39,12 +39,31 @@ class GateState {
             // also publishes it from transcript detection — for sessions that finished
             // hours ago. Arming a verdict on this would put an approve button in front of
             // an operator with nothing behind it.
-            case 'PlanProposed':
-                if (this.plans.get(event.session) === event.plan) {
+            case 'PlanProposed': {
+                // A plan hold folded *before* its plan arrived keeps `plan: undefined` for
+                // good: `ApprovalRequested` carries no plan of its own, and nothing else ever
+                // revisits an entry once it is in the map. The notifier does publish the plan
+                // first, but both travel the same stream and a resync can land between them —
+                // and the result is the panel opening on a genuine hold with nothing in it,
+                // which reads as the plan having been lost rather than not yet delivered.
+                //
+                // Only a hold that is *itself* the plan proposal is patched. Filling in any
+                // waiting hold would put a plan back on the command approvals this fold was
+                // just fixed to keep clear of one.
+                const held = this.held.get(event.session);
+                const patch = held !== undefined && held.what === moonlight_control_client_1.PLAN_HOLD && held.plan !== event.plan;
+                // The dedup has to account for the patch: an identical `PlanProposed` repeated
+                // while the hold is still missing its plan is exactly the case worth acting on,
+                // and returning early on "same text" would skip it.
+                if (this.plans.get(event.session) === event.plan && !patch) {
                     return false;
                 }
                 this.plans.set(event.session, event.plan);
+                if (patch && held !== undefined) {
+                    this.held.set(event.session, { ...held, plan: event.plan });
+                }
                 return true;
+            }
             // A hook is holding: this session is the one that needs an answer.
             case 'ApprovalRequested':
                 this.held.set(event.session, {

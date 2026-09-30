@@ -120,3 +120,40 @@ test('the plan stays readable on its own after the hold moves on', () => {
   gate.apply({ kind: 'ApprovalRequested', session: 's1', what: 'run `ls`' } as EngineEvent);
   assert.equal(gate.plan('s1'), '# Plan');
 });
+
+test('a plan arriving after its hold still reaches the hold', () => {
+  // The notifier publishes PlanProposed first, but both travel the same stream and a
+  // resync can land between them. Before this, the late plan updated only the cache,
+  // so the panel opened on a real hold with nothing in it.
+  const gate = new GateState();
+  gate.apply({ kind: 'ApprovalRequested', session: 's1', what: PLAN_HOLD } as EngineEvent);
+  assert.equal(gate.approval('s1')?.plan, undefined);
+
+  gate.apply({ kind: 'PlanProposed', session: 's1', plan: '# Late' } as EngineEvent);
+  assert.equal(gate.approval('s1')?.plan, '# Late');
+});
+
+test('a repeated plan still fills a hold that is missing it', () => {
+  // Transcript detection republishes plans, so the same text can arrive twice with the
+  // hold folded in between. Deduping on the text alone skipped the one that mattered.
+  const gate = new GateState();
+  gate.apply({ kind: 'PlanProposed', session: 's1', plan: '# Same' } as EngineEvent);
+  gate.apply({ kind: 'ApprovalRequested', session: 's1', what: PLAN_HOLD } as EngineEvent);
+  // Simulate the ordering where the hold folded before the plan was cached.
+  const fresh = new GateState();
+  fresh.apply({ kind: 'ApprovalRequested', session: 's1', what: PLAN_HOLD } as EngineEvent);
+  fresh.apply({ kind: 'PlanProposed', session: 's1', plan: '# Same' } as EngineEvent);
+  fresh.apply({ kind: 'PlanProposed', session: 's1', plan: '# Same' } as EngineEvent);
+  assert.equal(fresh.approval('s1')?.plan, '# Same');
+  assert.equal(gate.approval('s1')?.plan, '# Same');
+});
+
+test('a late plan does not attach itself to a command approval', () => {
+  // The bug this fold was fixed for, from the other direction: patching any waiting
+  // hold would put a plan back on a Bash approval and reopen the plan panel for it.
+  const gate = new GateState();
+  gate.apply({ kind: 'ApprovalRequested', session: 's1', what: 'run `ls`' } as EngineEvent);
+  gate.apply({ kind: 'PlanProposed', session: 's1', plan: '# Unrelated' } as EngineEvent);
+  assert.equal(gate.approval('s1')?.plan, undefined);
+  assert.equal(gate.plan('s1'), '# Unrelated');
+});

@@ -100,4 +100,37 @@ const gate_state_1 = require("./gate-state");
     gate.apply({ kind: 'ApprovalRequested', session: 's1', what: 'run `ls`' });
     strict_1.default.equal(gate.plan('s1'), '# Plan');
 });
+(0, node_test_1.test)('a plan arriving after its hold still reaches the hold', () => {
+    // The notifier publishes PlanProposed first, but both travel the same stream and a
+    // resync can land between them. Before this, the late plan updated only the cache,
+    // so the panel opened on a real hold with nothing in it.
+    const gate = new gate_state_1.GateState();
+    gate.apply({ kind: 'ApprovalRequested', session: 's1', what: moonlight_control_client_1.PLAN_HOLD });
+    strict_1.default.equal(gate.approval('s1')?.plan, undefined);
+    gate.apply({ kind: 'PlanProposed', session: 's1', plan: '# Late' });
+    strict_1.default.equal(gate.approval('s1')?.plan, '# Late');
+});
+(0, node_test_1.test)('a repeated plan still fills a hold that is missing it', () => {
+    // Transcript detection republishes plans, so the same text can arrive twice with the
+    // hold folded in between. Deduping on the text alone skipped the one that mattered.
+    const gate = new gate_state_1.GateState();
+    gate.apply({ kind: 'PlanProposed', session: 's1', plan: '# Same' });
+    gate.apply({ kind: 'ApprovalRequested', session: 's1', what: moonlight_control_client_1.PLAN_HOLD });
+    // Simulate the ordering where the hold folded before the plan was cached.
+    const fresh = new gate_state_1.GateState();
+    fresh.apply({ kind: 'ApprovalRequested', session: 's1', what: moonlight_control_client_1.PLAN_HOLD });
+    fresh.apply({ kind: 'PlanProposed', session: 's1', plan: '# Same' });
+    fresh.apply({ kind: 'PlanProposed', session: 's1', plan: '# Same' });
+    strict_1.default.equal(fresh.approval('s1')?.plan, '# Same');
+    strict_1.default.equal(gate.approval('s1')?.plan, '# Same');
+});
+(0, node_test_1.test)('a late plan does not attach itself to a command approval', () => {
+    // The bug this fold was fixed for, from the other direction: patching any waiting
+    // hold would put a plan back on a Bash approval and reopen the plan panel for it.
+    const gate = new gate_state_1.GateState();
+    gate.apply({ kind: 'ApprovalRequested', session: 's1', what: 'run `ls`' });
+    gate.apply({ kind: 'PlanProposed', session: 's1', plan: '# Unrelated' });
+    strict_1.default.equal(gate.approval('s1')?.plan, undefined);
+    strict_1.default.equal(gate.plan('s1'), '# Unrelated');
+});
 //# sourceMappingURL=gate-state.test.js.map
