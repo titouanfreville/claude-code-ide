@@ -1,11 +1,94 @@
 # MoonlightCode
 
-An AI-centric, single-build **pure-Rust desktop IDE** for orchestrating many Claude Code sessions.
-Sessions are center-stage; the IDE is a workflow state machine (Plan → Auto → Test → Review → Commit)
-where Claude acts via an embedded MCP server under graduated trust tiers. Calm "mission-control" UX,
-RTK-native token economy, local-first / zero-telemetry.
+Governance for a fleet of Claude Code sessions. Sessions are center-stage, and the
+workflow is a state machine — Plan → Auto → Test → Review → Commit — where Claude acts
+through an MCP server under graduated trust tiers. Local-first, zero-telemetry.
 
 > Working title. Personal tool first. Full plan & design live in [`.bmad-output/planning/`](.bmad-output/planning/).
+
+## The three parts
+
+MoonlightCode is a daemon plus two ways of looking at it. The daemon is the only thing
+that governs anything; the editor and the IDE are both clients of it, and neither is
+required by the other.
+
+```text
+   VS Code extensions                    the desktop IDE
+   (your editor, gated)                  (mission control)
+            \                                   /
+             \____  HTTP on 127.0.0.1  ________/
+                            |
+                        moonlightd
+              control API · hook gate · trust
+                            |
+                   Claude Code sessions
+```
+
+### 1. `moonlightd` — the daemon
+
+The centre. It discovers Claude Code sessions, holds their hook calls at the gate,
+applies the phase policy, and keeps the review ledger. **A session it has not adopted is
+never gated** — adoption is what first lets anything be denied.
+
+It binds an ephemeral loopback port and writes it to `~/.moonlight/control.json`, so a
+client finds it without configuration. Whoever opens first starts it; a second one loses
+the socket race and exits rather than splitting the fleet.
+
+Headless — no GPUI, no Metal, no Vulkan — so it runs anywhere the rest does. Source in
+[`apps/daemon`](apps/daemon), served by [`crates/control`](crates/control) and
+[`crates/trust`](crates/trust).
+
+### 2. The VS Code extensions
+
+Governance inside the editor you already use. Six extensions: a core that owns the
+connection, four features, and a pack that installs the set.
+
+**Install the pack** — it pulls in the other five:
+
+- [VS Marketplace](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-ai) — VS Code
+- [Open VSX](https://open-vsx.org/extension/titouanfreville/moonlight-ai) — Cursor, Windsurf, VSCodium
+
+```bash
+code --install-extension titouanfreville.moonlight-ai
+```
+
+| Extension | What it adds |
+| --- | --- |
+| [`moonlight-core`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-core) | The shared connection, session state and owned terminals. Everything else depends on it. |
+| [`moonlight-status`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-status) | Gating indicator and Claude usage readout in the status bar. |
+| [`moonlight-session-control`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-session-control) | Adopt sessions, set their phase, start governed ones. |
+| [`moonlight-ai-review`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-ai-review) | Review a session's diff against its own baseline, with inline comments delivered back to it. |
+| [`moonlight-agentic-support`](https://marketplace.visualstudio.com/items?itemName=titouanfreville.moonlight-agentic-support) | The plan gate and held approvals — where a blocked session is answered. |
+
+You do not need the desktop app to use these. On first run, if no daemon is reachable
+and none is on `PATH`, `moonlight-core` downloads `moonlightd` for your platform,
+verifies it against a hash pinned when the release was built, and starts it.
+
+Source and development notes: [`clients/vscode`](clients/vscode).
+
+### 3. The desktop IDE
+
+A single-build pure-Rust GPUI application — the mission-control view of the whole fleet,
+with the same control API embedded rather than reached over the network. Sessions, their
+phases, the review queue and the gate in one window.
+
+Download the latest `.dmg` (macOS) or `.tar.gz` (Linux) from
+[Releases](https://github.com/titouanfreville/moonligh-ide-plugins/releases). Building it
+from source needs the Metal toolchain on macOS — see below.
+
+### Platform support
+
+| Component | macOS arm64 | macOS x64 | Linux x64 | Linux arm64 | Windows |
+| --- | --- | --- | --- | --- | --- |
+| `moonlightd` | ✅ | ✅ | ✅ | ✅ | ❌ |
+| VS Code extensions | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Desktop IDE | ✅ | ✅ | ✅ | — | ❌ |
+
+Windows is not supported yet, and packaging is not the reason: the hook gate in
+`crates/control` serves over a Unix domain socket, so the daemon does not compile for
+Windows at all. It needs a second transport — a named pipe, or loopback TCP with a token
+— and a matching change to how hooks are registered. The extensions are already correct
+for it and report the platform as unsupported rather than failing oddly.
 
 ## Status
 
@@ -20,7 +103,7 @@ implementing those ports, and a single GPUI desktop app as the composition root.
 [`AGENTS.md`](AGENTS.md) for the house rules and
 [`.bmad-output/planning/architecture.md`](.bmad-output/planning/architecture.md) for the full design.
 
-```
+```text
 crates/
   domain/        pure entities + ports + errors (no I/O, no runtime, no UI)
   core/          config, logging/tracing, secrets
