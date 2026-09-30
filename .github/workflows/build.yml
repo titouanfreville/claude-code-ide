@@ -193,39 +193,22 @@ jobs:
       # The intermediates are what go: once the bundle exists, `deps/`, `build/` and
       # `incremental/` are spent. Deliberately after `cargo bundle` — removing them
       # before it would make cargo rebuild the whole thing.
-      # `hdiutil` needs room for a staged copy of the .app plus the compressed image,
-      # and a release build of a GPUI app leaves little of a macOS runner's disk.
+      # Diagnostics only — the disk is not the problem, and two earlier attempts to
+      # "fix" this by freeing space were treating the symptom's wording rather than its
+      # cause. See the sizing note on the .dmg step below.
       #
-      # The first version of this step freed `deps/`, `build/` and `incremental/` and
-      # measured `df /`. Both were wrong. `/` on macOS is the sealed, read-only system
-      # volume — the writable one is `/System/Volumes/Data` — so the numbers it printed
-      # described a filesystem nothing here writes to, and the arm64 leg kept failing
-      # with 35 GiB apparently free. The three directories it removed were also not the
-      # bulk: `cargo bundle` leaves the whole release tree behind, and that is what
-      # fills the volume.
-      #
-      # So the .app moves out of `target/` first and the entire tree goes. Nothing after
-      # this step reads it — the signing, dmg and notarize steps all work from the
-      # staged copy — and it is the only thing big enough to matter.
-      - name: Reclaim disk before packaging
+      # `/System/Volumes/Data` deliberately: `/` on macOS is the sealed, read-only
+      # system volume, so `df /` reports a filesystem nothing in this job writes to.
+      # That is what made the first attempt look like it should have worked.
+      - name: Disk before packaging
         if: matrix.kind == 'macos'
-        run: |
-          set -euo pipefail
-          echo "before:"; df -h /System/Volumes/Data | tail -1
-          du -sh "target/${TGT}/release" 2>/dev/null || true
-          mkdir -p staged
-          mv "target/${TGT}/release/bundle/osx/MoonlightCode.app" staged/
-          rm -rf target
-          echo "after:"; df -h /System/Volumes/Data | tail -1
+        run: df -h /System/Volumes/Data | tail -1
 
       - name: Build .dmg
         if: matrix.kind == 'macos'
         run: |
           set -euo pipefail
-          # From the staged copy: the reclaim step above moved the bundle out and
-          # deleted `target/` entirely, which is the only way to free enough room for
-          # hdiutil on a runner that has just done a GPUI release build.
-          APP="staged/MoonlightCode.app"
+          APP="target/${TGT}/release/bundle/osx/MoonlightCode.app"
           name="MoonlightCode-${VERSION}-${TGT}"
           mkdir -p dist dmg-staging
           # A real copy, not a symlink: `hdiutil -srcfolder` preserves symlinks rather
@@ -234,8 +217,27 @@ jobs:
           # a link — that is the drag-to-install target.
           cp -R "$APP" dmg-staging/
           ln -s /Applications dmg-staging/Applications
+          # Sized explicitly, with headroom.
+          #
+          # Left to itself, `hdiutil create -srcfolder` computes the image size from
+          # the source and gets it slightly wrong — filesystem metadata is not free,
+          # and the estimate does not allow enough for it. It then fails *copying into
+          # the image it just made*, and reports that as "No space left on device".
+          #
+          # Which is why this looked like a full disk for three attempts: the message
+          # names a device, and the device is the image, not the volume. The runner had
+          # 36 GiB free at the point of failure. It is marginal, so it alternated
+          # between the two macOS legs run to run depending on which app was fractionally
+          # larger — which is also what makes it read as flakiness rather than a bug.
+          #
+          # `du -ms` follows the real content; +64 MiB covers the metadata and leaves
+          # room for the app to grow. `-format UDZO` compresses afterwards, so the
+          # slack costs nothing in the published artifact.
+          size_mb=$(( $(du -ms dmg-staging | cut -f1) + 64 ))
+          echo "staging $(du -sh dmg-staging | cut -f1), creating a ${size_mb}m image"
           hdiutil create -volname "MoonlightCode" -srcfolder dmg-staging \
-            -ov -format UDZO "dist/$name.dmg"
+            -size "${size_mb}m" -ov -format UDZO "dist/$name.dmg"
+          ls -lh "dist/$name.dmg"
           echo "ASSET=dist/$name.dmg" >> "$GITHUB_ENV"
 
       - name: Notarize .dmg (only if signing secrets are set)
