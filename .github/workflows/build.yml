@@ -85,9 +85,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Registry and git checkouts only — not `target/`.
+      #
+      # GitHub allows a repository 10 GB of cache in total and evicts least-recently-
+      # used beyond it. Caching the target dir for three release targets plus four
+      # daemon targets put the repo at 9 GB, so each run pushed out the previous run's
+      # entries and *every* job then logged "No cache found": the caches were written
+      # on every run and read on none. CI's own test jobs, which run on every pull
+      # request, were the ones losing the race.
+      #
+      # These jobs run on a tag or a nightly, so a cold compile costs less than the
+      # eviction it causes. Keeping `~/.cargo` still skips the downloads, which is the
+      # part that is pure waiting.
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+          cache-targets: false
 
       # GPUI/blade (Vulkan) + alacritty terminal core need these to build on Linux.
       - name: Install Linux system dependencies
@@ -321,9 +334,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Registry only, same reasoning as the release job above: four more multi-GB
+      # target caches is what pushed the repo over its 10 GB allowance.
       - uses: Swatinem/rust-cache@v2
         with:
           key: daemon-${{ matrix.target }}
+          cache-targets: false
 
       - name: Build moonlightd
         run: cargo build --release -p moonlight-daemon --target "$TGT"

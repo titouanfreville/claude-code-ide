@@ -49,7 +49,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # The one place a full `target/` cache earns its keep: this job runs on every
+      # pull request and spends ~10 min (Linux) to ~16 min (macOS) compiling, because
+      # `cargo test --all` includes the GPUI desktop app. The release and daemon jobs
+      # now cache only `~/.cargo`, so these two entries stay inside the repo's 10 GB
+      # allowance instead of being evicted before the next run reads them.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.os }}
 
       # GPUI/blade (Vulkan) + alacritty terminal core need these to build on Linux.
       - name: Install Linux system dependencies
