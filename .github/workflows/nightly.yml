@@ -88,7 +88,11 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          assets="$(gh release view nightly --json assets -q '.assets[].name')"
+          # `--repo` because this job checks out nothing: `gh` otherwise infers the
+          # repository from git remotes and fails with "not a git repository", which
+          # this job then reported as a missing asset. Naming the repo is cheaper than
+          # adding a checkout for one API call.
+          assets="$(gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')"
           echo "$assets"
           missing=0
           for expected in \
