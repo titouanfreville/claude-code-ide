@@ -47,6 +47,15 @@ export interface ReviewQueueItem {
    */
   from_head: boolean;
   diff: string;
+  /** The diff was left out — asked for without diffs, or too large to send. */
+  diff_omitted?: boolean;
+  /**
+   * Git ignores this path: build output, dependencies, a local `.env`. Not up for review —
+   * it is never pushed — but shown as a warning. `file_path` is then the first ignored
+   * level (a directory ends in `/`), standing for `ignored_files` written files.
+   */
+  ignored?: boolean;
+  ignored_files?: number;
 }
 
 /** The "before" side of a reviewed file — content, plus what kind of baseline it is. */
@@ -186,6 +195,13 @@ export interface DiscoverableSession {
    * much work to repeat every poll just to show a number.
    */
   unreviewed_files: number;
+  /**
+   * The launch currently in this conversation — the id an IDE minted when it started the
+   * process. A process that `/resume`s or `/clear`s changes conversation; this is how the
+   * IDE that launched it can follow it. Absent when no launch is known, or from a daemon
+   * too old to say.
+   */
+  launch_id?: string;
 }
 
 /** The leading characters of a session id — enough to tell two sessions apart by eye. */
@@ -271,7 +287,15 @@ export interface UsageResponse {
  */
 const REQUEST_TIMEOUT_MS = 3000;
 
-function request<T>(method: string, urlPath: string, body?: unknown): Promise<T> {
+/** The review queue reads every reviewed file from disk; it gets far longer than a status read. */
+const QUEUE_TIMEOUT_MS = 60_000;
+
+function request<T>(
+  method: string,
+  urlPath: string,
+  body?: unknown,
+  timeoutMs: number = REQUEST_TIMEOUT_MS
+): Promise<T> {
   return new Promise((resolve, reject) => {
     const base = controlBaseUrl();
     if (!base) {
@@ -315,8 +339,8 @@ function request<T>(method: string, urlPath: string, body?: unknown): Promise<T>
     req.on('error', reject);
     // A daemon that accepts the socket and then stops answering would otherwise hold
     // this promise open forever, which wedges the poll exactly as the parse throw did.
-    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
-      req.destroy(new Error(`${method} ${urlPath} → timed out after ${REQUEST_TIMEOUT_MS}ms`));
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`${method} ${urlPath} → timed out after ${timeoutMs}ms`));
     });
     if (payload) {
       req.write(payload);
@@ -337,8 +361,30 @@ export function usage(): Promise<UsageResponse> {
   return request('GET', '/control/usage');
 }
 
-export function reviewQueue(): Promise<ReviewQueueItem[]> {
-  return request('GET', '/control/review-queue');
+/**
+ * Unreviewed files, narrowed to one `session` and/or `path` when given. `diffs: false`
+ * leaves each diff empty — across a fleet that wrote build output they run to tens of
+ * megabytes. A daemon too old to know the parameters answers with everything, so the
+ * result is filtered here too.
+ */
+export async function reviewQueue(
+  opts: { session?: string; path?: string; diffs?: boolean } = {}
+): Promise<ReviewQueueItem[]> {
+  const query = new URLSearchParams();
+  if (opts.session) query.set('session', opts.session);
+  if (opts.path) query.set('path', opts.path);
+  if (opts.diffs === false) query.set('diffs', 'false');
+  const qs = query.toString();
+  const all = await request<ReviewQueueItem[]>(
+    'GET',
+    `/control/review-queue${qs ? `?${qs}` : ''}`,
+    undefined,
+    QUEUE_TIMEOUT_MS
+  );
+  return all.filter(
+    (i) =>
+      (!opts.session || i.session_id === opts.session) && (!opts.path || i.file_path === opts.path)
+  );
 }
 
 export function accept(sessionId: string, filePath: string): Promise<void> {
@@ -471,6 +517,28 @@ export function safeEndpointUrl(url: string): string | undefined {
 /** A session id we are willing to put on a command line — the shape Claude Code mints. */
 export function isSafeSessionId(id: string): boolean {
   return /^[0-9a-fA-F-]{8,64}$/.test(id);
+}
+
+/** Ties a launched process back to its launch — see `crates/control/src/launches.rs`. */
+export const LAUNCH_ENV = 'MOONLIGHT_LAUNCH_ID';
+
+/**
+ * The line typed into a terminal to start a governed session, or `undefined` for an id
+ * that is not the shape we mint (it is interpolated into a shell line).
+ *
+ * `env MOONLIGHT_LAUNCH_ID=<id>` rather than a `VAR=value` prefix because `env` reads the
+ * same in bash, zsh and fish. The variable is what keeps the session's MCP verbs working
+ * after `/resume` or `/clear` change its conversation: Claude Code hands it to every hook
+ * it runs, and the daemon follows the launch to wherever the hooks say it is now. Without
+ * it, the endpoint stays bound to the minted id and every verb answers "session not found".
+ *
+ * `mcpFlag` is {@link mcpConfigFlag}'s output — already validated and quoted — or `''`.
+ */
+export function launchCommand(sessionId: string, mcpFlag: string): string | undefined {
+  if (!isSafeSessionId(sessionId)) {
+    return undefined;
+  }
+  return `env ${LAUNCH_ENV}=${sessionId} claude --session-id ${sessionId}${mcpFlag}`;
 }
 
 /**

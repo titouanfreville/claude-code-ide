@@ -293,7 +293,8 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       let queue: controlApi.ReviewQueueItem[];
       try {
-        queue = await controlApi.reviewQueue();
+        // Ignored paths are warnings, not files to diff.
+        queue = (await controlApi.reviewQueue({ diffs: false })).filter((i) => !i.ignored);
       } catch (err) {
         void vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
         return;
@@ -449,9 +450,13 @@ export function activate(context: vscode.ExtensionContext): void {
                 return;
               }
               reviewTarget = message.sessionId;
-              const item = (await controlApi.reviewQueue()).find(
-                (i) => i.session_id === message.sessionId && i.file_path === message.path
-              );
+              const item = (
+                await controlApi.reviewQueue({
+                  session: message.sessionId,
+                  path: message.path,
+                  diffs: false,
+                })
+              ).find((i) => !i.ignored);
               if (item) {
                 await openDiff(item, reviewComments);
               }
@@ -569,7 +574,7 @@ async function renderQueue(panel: vscode.WebviewPanel): Promise<void> {
   let items: controlApi.ReviewQueueItem[] = [];
   let error: string | undefined;
   try {
-    items = await controlApi.reviewQueue();
+    items = await controlApi.reviewQueue({ diffs: false });
   } catch (err) {
     error = err instanceof Error ? err.message : String(err);
   }
@@ -601,7 +606,10 @@ function renderHtml(items: controlApi.ReviewQueueItem[], error: string | undefin
     ? `<p class="error">${esc(error)}</p>`
     : items.length === 0
       ? '<p>Nothing pending review.</p>'
-      : items.map(renderItem).join('\n');
+      : [...items]
+          .sort((a, b) => Number(!!a.ignored) - Number(!!b.ignored))
+          .map(renderItem)
+          .join('\n');
 
   return `<!DOCTYPE html>
 <html>
@@ -701,6 +709,18 @@ function badges(item: controlApi.ReviewQueueItem): string {
 function renderItem(item: controlApi.ReviewQueueItem): string {
   const session = esc(item.session_id);
   const filePath = esc(item.file_path);
+  if (item.ignored) {
+    // A warning, not work: ignored files are never pushed, so they get no diff — only a
+    // heads-up that they changed, masked at the first ignored level.
+    return `<div class="item">
+  <h3>⚠ ${esc(item.file_path.replace(/\/$/, '').split('/').pop() ?? item.file_path)}${item.file_path.endsWith('/') ? '/' : ''}</h3>
+  <div class="meta">${esc(item.file_path)}</div>
+  <div class="meta">${esc(item.session_title ?? item.session_id)} <span class="badge warn">git-ignored · ${item.ignored_files ?? 0} file(s) changed, not reviewed</span></div>
+  <div>
+    <button data-accept data-session="${session}" data-path="${filePath}">Mark reviewed</button>
+  </div>
+</div>`;
+  }
   const name = esc(item.file_path.split('/').pop() ?? item.file_path);
   return `<div class="item">
   <h3>${name}</h3>

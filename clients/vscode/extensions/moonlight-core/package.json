@@ -2,7 +2,7 @@
   "name": "moonlight-core",
   "displayName": "MoonlightCode Core",
   "description": "Shared backend connection, session state and owned-terminal registry. Every other MoonlightCode extension depends on this one.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": false,
   "publisher": "titouanfreville",
   "license": "MIT",
@@ -37,26 +37,56 @@
   },
   "types": "./out/api.d.ts",
   "contributes": {
-    "configuration": {
-      "title": "MoonlightCode",
-      "properties": {
-        "moonlight.daemon.path": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null,
-          "markdownDescription": "Absolute path to the `moonlightd` binary this window should start. Leave empty to use the `MOONLIGHT_DAEMON_BIN` environment variable, then the first `moonlightd` on `PATH`.\n\nSet this when you build the daemon yourself and want the editor to start *your* build rather than the installed one. If the path is set but not executable, no daemon is started — a named daemon is never silently swapped for a different one.",
-          "scope": "machine-overridable"
-        },
-        "moonlight.daemon.autostart": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Start `moonlightd` from this window when the backend is unreachable.\n\nTurn this off if you run the daemon yourself — from a terminal, a debugger, or a service manager. The editor keeps talking to whichever daemon is running; it just stops starting one, so your process is not displaced by an autostart on the poll loop.\n\nWith this off and no daemon running, sessions are ungoverned: the hooks fail open.",
-          "scope": "machine-overridable"
+    "configuration": [
+      {
+        "title": "Daemon",
+        "order": 0,
+        "properties": {
+          "moonlight.daemon.path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "default": null,
+            "markdownDescription": "Absolute path to the `moonlightd` binary this window should start. Leave empty to use the `MOONLIGHT_DAEMON_BIN` environment variable, then the first `moonlightd` on `PATH`.\n\nSet this when you build the daemon yourself and want the editor to start *your* build rather than the installed one. If the path is set but not executable, no daemon is started — a named daemon is never silently swapped for a different one.",
+            "scope": "machine-overridable"
+          },
+          "moonlight.daemon.autostart": {
+            "type": "boolean",
+            "default": true,
+            "markdownDescription": "Start `moonlightd` from this window when the backend is unreachable.\n\nTurn this off if you run the daemon yourself — from a terminal, a debugger, or a service manager. The editor keeps talking to whichever daemon is running; it just stops starting one, so your process is not displaced by an autostart on the poll loop.\n\nWith this off and no daemon running, sessions are ungoverned: the hooks fail open.",
+            "scope": "machine-overridable"
+          }
+        }
+      },
+      {
+        "title": "Sessions",
+        "order": 1,
+        "properties": {
+          "moonlight.sessions.groupBy": {
+            "type": "string",
+            "enum": [
+              "project",
+              "custom",
+              "none"
+            ],
+            "enumDescriptions": [
+              "Group sessions by their project root.",
+              "Group by the groups you create; anything ungrouped still falls back to its project.",
+              "One flat list, ordered worst-first."
+            ],
+            "default": "project",
+            "markdownDescription": "How the session lists in the MoonlightCode sidebar are arranged.\n\nGrouping applies **within** the Governed and Not-adopted views — those stay separate lists. A single group is rendered flat, since one header over the whole list carries no information.\n\n*Requires the **MoonlightCode Session Control** extension; without it this setting has no effect.*",
+            "scope": "resource"
+          },
+          "moonlight.session.autoAdopt": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "Adopt new Claude Code sessions into MoonlightCode governance automatically, without being asked.\n\nOnly sessions belonging to **this window** are taken — the session root has to sit inside this workspace, or be the session you are working in. Every open window sees the whole fleet, so an unscoped rule would have them all racing to adopt every session.\n\n**An auto-adopted session lands on `Plan`, where project writes are denied** until you advance its phase. That is adoption’s normal behaviour, not an extra restriction — but applied automatically it means a new session stops until you act, so it is off by default.\n\n*Requires the **MoonlightCode Session Control** extension; without it this setting has no effect.*"
+          }
         }
       }
-    }
+    ]
   },
   "keywords": [
     "claude",

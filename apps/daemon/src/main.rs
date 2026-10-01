@@ -209,22 +209,33 @@ fn main() {
         let notifier: Arc<dyn moonlight_control::ApprovalNotifier> =
             Arc::new(BusNotifier { bus: bus.clone() });
 
+        // Which conversation each IDE-launched process is in now. The hook gate writes
+        // it; the MCP endpoints and the control API read it — see
+        // `moonlight_control::launches` for why a launch id alone goes stale.
+        let launches: moonlight_control::SharedLaunches =
+            Arc::new(moonlight_control::LaunchRegistry::new());
+
         let mcp_host = build_mcp_host(
             &bus,
             commands.clone(),
             store.clone(),
             pending.clone(),
             notifier.clone(),
+            launches.clone(),
         );
         let api_pending = pending.clone();
 
         tokio::spawn(run_control_server(
             hook_listener,
-            gate_view,
+            gate_view.clone(),
             pending,
             notifier,
             changes.clone(),
             verbs,
+            (
+                launches.clone(),
+                keep_launches_governed(gate_view, commands.clone()),
+            ),
         ));
 
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
@@ -269,6 +280,7 @@ fn main() {
         // The same registry the gate holds on, so a client's verdict resolves the hook
         // actually waiting rather than a second, unrelated one.
         .with_pending(api_pending)
+        .with_launches(launches)
         .with_mcp_host(mcp_host);
         if let Err(e) = control_api::serve(state, listener).await {
             tracing::error!(error = %e, "control API stopped");
@@ -448,6 +460,7 @@ fn build_mcp_host(
     store: Arc<moonlight_persistence::Store>,
     pending: Arc<moonlight_control::PendingApprovals>,
     notifier: Arc<dyn moonlight_control::ApprovalNotifier>,
+    launches: moonlight_control::SharedLaunches,
 ) -> Arc<moonlight_mcp_server::McpHost> {
     let policy = Arc::new(moonlight_mcp_server::BusPolicyView::new());
     {
@@ -477,11 +490,65 @@ fn build_mcp_host(
             )),
         ));
 
-    Arc::new(moonlight_mcp_server::McpHost::with_scope(
-        actor,
-        policy,
-        moonlight_mcp_server::VerbScope::WorkflowOnly,
-    ))
+    Arc::new(
+        moonlight_mcp_server::McpHost::with_scope(
+            actor,
+            policy,
+            moonlight_mcp_server::VerbScope::WorkflowOnly,
+        )
+        // Endpoints follow their launch to its current conversation, so `/resume` and
+        // `/clear` do not leave a session with verbs that address a conversation it left.
+        .with_launches(launches),
+    )
+}
+
+/// How long to wait before asking again to adopt a launched process's conversation.
+///
+/// The engine drops an adoption for a session detection has not seen yet — a `/clear`ed
+/// conversation has no transcript until its first turn — so the request is repeated on a
+/// later hook rather than sent once and lost. Bounded so a busy session's stream of hooks
+/// is not a stream of commands.
+const LAUNCH_ADOPT_RETRY: Duration = Duration::from_secs(5);
+
+/// Keep a process an IDE launched under governance, whichever conversation it is in.
+///
+/// Starting a session through MoonlightCode *is* the decision to govern it — every IDE
+/// adopts its own launches. A `/resume` into an old conversation, or a `/clear` into a new
+/// one, used to slip out from under that: the process carried on in a conversation nobody
+/// had adopted, and an unadopted session is allowed everything. So any conversation a
+/// launched process is in gets adopted (landing on `Plan`, as every adoption does). One
+/// already adopted keeps its own phase — this only ever turns governance on.
+fn keep_launches_governed(
+    gate_view: moonlight_control::GateView,
+    commands: mpsc::UnboundedSender<Command>,
+) -> Option<moonlight_control::LaunchObserver> {
+    let asked: Arc<
+        std::sync::Mutex<HashMap<moonlight_domain::ids::SessionId, std::time::Instant>>,
+    > = Arc::default();
+    Some(Arc::new(move |launch, session, _observation| {
+        let adopted = gate_view
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session)
+            .is_some_and(|gate| gate.adopted);
+        if adopted {
+            return;
+        }
+        let mut asked = asked.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        if asked
+            .get(session)
+            .is_some_and(|at| now.duration_since(*at) < LAUNCH_ADOPT_RETRY)
+        {
+            return;
+        }
+        asked.insert(session.clone(), now);
+        tracing::info!(launch, session = %session, "adopting the conversation a launched process is in");
+        let _ = commands.send(Command::SetAdopted {
+            session: session.clone(),
+            adopted: true,
+        });
+    }))
 }
 
 /// Host the hook `ControlServer` — the actual phase/trust enforcement, answering
@@ -499,6 +566,11 @@ async fn run_control_server(
     notifier: Arc<dyn moonlight_control::ApprovalNotifier>,
     changes: Arc<dyn SessionChangeStore>,
     verbs: Verbs,
+    // The launch registry the hook gate feeds, and what to do on each observation.
+    (launches, on_launch): (
+        moonlight_control::SharedLaunches,
+        Option<moonlight_control::LaunchObserver>,
+    ),
 ) {
     // `ControlServer::new` is the degraded-standalone posture: `NoopNotifier` +
     // `DEFAULT_HOLD` (45s) — see the module doc on why that's the right default
@@ -527,7 +599,10 @@ async fn run_control_server(
         // to a session that has no such tool costs it a turn and ends in a confused
         // retry, and saying it has "no tool to ask with" when it does is how an agent
         // sits in Plan writing prose at an operator who is waiting for a plan panel.
-        .with_mcp_verbs(Arc::new(move |_| verbs)),
+        .with_mcp_verbs(Arc::new(move |_| verbs))
+        // Every hook says which conversation its launched process is in; this is what
+        // the MCP endpoints resolve through.
+        .with_launches(launches, on_launch),
     );
     server.serve(listener).await;
 }
@@ -625,6 +700,73 @@ mod tests {
     use moonlight_domain::trust::TrustTier;
     use moonlight_persistence::Store;
 
+    fn governance_observer() -> (
+        moonlight_control::LaunchObserver,
+        moonlight_control::GateView,
+        mpsc::UnboundedReceiver<Command>,
+    ) {
+        let gates: moonlight_control::GateView = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            keep_launches_governed(gates.clone(), tx).expect("an observer"),
+            gates,
+            rx,
+        )
+    }
+
+    /// A process MoonlightCode launched must not leave governance by `/resume`ing into a
+    /// conversation nobody adopted.
+    #[test]
+    fn a_launched_process_in_an_unadopted_conversation_gets_it_adopted_once() {
+        let (observe, _gates, mut rx) = governance_observer();
+        let session = SessionId::new("213d1944");
+        observe(
+            "a05a347e",
+            &session,
+            &moonlight_control::LaunchObservation::New,
+        );
+        // A burst of hooks right after is not a burst of commands.
+        observe(
+            "a05a347e",
+            &session,
+            &moonlight_control::LaunchObservation::Unchanged,
+        );
+
+        match rx.try_recv() {
+            Ok(Command::SetAdopted {
+                session: s,
+                adopted: true,
+            }) => assert_eq!(s, session),
+            other => panic!("expected one adoption, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_adopted_conversation_is_left_alone() {
+        let (observe, gates, mut rx) = governance_observer();
+        let session = SessionId::new("213d1944");
+        gates.write().unwrap().insert(
+            session.clone(),
+            GateState {
+                adopted: true,
+                phase: Phase::AutoImplement,
+                ..GateState::default()
+            },
+        );
+        observe(
+            "a05a347e",
+            &session,
+            &moonlight_control::LaunchObservation::Moved {
+                from: SessionId::new("a05a347e"),
+            },
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "an adopted conversation keeps its own phase"
+        );
+    }
+
     fn temp_socket_path(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("moonlightd-test-{}-{tag}.sock", std::process::id()))
     }
@@ -636,6 +778,7 @@ mod tests {
             tool_name: "Edit".to_string(),
             tool_input: serde_json::json!({ "file_path": "/repo/src/main.rs" }),
             cwd: "/repo".to_string(),
+            launch_id: None,
         }
     }
 
@@ -723,6 +866,7 @@ mod tests {
             // These tests exercise gating, not the brief's wording; the verbs a real
             // daemon reports depend on a registration written to the operator's $HOME.
             Verbs::Unavailable,
+            (Arc::new(moonlight_control::LaunchRegistry::new()), None),
         ));
         wait_for_socket(path).await;
     }

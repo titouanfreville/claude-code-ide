@@ -90,7 +90,12 @@ pub struct PresentPlanParams {
 #[derive(Clone)]
 pub struct VerbToolServer {
     actor: Arc<dyn McpActor>,
+    /// The session this server was bound to — for an IDE launch, the launch id.
     session: SessionId,
+    /// When set, `session` is a launch id and each verb acts on that launch's *current*
+    /// conversation, so a process that `/resume`d or `/clear`ed keeps its verbs. See
+    /// `moonlight_control::launches`.
+    launches: Option<moonlight_control::SharedLaunches>,
     tool_router: ToolRouter<Self>,
     /// Kept so [`ServerHandler::get_info`] can describe the verbs this host actually
     /// serves. The router already withdraws the rest, but `instructions` is prose the
@@ -177,8 +182,23 @@ impl VerbToolServer {
         Self {
             actor,
             session,
+            launches: None,
             tool_router,
             scope,
+        }
+    }
+
+    /// Resolve the session per call through `launches` (see the field).
+    pub fn with_launches(mut self, launches: Option<moonlight_control::SharedLaunches>) -> Self {
+        self.launches = launches;
+        self
+    }
+
+    /// The session a verb acts on *now*.
+    fn current_session(&self) -> SessionId {
+        match &self.launches {
+            Some(launches) => launches.resolve(self.session.as_str()),
+            None => self.session.clone(),
         }
     }
 
@@ -186,7 +206,7 @@ impl VerbToolServer {
     /// (the compact output, or the actor error).
     async fn dispatch(&self, verb: McpVerb, payload: String) -> String {
         let request = ActorRequest {
-            session: self.session.clone(),
+            session: self.current_session(),
             verb,
             payload,
         };
@@ -330,7 +350,7 @@ pub async fn serve_http(
     session: SessionId,
     listener: tokio::net::TcpListener,
 ) -> std::io::Result<()> {
-    serve_http_scoped(actor, session, listener, VerbScope::All).await
+    serve_http_scoped(actor, session, listener, VerbScope::All, None).await
 }
 
 /// As [`serve_http`], but offering only the verbs this host can honour.
@@ -339,6 +359,7 @@ pub async fn serve_http_scoped(
     session: SessionId,
     listener: tokio::net::TcpListener,
     scope: VerbScope,
+    launches: Option<moonlight_control::SharedLaunches>,
 ) -> std::io::Result<()> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
@@ -348,11 +369,10 @@ pub async fn serve_http_scoped(
     // A fresh tool server per MCP session, bound to this CC session id.
     let service = StreamableHttpService::new(
         move || {
-            Ok(VerbToolServer::with_scope(
-                actor.clone(),
-                session.clone(),
-                scope,
-            ))
+            Ok(
+                VerbToolServer::with_scope(actor.clone(), session.clone(), scope)
+                    .with_launches(launches.clone()),
+            )
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
@@ -371,6 +391,7 @@ pub struct McpHost {
     actor: Arc<dyn McpActor>,
     policy: Arc<crate::BusPolicyView>,
     scope: VerbScope,
+    launches: Option<moonlight_control::SharedLaunches>,
 }
 
 impl McpHost {
@@ -379,6 +400,7 @@ impl McpHost {
             actor,
             policy,
             scope: VerbScope::All,
+            launches: None,
         }
     }
 
@@ -405,6 +427,25 @@ impl McpHost {
             actor,
             policy,
             scope,
+            launches: None,
+        }
+    }
+
+    /// Bind every endpoint this host spawns to a *launch* rather than a conversation:
+    /// verbs resolve through `launches` on each call, so a process that changes
+    /// conversation keeps working verbs. Wired by a host that also feeds `launches` from
+    /// the hook gate (the daemon); without it endpoints keep their bound id, as before.
+    pub fn with_launches(mut self, launches: moonlight_control::SharedLaunches) -> Self {
+        self.launches = Some(launches);
+        self
+    }
+
+    /// The session a verb for `launch` acts on now, or `launch` itself when this host
+    /// does not track launches.
+    pub fn resolve_launch(&self, launch: &str) -> SessionId {
+        match &self.launches {
+            Some(launches) => launches.resolve(launch),
+            None => SessionId::new(launch.to_string()),
         }
     }
 
@@ -423,8 +464,9 @@ impl McpHost {
         let port = listener.local_addr()?.port();
         let actor = self.actor.clone();
         let scope = self.scope;
+        let launches = self.launches.clone();
         tokio::spawn(async move {
-            if let Err(err) = serve_http_scoped(actor, session, listener, scope).await {
+            if let Err(err) = serve_http_scoped(actor, session, listener, scope, launches).await {
                 tracing::warn!(error = %err, "embedded MCP server stopped");
             }
         });
@@ -435,6 +477,50 @@ impl McpHost {
 #[cfg(test)]
 mod scope_tests {
     use super::*;
+
+    struct NoActor;
+
+    #[async_trait::async_trait]
+    impl McpActor for NoActor {
+        async fn run(
+            &self,
+            _req: &moonlight_domain::ports::mcp::ActorRequest,
+        ) -> Result<moonlight_domain::ports::mcp::ActorResult, moonlight_domain::ControlError>
+        {
+            unreachable!("not called")
+        }
+    }
+
+    /// The bug: a verb bound at launch kept naming the launch id after `/resume`.
+    #[test]
+    fn a_verb_server_bound_to_a_launch_acts_on_its_current_conversation() {
+        let launches: moonlight_control::SharedLaunches =
+            Arc::new(moonlight_control::LaunchRegistry::new());
+        let server = VerbToolServer::with_scope(
+            Arc::new(NoActor),
+            SessionId::new("a05a347e"),
+            VerbScope::WorkflowOnly,
+        )
+        .with_launches(Some(launches.clone()));
+        assert_eq!(
+            server.current_session(),
+            SessionId::new("a05a347e"),
+            "before any hook: the launch id"
+        );
+
+        launches.observe("a05a347e", &SessionId::new("213d1944"));
+        assert_eq!(server.current_session(), SessionId::new("213d1944"));
+    }
+
+    #[test]
+    fn a_verb_server_without_launches_keeps_its_bound_session() {
+        let server = VerbToolServer::with_scope(
+            Arc::new(NoActor),
+            SessionId::new("a05a347e"),
+            VerbScope::WorkflowOnly,
+        );
+        assert_eq!(server.current_session(), SessionId::new("a05a347e"));
+    }
 
     fn names(scope: VerbScope) -> Vec<String> {
         let mut router = VerbToolServer::tool_router();

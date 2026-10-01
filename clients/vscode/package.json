@@ -16,7 +16,8 @@
     "test": "npm run compile && npm run test --workspaces --if-present && node --test scripts/",
     "link:local": "node scripts/link-local.js",
     "postinstall": "node scripts/link-local.js",
-    "bundle": "npm run bundle --workspaces --if-present"
+    "bundle": "npm run bundle --workspaces --if-present",
+    "install:local": "scripts/install-local.sh"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

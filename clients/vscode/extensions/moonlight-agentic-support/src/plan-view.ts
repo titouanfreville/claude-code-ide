@@ -218,16 +218,23 @@ export class PlanReviewPanel {
     .md code { font-family: var(--vscode-editor-font-family); font-size: .9em;
                background: var(--vscode-textCodeBlock-background); padding: .1em .3em;
                border-radius: 3px; }
-    .md pre.code { font-family: var(--vscode-editor-font-family); font-size: .9em;
-                   background: var(--vscode-textCodeBlock-background); padding: .6rem .8rem;
-                   border-radius: 4px; overflow-x: auto; white-space: pre; margin: .5rem 0; }
-    .md pre.code code { background: none; padding: 0; }
+    .md pre { font-family: var(--vscode-editor-font-family); font-size: .9em;
+              background: var(--vscode-textCodeBlock-background); padding: .6rem .8rem;
+              border-radius: 4px; overflow-x: auto; white-space: pre; margin: .5rem 0; }
+    .md pre code { background: none; padding: 0; font-size: 1em; }
     .md blockquote { margin: .4rem 0; padding-left: .8rem;
                      border-left: 3px solid var(--vscode-textBlockQuote-border, var(--vscode-panel-border));
                      color: var(--vscode-descriptionForeground); }
     .md a { color: var(--vscode-textLink-foreground); }
     .md hr { border: 0; border-top: 1px solid var(--vscode-panel-border); margin: .8rem 0; }
     .md strong { font-weight: 600; }
+    /* Wide tables scroll inside the section instead of widening the whole panel. */
+    .md table { display: block; overflow-x: auto; max-width: 100%; margin: .5rem 0;
+                border-collapse: collapse; font-size: .92em; }
+    .md th, .md td { border: 1px solid var(--vscode-panel-border); padding: .3rem .6rem;
+                     text-align: left; vertical-align: top; line-height: 1.4; }
+    .md th { font-weight: 600; background: var(--vscode-textCodeBlock-background); }
+    .md s { opacity: .7; }
     /* A quiet affordance: present on every section, loud on none. */
     .note { margin: .35rem 0 .1rem; }
     .add-comment { background: none; color: var(--vscode-descriptionForeground);

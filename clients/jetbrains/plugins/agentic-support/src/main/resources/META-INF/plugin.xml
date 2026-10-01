@@ -1,0 +1,41 @@
+<idea-plugin>
+    <id>io.github.titouanfreville.moonlight.agentic-support</id>
+    <name>MoonlightCode Agentic Support</name>
+    <vendor url="https://github.com/titouanfreville/moonlight-ide-plugins">titouanfreville</vendor>
+
+    <description><![CDATA[
+    <p>The plan gate and held approvals, answered from the IDE. When a governed Claude Code
+    session proposes a plan, it opens as a review tab in the window that owns the session:
+    the plan in sections, a comment box per section, and four verdicts — Approve, Open
+    question, Refine, No-go — sent back to the agent with your comments anchored to the
+    sections they are about.</p>
+    <p>A danger-zone action held by a frozen phase is answered from a notification with
+    Allow or Refuse; refusing asks why, because the agent is told and acts on it.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>io.github.titouanfreville.moonlight.core</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <fileEditorProvider implementation="io.github.titouanfreville.moonlight.agentic.PlanReviewEditorProvider"/>
+        <!-- Sticky: a hold stops the session until answered, and a toast that fades on its
+             own is how an agent ends up blocked with nobody noticing. -->
+        <notificationGroup id="MoonlightCode Holds" displayType="STICKY_BALLOON"/>
+        <postStartupActivity implementation="io.github.titouanfreville.moonlight.agentic.AgenticStartup"/>
+    </extensions>
+
+    <actions>
+        <action id="Moonlight.Gate.ReviewPlan"
+                class="io.github.titouanfreville.moonlight.agentic.AnswerSessionHoldAction"
+                text="MoonlightCode: Answer the Held Session"
+                description="Open the plan review, or allow/refuse the held action, for the selected or blocked session"/>
+        <action id="Moonlight.Gate.AnswerHold"
+                class="io.github.titouanfreville.moonlight.agentic.AnswerAnyHoldAction"
+                text="MoonlightCode: Answer a Held Action…"
+                description="Pick any outstanding hold and answer it"/>
+        <action id="Moonlight.Gate.OpenPlan"
+                class="io.github.titouanfreville.moonlight.agentic.OpenPlanAction"
+                text="MoonlightCode: Review Proposed Plan"
+                description="Open the plan the active session last proposed"/>
+    </actions>
+</idea-plugin>

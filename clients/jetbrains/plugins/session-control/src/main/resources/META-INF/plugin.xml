@@ -1,0 +1,121 @@
+<idea-plugin>
+    <id>io.github.titouanfreville.moonlight.session-control</id>
+    <name>MoonlightCode Session Control</name>
+    <vendor url="https://github.com/titouanfreville/moonlight-ide-plugins">titouanfreville</vendor>
+
+    <description><![CDATA[
+    <p>Govern Claude Code sessions from the IDE: see every session in a MoonlightCode tool
+    window — governed and ungoverned in two separate lists — adopt them into governance, set
+    or advance their workflow phase, group them, say which one you are working in, and start
+    new governed sessions in a terminal MoonlightCode owns.</p>
+    <p>A freshly adopted session starts in <b>Plan</b>, where project writes are denied, until
+    you advance its phase.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>io.github.titouanfreville.moonlight.core</depends>
+
+    <extensions defaultExtensionNs="io.github.titouanfreville.moonlight.core">
+        <toolWindowTab id="sessions" implementation="io.github.titouanfreville.moonlight.sessions.SessionsTab" order="first"/>
+    </extensions>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <projectConfigurable parentId="tools"
+                             id="io.github.titouanfreville.moonlight.sessions"
+                             displayName="MoonlightCode Sessions"
+                             instance="io.github.titouanfreville.moonlight.sessions.SessionControlConfigurable"/>
+        <postStartupActivity implementation="io.github.titouanfreville.moonlight.sessions.SessionControlStartup"/>
+    </extensions>
+
+    <actions>
+        <action id="Moonlight.SessionControl.StartSession"
+                class="io.github.titouanfreville.moonlight.sessions.StartSessionAction"
+                text="MoonlightCode: Start Governed Claude Session"
+                description="Start Claude Code in a terminal MoonlightCode owns, and adopt it"
+                icon="AllIcons.Actions.Execute"/>
+        <action id="Moonlight.SessionControl.Resume"
+                class="io.github.titouanfreville.moonlight.sessions.ResumeSessionAction"
+                text="MoonlightCode: Resume Session"
+                description="Bring an ended session back in a terminal, on the conversation it was in"
+                icon="AllIcons.Actions.Restart"/>
+        <action id="Moonlight.SessionControl.AutoResume"
+                class="io.github.titouanfreville.moonlight.sessions.AutoResumeToggleAction"
+                text="Auto-Resume Sessions"
+                description="Resume this window's sessions on IDE start, and relaunch one that crashed mid-work"
+                icon="AllIcons.Actions.Rerun"/>
+        <action id="Moonlight.SessionControl.Refresh"
+                class="io.github.titouanfreville.moonlight.sessions.RefreshSessionsAction"
+                text="MoonlightCode: Refresh Sessions"
+                icon="AllIcons.Actions.Refresh"/>
+        <action id="Moonlight.SessionControl.Adopt"
+                class="io.github.titouanfreville.moonlight.sessions.AdoptAction"
+                text="MoonlightCode: Adopt a Claude Code Session"
+                description="Opt a session into MoonlightCode governance — it starts in Plan"
+                icon="AllIcons.Ide.Readonly"/>
+        <action id="Moonlight.SessionControl.SetPhase"
+                class="io.github.titouanfreville.moonlight.sessions.SetPhaseAction"
+                text="MoonlightCode: Set Session Phase…"
+                description="Move a governed session to a workflow phase (pins it)"
+                icon="AllIcons.Actions.Edit"/>
+        <action id="Moonlight.SessionControl.AdvancePhase"
+                class="io.github.titouanfreville.moonlight.sessions.AdvancePhaseAction"
+                text="MoonlightCode: Advance Phase"
+                description="Advance to the next phase and return the session to auto"
+                icon="AllIcons.Actions.Forward"/>
+        <action id="Moonlight.SessionControl.SetActive"
+                class="io.github.titouanfreville.moonlight.sessions.SetActiveAction"
+                text="MoonlightCode: Set Active Session…"
+                description="Say which session you are working in"
+                icon="AllIcons.General.Locate"/>
+        <action id="Moonlight.SessionControl.ReviewPlan"
+                class="io.github.titouanfreville.moonlight.sessions.ReviewPlanAction"
+                text="MoonlightCode: Answer the Held Session"
+                icon="AllIcons.General.BalloonWarning"/>
+        <action id="Moonlight.SessionControl.NewGroup"
+                class="io.github.titouanfreville.moonlight.sessions.NewGroupAction"
+                text="MoonlightCode: New Session Group…"
+                icon="AllIcons.Actions.NewFolder"/>
+        <action id="Moonlight.SessionControl.AddToGroup"
+                class="io.github.titouanfreville.moonlight.sessions.AddToGroupAction"
+                text="Add to Group…"/>
+        <action id="Moonlight.SessionControl.RemoveFromGroup"
+                class="io.github.titouanfreville.moonlight.sessions.RemoveFromGroupAction"
+                text="Remove from Group"/>
+        <action id="Moonlight.SessionControl.RenameGroup"
+                class="io.github.titouanfreville.moonlight.sessions.RenameGroupAction"
+                text="Rename Group…"
+                icon="AllIcons.Actions.Edit"/>
+        <action id="Moonlight.SessionControl.DeleteGroup"
+                class="io.github.titouanfreville.moonlight.sessions.DeleteGroupAction"
+                text="Delete Group"
+                description="Delete the group — its sessions fall back to their project group"
+                icon="AllIcons.General.Remove"/>
+
+        <group id="Moonlight.Sessions.Toolbar">
+            <reference ref="Moonlight.SessionControl.StartSession"/>
+            <reference ref="Moonlight.SessionControl.Refresh"/>
+            <reference ref="Moonlight.SessionControl.NewGroup"/>
+            <reference ref="Moonlight.SessionControl.Resume"/>
+            <reference ref="Moonlight.SessionControl.AutoResume"/>
+            <separator/>
+            <reference ref="Moonlight.SessionControl.Adopt"/>
+            <reference ref="Moonlight.SessionControl.SetPhase"/>
+            <reference ref="Moonlight.SessionControl.AdvancePhase"/>
+            <reference ref="Moonlight.SessionControl.SetActive"/>
+        </group>
+
+        <group id="Moonlight.Sessions.Popup">
+            <reference ref="Moonlight.SessionControl.ReviewPlan"/>
+            <reference ref="Moonlight.SessionControl.Resume"/>
+            <reference ref="Moonlight.SessionControl.Adopt"/>
+            <reference ref="Moonlight.SessionControl.SetPhase"/>
+            <reference ref="Moonlight.SessionControl.AdvancePhase"/>
+            <reference ref="Moonlight.SessionControl.SetActive"/>
+            <separator/>
+            <reference ref="Moonlight.SessionControl.AddToGroup"/>
+            <reference ref="Moonlight.SessionControl.RemoveFromGroup"/>
+            <reference ref="Moonlight.SessionControl.RenameGroup"/>
+            <reference ref="Moonlight.SessionControl.DeleteGroup"/>
+        </group>
+    </actions>
+</idea-plugin>

@@ -45,6 +45,7 @@ exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const controlApi = __importStar(require("moonlight-control-client"));
 const ownership_1 = require("./ownership");
+const panel_match_1 = require("./panel-match");
 const daemon_install_1 = require("./daemon-install");
 const gate_state_1 = require("./gate-state");
 const terminals_1 = require("./terminals");
@@ -242,29 +243,55 @@ function activate(context) {
     };
     // Switching tabs switches which session the UI is about, so redraw on tab change.
     context.subscriptions.push(vscode.window.tabGroups.onDidChangeTabGroups(() => changed.fire()), vscode.window.tabGroups.onDidChangeTabs(() => changed.fire()));
+    // The session of the agent panel last in front of you, so moving into an editor
+    // to read what the agent wrote keeps the UI on that agent instead of snapping back
+    // to an older workspace pin. In memory only: after a reload, focus re-derives it.
+    let lastPanelSession;
     const activeSession = () => {
         const known = sessions;
-        // 1. The session linked to the panel in front of you. Most specific, and the
-        //    only answer that stays right when several agent panels are open at once.
+        const exists = (id) => !!id && known.some((s) => s.session_id === id);
+        const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+        const tab = vscode.window.tabGroups.activeTabGroup?.activeTab;
+        const claudePanel = tab?.input instanceof vscode.TabInputWebview && (0, panel_match_1.isClaudePanel)(tab.input.viewType);
+        // 1. The session the operator linked to the panel in front of you. Explicit, so it
+        //    outranks anything read off the tab.
         const key = activePanelKey();
         const forPanel = key ? panelPins[key] : undefined;
-        if (forPanel && known.some((s) => s.session_id === forPanel)) {
+        if (exists(forPanel)) {
+            lastPanelSession = forPanel;
             return { sessionId: forPanel, how: 'panel' };
         }
-        // 2. A session we launched — the id is certain, not inferred. Only when there is
+        // 2. The session a focused Claude Code panel names in its tab label. This is what
+        //    makes several agent panels each follow their own session with no pinning.
+        if (claudePanel && tab) {
+            const matched = (0, panel_match_1.matchPanelSession)(tab.label, known, folders);
+            if (matched) {
+                lastPanelSession = matched;
+                return { sessionId: matched, how: 'panel' };
+            }
+        }
+        // 3. A session we launched — the id is certain, not inferred. Only when there is
         //    exactly one, since several owned terminals are as ambiguous as none.
         const owned = known.filter((s) => terminals.has(s.session_id));
         if (owned.length === 1) {
             return { sessionId: owned[0].session_id, how: 'owned' };
         }
-        // 3. The operator's workspace-wide pin, while it still exists.
-        if (pinned && known.some((s) => s.session_id === pinned)) {
-            return { sessionId: pinned, how: 'pinned' };
+        // A Claude panel is in front of you but its tab names no session we can resolve
+        // (a brand-new, untitled one, or an ambiguous title). Every remembered answer
+        // below is about some *other* panel, so only the labelled guess is left.
+        if (!claudePanel) {
+            // 4. The agent panel you were last in — you are in an editor, not a new agent.
+            if (exists(lastPanelSession)) {
+                return { sessionId: lastPanelSession, how: 'recent' };
+            }
+            // 5. The operator's workspace-wide pin, while it still exists.
+            if (exists(pinned)) {
+                return { sessionId: pinned, how: 'pinned' };
+            }
         }
-        // 3. Exactly one session running in this workspace. A guess, labelled as one —
+        // 6. Exactly one session running in this workspace. A guess, labelled as one —
         //    and only when there is no competition, because naming the wrong session as
         //    governed is worse than admitting we don't know.
-        const folders = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
         const here = known.filter((s) => s.root && folders.some((f) => s.root === f || s.root.startsWith(`${f}/`)));
         const running = here.filter((s) => s.status === 'Running');
         const candidates = running.length > 0 ? running : here;

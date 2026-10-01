@@ -1,0 +1,10 @@
+<idea-plugin>
+    <actions>
+        <group id="Moonlight.Review.SessionPopup">
+            <separator/>
+            <reference ref="Moonlight.Review.OpenSession"/>
+            <reference ref="Moonlight.Review.Reopen"/>
+            <add-to-group group-id="Moonlight.Sessions.Popup" anchor="last"/>
+        </group>
+    </actions>
+</idea-plugin>

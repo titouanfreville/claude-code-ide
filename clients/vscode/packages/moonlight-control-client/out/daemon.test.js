@@ -84,4 +84,15 @@ const index_1 = require("./index");
     strict_1.default.ok(!(0, index_1.isSafeSessionId)('../../etc/passwd'));
     strict_1.default.ok(!(0, index_1.isSafeSessionId)(''));
 });
+/**
+ * The launch id has to reach `claude`'s environment: that is what its hooks inherit, and
+ * what lets the daemon follow the process across `/resume` and `/clear`.
+ */
+(0, node_test_1.test)('the launch command exports the launch id and pins the session', () => {
+    const id = 'c391cd75-fef3-47a8-9ff9-2544aff34d09';
+    strict_1.default.equal((0, index_1.launchCommand)(id, " --mcp-config '{}'"), `env MOONLIGHT_LAUNCH_ID=${id} claude --session-id ${id} --mcp-config '{}'`);
+});
+(0, node_test_1.test)('a malformed id builds no launch command', () => {
+    strict_1.default.equal((0, index_1.launchCommand)("abc'; id; echo '", ''), undefined);
+});
 //# sourceMappingURL=daemon.test.js.map

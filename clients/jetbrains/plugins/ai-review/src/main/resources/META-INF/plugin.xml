@@ -1,0 +1,131 @@
+<idea-plugin>
+    <id>io.github.titouanfreville.moonlight.ai-review</id>
+    <name>MoonlightCode AI Review</name>
+    <vendor url="https://github.com/titouanfreville/moonlight-ide-plugins">titouanfreville</vendor>
+
+    <description><![CDATA[
+    <p>Review what a Claude Code session changed, the way you would review a colleague: the
+    session's changed files as a diff chain, comments on lines or whole files on either side,
+    and one <b>Send review</b> that delivers every pending comment to the session as a single
+    message.</p>
+    <p>Comments live in MoonlightCode's shared tracker, so a review survives closing the IDE
+    and reads the same in VS Code and the desktop app. The agent's answers appear in the same
+    threads. A review is marked delivered only when it actually reached the session — otherwise
+    it stays queued and the message is handed to you to pass on.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>io.github.titouanfreville.moonlight.core</depends>
+    <!-- Adds "Review Session Changes" to the session rows when Session Control is installed. -->
+    <depends optional="true" config-file="review-sessions.xml">io.github.titouanfreville.moonlight.session-control</depends>
+
+    <extensions defaultExtensionNs="io.github.titouanfreville.moonlight.core">
+        <toolWindowTab id="review" implementation="io.github.titouanfreville.moonlight.review.ReviewTab" order="after sessions"/>
+    </extensions>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- Beside the gating indicator: phase and "what changed" read together, as in VS Code. -->
+        <statusBarWidgetFactory id="MoonlightPendingReview"
+                                implementation="io.github.titouanfreville.moonlight.review.PendingReviewWidgetFactory"
+                                order="after MoonlightGating"/>
+        <!-- Sticky: the hand-off carries the message the agent may not have received yet. -->
+        <notificationGroup id="MoonlightCode Review" displayType="STICKY_BALLOON"/>
+        <fileEditorProvider implementation="io.github.titouanfreville.moonlight.review.ReviewDiffEditorProvider"/>
+        <postStartupActivity implementation="io.github.titouanfreville.moonlight.review.ReviewStartup"/>
+    </extensions>
+
+    <!-- No default keybindings: the obvious ones (Cmd+Alt+M) are taken by refactorings. -->
+    <actions>
+        <action id="Moonlight.Review.OpenSession"
+                class="io.github.titouanfreville.moonlight.review.ReviewSessionChangesAction"
+                text="MoonlightCode: Review Session Changes"
+                description="Open the files a session changed as a diff chain, ready for comments"
+                icon="AllIcons.Actions.Diff"/>
+        <action id="Moonlight.Review.OpenQueue"
+                class="io.github.titouanfreville.moonlight.review.OpenReviewQueueAction"
+                text="MoonlightCode: Open Review Queue"/>
+        <action id="Moonlight.Review.Submit"
+                class="io.github.titouanfreville.moonlight.review.SubmitReviewAction"
+                text="MoonlightCode: Send Review"
+                description="Deliver every pending comment to the session as one message"
+                icon="AllIcons.Actions.Upload"/>
+        <action id="Moonlight.Review.Reopen"
+                class="io.github.titouanfreville.moonlight.review.ReopenReviewAction"
+                text="MoonlightCode: Reopen Review from Comments"
+                description="Reopen the files commented on in a session's review"
+                icon="AllIcons.Vcs.History"/>
+        <action id="Moonlight.Review.Refresh"
+                class="io.github.titouanfreville.moonlight.review.RefreshReviewAction"
+                text="MoonlightCode: Refresh Review"
+                icon="AllIcons.Actions.Refresh"/>
+        <action id="Moonlight.Review.ToggleResolved"
+                class="io.github.titouanfreville.moonlight.review.ToggleResolvedAction"
+                text="Show Resolved Threads"
+                description="Draw settled review threads in the editor"
+                icon="AllIcons.RunConfigurations.TestPassed"/>
+        <action id="Moonlight.Review.OpenDiff"
+                class="io.github.titouanfreville.moonlight.review.OpenQueueDiffAction"
+                text="Open Diff and Comment"
+                icon="AllIcons.Actions.Diff"/>
+        <action id="Moonlight.Review.MarkReviewed"
+                class="io.github.titouanfreville.moonlight.review.MarkReviewedAction"
+                text="Mark Reviewed"
+                description="Accept the change and drop it from the queue"
+                icon="AllIcons.Actions.Checked"/>
+        <action id="Moonlight.Review.Ignore"
+                class="io.github.titouanfreville.moonlight.review.IgnoreFileAction"
+                text="Ignore File"
+                description="Stop queueing this file for this session"
+                icon="AllIcons.Actions.Cancel"/>
+        <action id="Moonlight.Review.Reject"
+                class="io.github.titouanfreville.moonlight.review.RejectChangeAction"
+                text="Reject with Feedback…"
+                description="Drop the change from the queue and tell the session what to do instead"
+                icon="AllIcons.General.Remove"/>
+
+        <action id="Moonlight.Review.AddComment"
+                class="io.github.titouanfreville.moonlight.review.AddReviewCommentAction"
+                text="MoonlightCode: Add Review Comment…"
+                description="Comment on the selected lines of a file under review"
+                icon="AllIcons.Toolwindows.ToolWindowMessages">
+            <add-to-group group-id="EditorPopupMenu" anchor="first"/>
+            <!-- The diff viewer has a menu of its own; without this the action is not offered there. -->
+            <add-to-group group-id="Diff.EditorPopupMenu" anchor="first"/>
+        </action>
+        <action id="Moonlight.Review.AddFileComment"
+                class="io.github.titouanfreville.moonlight.review.AddFileReviewCommentAction"
+                text="MoonlightCode: Comment on Whole File…"
+                description="Comment on a file under review as a whole">
+            <add-to-group group-id="EditorPopupMenu" anchor="after" relative-to-action="Moonlight.Review.AddComment"/>
+            <add-to-group group-id="Diff.EditorPopupMenu" anchor="after" relative-to-action="Moonlight.Review.AddComment"/>
+        </action>
+
+        <group id="Moonlight.Review.Toolbar">
+            <reference ref="Moonlight.Review.Refresh"/>
+            <reference ref="Moonlight.Review.OpenSession"/>
+            <reference ref="Moonlight.Review.Submit"/>
+            <reference ref="Moonlight.Review.Reopen"/>
+            <reference ref="Moonlight.Review.ToggleResolved"/>
+            <separator/>
+            <reference ref="Moonlight.Review.OpenDiff"/>
+            <reference ref="Moonlight.Review.MarkReviewed"/>
+            <reference ref="Moonlight.Review.Ignore"/>
+            <reference ref="Moonlight.Review.Reject"/>
+        </group>
+
+        <group id="Moonlight.Review.DiffToolbar">
+            <reference ref="Moonlight.Review.Submit"/>
+            <reference ref="Moonlight.Review.ToggleResolved"/>
+            <separator/>
+            <reference ref="Moonlight.Review.MarkReviewed"/>
+            <reference ref="Moonlight.Review.Reject"/>
+        </group>
+
+        <group id="Moonlight.Review.QueuePopup">
+            <reference ref="Moonlight.Review.OpenDiff"/>
+            <reference ref="Moonlight.Review.MarkReviewed"/>
+            <reference ref="Moonlight.Review.Ignore"/>
+            <reference ref="Moonlight.Review.Reject"/>
+        </group>
+    </actions>
+</idea-plugin>

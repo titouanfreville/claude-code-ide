@@ -657,9 +657,13 @@ pub fn run_hook_client(socket: &Path) {
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return;
     }
-    let Ok(request) = serde_json::from_str::<HookRequest>(&input) else {
+    let Ok(mut request) = serde_json::from_str::<HookRequest>(&input) else {
         return;
     };
+    // From our own environment, which Claude Code inherited from whoever launched it —
+    // never from the payload, which only knows the conversation. This is what lets the
+    // daemon follow a process that `/resume`d or `/clear`ed to its new conversation.
+    request.launch_id = crate::launches::launch_id_from_env();
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

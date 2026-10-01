@@ -33,7 +33,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.FROZEN_PHASES = exports.PLAN_HOLD = exports.subscribeEvents = exports.statusIsWaiting = exports.readFrames = exports.parseEngineEvent = exports.stateAnchor = exports.ensureDaemon = exports.discoveryPath = exports.daemonReachable = exports.daemonBinaryName = exports.controlBaseUrl = void 0;
+exports.LAUNCH_ENV = exports.FROZEN_PHASES = exports.PLAN_HOLD = exports.subscribeEvents = exports.statusIsWaiting = exports.readFrames = exports.parseEngineEvent = exports.stateAnchor = exports.ensureDaemon = exports.discoveryPath = exports.daemonReachable = exports.daemonBinaryName = exports.controlBaseUrl = void 0;
 exports.toThreads = toThreads;
 exports.isReviewable = isReviewable;
 exports.shortId = shortId;
@@ -52,6 +52,7 @@ exports.approvePlan = approvePlan;
 exports.mcpEndpoint = mcpEndpoint;
 exports.safeEndpointUrl = safeEndpointUrl;
 exports.isSafeSessionId = isSafeSessionId;
+exports.launchCommand = launchCommand;
 exports.mcpConfigFlag = mcpConfigFlag;
 exports.pendingApprovals = pendingApprovals;
 exports.baseline = baseline;
@@ -144,7 +145,9 @@ function sessionLabel(session, among) {
  * wedged daemon costs one tick rather than every tick after it.
  */
 const REQUEST_TIMEOUT_MS = 3000;
-function request(method, urlPath, body) {
+/** The review queue reads every reviewed file from disk; it gets far longer than a status read. */
+const QUEUE_TIMEOUT_MS = 60_000;
+function request(method, urlPath, body, timeoutMs = REQUEST_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
         const base = (0, daemon_1.controlBaseUrl)();
         if (!base) {
@@ -182,8 +185,8 @@ function request(method, urlPath, body) {
         req.on('error', reject);
         // A daemon that accepts the socket and then stops answering would otherwise hold
         // this promise open forever, which wedges the poll exactly as the parse throw did.
-        req.setTimeout(REQUEST_TIMEOUT_MS, () => {
-            req.destroy(new Error(`${method} ${urlPath} → timed out after ${REQUEST_TIMEOUT_MS}ms`));
+        req.setTimeout(timeoutMs, () => {
+            req.destroy(new Error(`${method} ${urlPath} → timed out after ${timeoutMs}ms`));
         });
         if (payload) {
             req.write(payload);
@@ -201,8 +204,23 @@ function gatingStatus() {
 function usage() {
     return request('GET', '/control/usage');
 }
-function reviewQueue() {
-    return request('GET', '/control/review-queue');
+/**
+ * Unreviewed files, narrowed to one `session` and/or `path` when given. `diffs: false`
+ * leaves each diff empty — across a fleet that wrote build output they run to tens of
+ * megabytes. A daemon too old to know the parameters answers with everything, so the
+ * result is filtered here too.
+ */
+async function reviewQueue(opts = {}) {
+    const query = new URLSearchParams();
+    if (opts.session)
+        query.set('session', opts.session);
+    if (opts.path)
+        query.set('path', opts.path);
+    if (opts.diffs === false)
+        query.set('diffs', 'false');
+    const qs = query.toString();
+    const all = await request('GET', `/control/review-queue${qs ? `?${qs}` : ''}`, undefined, QUEUE_TIMEOUT_MS);
+    return all.filter((i) => (!opts.session || i.session_id === opts.session) && (!opts.path || i.file_path === opts.path));
 }
 function accept(sessionId, filePath) {
     return request('POST', '/control/review-queue/accept', { session_id: sessionId, path: filePath });
@@ -320,6 +338,26 @@ function safeEndpointUrl(url) {
 /** A session id we are willing to put on a command line — the shape Claude Code mints. */
 function isSafeSessionId(id) {
     return /^[0-9a-fA-F-]{8,64}$/.test(id);
+}
+/** Ties a launched process back to its launch — see `crates/control/src/launches.rs`. */
+exports.LAUNCH_ENV = 'MOONLIGHT_LAUNCH_ID';
+/**
+ * The line typed into a terminal to start a governed session, or `undefined` for an id
+ * that is not the shape we mint (it is interpolated into a shell line).
+ *
+ * `env MOONLIGHT_LAUNCH_ID=<id>` rather than a `VAR=value` prefix because `env` reads the
+ * same in bash, zsh and fish. The variable is what keeps the session's MCP verbs working
+ * after `/resume` or `/clear` change its conversation: Claude Code hands it to every hook
+ * it runs, and the daemon follows the launch to wherever the hooks say it is now. Without
+ * it, the endpoint stays bound to the minted id and every verb answers "session not found".
+ *
+ * `mcpFlag` is {@link mcpConfigFlag}'s output — already validated and quoted — or `''`.
+ */
+function launchCommand(sessionId, mcpFlag) {
+    if (!isSafeSessionId(sessionId)) {
+        return undefined;
+    }
+    return `env ${exports.LAUNCH_ENV}=${sessionId} claude --session-id ${sessionId}${mcpFlag}`;
 }
 /**
  * The `--mcp-config` fragment (leading space included) that wires `url` in as the

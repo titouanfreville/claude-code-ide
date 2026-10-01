@@ -1,0 +1,43 @@
+<idea-plugin>
+    <id>io.github.titouanfreville.moonlight.core</id>
+    <name>MoonlightCode Core</name>
+    <vendor url="https://github.com/titouanfreville/moonlight-ide-plugins">titouanfreville</vendor>
+
+    <description><![CDATA[
+    <p>The shared backend connection for the MoonlightCode plugins: one poll of the
+    <code>moonlightd</code> daemon, one engine event stream, the held-approval state and
+    the registry of terminals MoonlightCode started. Every other MoonlightCode plugin
+    depends on this one.</p>
+    <p>When no daemon is running, it starts one — from the configured path, from
+    <code>PATH</code>, or (in released builds) by downloading a hash-pinned
+    <code>moonlightd</code> for your platform.</p>
+    <p>Settings: <b>Settings ▸ Tools ▸ MoonlightCode</b>.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <!-- Bundled in every JetBrains IDE. Core owns the terminals MoonlightCode starts. -->
+    <depends>org.jetbrains.plugins.terminal</depends>
+
+    <extensionPoints>
+        <!-- The feature plugins' tabs in the one MoonlightCode tool window. -->
+        <extensionPoint name="toolWindowTab"
+                        interface="io.github.titouanfreville.moonlight.core.MoonlightToolWindowTab"
+                        dynamic="true"/>
+    </extensionPoints>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="MoonlightCode"
+                    anchor="left"
+                    icon="/icons/moonlight.svg"
+                    factoryClass="io.github.titouanfreville.moonlight.core.MoonlightToolWindowFactory"/>
+        <postStartupActivity implementation="io.github.titouanfreville.moonlight.core.MoonlightStartup"/>
+        <applicationConfigurable
+                parentId="tools"
+                id="io.github.titouanfreville.moonlight.settings"
+                displayName="MoonlightCode"
+                instance="io.github.titouanfreville.moonlight.core.MoonlightConfigurable"/>
+        <notificationGroup id="MoonlightCode" displayType="BALLOON"/>
+        <!-- Sticky: an offer to resume a session waits for the operator rather than fading. -->
+        <notificationGroup id="MoonlightCode Sessions" displayType="STICKY_BALLOON"/>
+    </extensions>
+</idea-plugin>

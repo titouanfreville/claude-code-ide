@@ -27,6 +27,15 @@ export interface ReviewQueueItem {
      */
     from_head: boolean;
     diff: string;
+    /** The diff was left out — asked for without diffs, or too large to send. */
+    diff_omitted?: boolean;
+    /**
+     * Git ignores this path: build output, dependencies, a local `.env`. Not up for review —
+     * it is never pushed — but shown as a warning. `file_path` is then the first ignored
+     * level (a directory ends in `/`), standing for `ignored_files` written files.
+     */
+    ignored?: boolean;
+    ignored_files?: number;
 }
 /** The "before" side of a reviewed file — content, plus what kind of baseline it is. */
 export type BaselineView = {
@@ -147,6 +156,13 @@ export interface DiscoverableSession {
      * much work to repeat every poll just to show a number.
      */
     unreviewed_files: number;
+    /**
+     * The launch currently in this conversation — the id an IDE minted when it started the
+     * process. A process that `/resume`s or `/clear`s changes conversation; this is how the
+     * IDE that launched it can follow it. Absent when no launch is known, or from a daemon
+     * too old to say.
+     */
+    launch_id?: string;
 }
 /** The leading characters of a session id — enough to tell two sessions apart by eye. */
 export declare function shortId(sessionId: string): string;
@@ -219,7 +235,17 @@ export declare function gatingStatus(): Promise<HookStatusEntry[]>;
  * network round-trip to Anthropic), so polling this on a UI cadence is cheap.
  */
 export declare function usage(): Promise<UsageResponse>;
-export declare function reviewQueue(): Promise<ReviewQueueItem[]>;
+/**
+ * Unreviewed files, narrowed to one `session` and/or `path` when given. `diffs: false`
+ * leaves each diff empty — across a fleet that wrote build output they run to tens of
+ * megabytes. A daemon too old to know the parameters answers with everything, so the
+ * result is filtered here too.
+ */
+export declare function reviewQueue(opts?: {
+    session?: string;
+    path?: string;
+    diffs?: boolean;
+}): Promise<ReviewQueueItem[]>;
 export declare function accept(sessionId: string, filePath: string): Promise<void>;
 export declare function reject(sessionId: string, filePath: string, message: string): Promise<RejectResponse>;
 /**
@@ -289,6 +315,21 @@ export declare function mcpEndpoint(sessionId: string): Promise<{
 export declare function safeEndpointUrl(url: string): string | undefined;
 /** A session id we are willing to put on a command line — the shape Claude Code mints. */
 export declare function isSafeSessionId(id: string): boolean;
+/** Ties a launched process back to its launch — see `crates/control/src/launches.rs`. */
+export declare const LAUNCH_ENV = "MOONLIGHT_LAUNCH_ID";
+/**
+ * The line typed into a terminal to start a governed session, or `undefined` for an id
+ * that is not the shape we mint (it is interpolated into a shell line).
+ *
+ * `env MOONLIGHT_LAUNCH_ID=<id>` rather than a `VAR=value` prefix because `env` reads the
+ * same in bash, zsh and fish. The variable is what keeps the session's MCP verbs working
+ * after `/resume` or `/clear` change its conversation: Claude Code hands it to every hook
+ * it runs, and the daemon follows the launch to wherever the hooks say it is now. Without
+ * it, the endpoint stays bound to the minted id and every verb answers "session not found".
+ *
+ * `mcpFlag` is {@link mcpConfigFlag}'s output — already validated and quoted — or `''`.
+ */
+export declare function launchCommand(sessionId: string, mcpFlag: string): string | undefined;
 /**
  * The `--mcp-config` fragment (leading space included) that wires `url` in as the
  * session's `moonlight` server. `undefined` when the URL is not one we will run.

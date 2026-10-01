@@ -127,8 +127,38 @@ pub fn wrap_statusline(kind: AgentKind, command: String) -> String {
     }
 }
 
+/// Export the launch id on a Claude Code launch, so the process can be followed across
+/// `/resume` and `/clear`.
+///
+/// Those change the process's conversation, and with it the session id its hooks report —
+/// while its `moonlight` MCP endpoint stays bound to the id it was launched with. Claude
+/// Code hands its environment to every hook it runs, so this variable lets the host follow
+/// the launch to wherever the hooks say it is now (see `moonlight_control::launches`).
+///
+/// `env VAR=value` rather than a shell's `VAR=value` prefix: it reads the same in bash, zsh
+/// and fish, and works whether or not a shell parses the line. Claude only — AGY has no
+/// hooks to carry it — and only for an id of the shape we mint, since it lands on a command
+/// line.
+pub fn with_launch_env(kind: AgentKind, launch: &str, command: String) -> String {
+    if kind != AgentKind::ClaudeCode || !moonlight_control::is_launch_id(launch) {
+        return command;
+    }
+    format!("env {}={launch} {command}", moonlight_control::LAUNCH_ENV)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The launch id has to reach Claude's environment — its hooks inherit it, and the
+    /// host follows the launch through them after `/resume`.
+    #[test]
+    fn a_claude_launch_exports_its_launch_id_and_agy_does_not() {
+        let cmd = super::with_launch_env(AgentKind::ClaudeCode, "abc12345", "claude --session-id abc12345".into());
+        assert_eq!(cmd, "env MOONLIGHT_LAUNCH_ID=abc12345 claude --session-id abc12345");
+        assert_eq!(super::with_launch_env(AgentKind::Antigravity, "abc12345", "agy".into()), "agy");
+        // A malformed id lands on no command line.
+        assert_eq!(super::with_launch_env(AgentKind::ClaudeCode, "x; rm -rf ~", "claude".into()), "claude");
+    }
+
     use super::*;
     use crate::views::mcp_host::session_launch_flags;
 

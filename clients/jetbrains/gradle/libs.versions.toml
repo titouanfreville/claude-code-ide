@@ -1,0 +1,22 @@
+[versions]
+# The plugins run on the IDE's bundled Kotlin stdlib — 2.2.20 in 2025.3, the oldest
+# supported platform — so every module compiles against API level 2.2 (see the builds).
+kotlin = "2.4.20"
+intellijPlatform = "2.19.0"
+junit = "5.11.4"
+markdown = "0.7.16"
+shadow = "9.6.1"
+
+[libraries]
+# JetBrains' GFM parser, relocated into libs/plan-markdown for the plan review (why: see
+# its build file).
+markdown = { module = "org.jetbrains:markdown", version.ref = "markdown" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+junit-launcher = { module = "org.junit.platform:junit-platform-launcher" }
+# The IntelliJ Platform's test bootstrap loads JUnit 4's `TestRule` even under JUnit 5.
+junit4 = { module = "junit:junit", version = "4.13.2" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+intellij-platform = { id = "org.jetbrains.intellij.platform", version.ref = "intellijPlatform" }
+shadow = { id = "com.gradleup.shadow", version.ref = "shadow" }

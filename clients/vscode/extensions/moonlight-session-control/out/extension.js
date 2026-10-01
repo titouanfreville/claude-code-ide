@@ -357,6 +357,8 @@ async function registerSessionsView(context, withCore) {
         if (adopting) {
             return;
         }
+        // Declared in moonlight-core's manifest, not this one: VS Code only nests settings
+        // under one Settings entry within a single extension, and core is always installed.
         if (!vscode.workspace.getConfiguration('moonlight').get('session.autoAdopt')) {
             return;
         }

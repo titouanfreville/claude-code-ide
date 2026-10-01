@@ -16,6 +16,7 @@ pub mod gate;
 pub mod git_probe;
 pub mod hook_registration;
 pub mod ipc;
+pub mod launches;
 pub mod paths;
 pub mod pending;
 pub mod probe;
@@ -28,18 +29,22 @@ pub use config::{
     MOONLIGHT_DIR,
 };
 pub use gate::{decide, evaluate, GateDecision, GateState, HoldKind, EXIT_PLAN_MODE, PRESENT_PLAN};
-pub use git_probe::GitProbe;
+pub use git_probe::{ignored_masks, GitProbe};
 pub use hook_registration::{
     ensure_mcp_registered, ensure_registered, install as install_hooks, run_hook_client,
     status as print_hook_status, status_entries as hook_status_entries,
     uninstall as uninstall_hooks, HookStatusEntry, Repair, HOOK_TIMEOUT,
 };
 pub use ipc::{HookRequest, HookResponse};
+pub use launches::{
+    is_launch_id, launch_id_from_env, LaunchObservation, LaunchRegistry, SharedLaunches, LAUNCH_ENV,
+};
 pub use paths::{classify_write_scope, AiWorkspace, AiWorkspaceConfig};
 pub use pending::{ApprovalNotifier, Decision, HeldApproval, PendingApprovals};
 pub use probe::{NoProbe, SharedProbe, WorkspaceProbe};
 pub use server::{
-    bind_singleton_unix_socket, query_hook, ControlServer, GateView, RuntimeSafeTools, DEFAULT_HOLD,
+    bind_singleton_unix_socket, query_hook, ControlServer, GateView, LaunchObserver,
+    RuntimeSafeTools, DEFAULT_HOLD,
 };
 
 use std::sync::Arc;

@@ -54,6 +54,7 @@ pub fn normalize(payload: &Value) -> HookRequest {
         tool_name,
         tool_input,
         cwd,
+        launch_id: None,
     }
 }
 

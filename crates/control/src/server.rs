@@ -22,6 +22,7 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::config::AiWorkspaceResolver;
 use crate::gate::{evaluate, GateDecision, GateState, HoldKind};
 use crate::ipc::{HookRequest, HookResponse};
+use crate::launches::{is_launch_id, LaunchObservation, SharedLaunches};
 use crate::paths::{absolutize, classify_write_scope, write_target, AiWorkspace};
 use crate::pending::{ApprovalNotifier, Decision, PendingApprovals};
 use crate::probe::{NoProbe, SharedProbe};
@@ -109,7 +110,18 @@ pub struct ControlServer {
     /// knows, and a brief that names a tool the session does not have is worse than
     /// one that names none. Wire with [`ControlServer::with_mcp_verbs`].
     mcp_verbs: Option<VerbsResolver>,
+    /// Which conversation each launched process is in now, written from every hook that
+    /// carries a launch id. `None` (tests, the desktop app until it wires one) records
+    /// nothing. See [`crate::launches`].
+    launches: Option<SharedLaunches>,
+    /// Told after each launch observation, so the composition root can act on a process
+    /// that changed conversation — the daemon uses it to keep that process governed.
+    on_launch: Option<LaunchObserver>,
 }
+
+/// Called with `(launch, current conversation, what changed)` after every hook that
+/// carries a launch id. See [`ControlServer::with_launches`].
+pub type LaunchObserver = Arc<dyn Fn(&str, &SessionId, &LaunchObservation) + Send + Sync>;
 
 /// Answers whether a given session has MoonlightCode's MCP verbs wired. See
 /// [`ControlServer::with_mcp_verbs`].
@@ -166,7 +178,25 @@ impl ControlServer {
             probe: Arc::new(NoProbe),
             shell_pre: Mutex::new(HashMap::new()),
             mcp_verbs: None,
+            launches: None,
+            on_launch: None,
         }
+    }
+
+    /// Record which conversation each launched process is in, from the launch id its
+    /// hooks carry, and tell `on_launch` after each observation.
+    ///
+    /// Without this a process that `/resume`s or `/clear`s is still gated — the hooks
+    /// report its new conversation — but its MCP verbs keep addressing the conversation
+    /// it was launched with, which the daemon may never have seen.
+    pub fn with_launches(
+        mut self,
+        launches: SharedLaunches,
+        on_launch: Option<LaunchObserver>,
+    ) -> Self {
+        self.launches = Some(launches);
+        self.on_launch = on_launch;
+        self
     }
 
     /// Declare which sessions can reach the `moonlight` MCP verbs, so the per-turn
@@ -246,6 +276,8 @@ impl ControlServer {
             probe: Arc::new(NoProbe),
             shell_pre: Mutex::new(HashMap::new()),
             mcp_verbs: None,
+            launches: None,
+            on_launch: None,
         }
     }
 
@@ -290,6 +322,9 @@ impl ControlServer {
         let Ok(req) = serde_json::from_slice::<HookRequest>(request_bytes) else {
             return HookResponse::fail_open();
         };
+        // Before any event filtering: every hook says which conversation its process is
+        // in, and the prompt hook is often the first one a resumed process sends.
+        self.observe_launch(&req);
         // We only gate `PreToolUse`. `PostToolUse` is observe-only: it closes the
         // shell-write scan opened before the command ran. Any other hook event
         // (Stop, Notification, …) is allowed untouched, so registering us on a
@@ -401,6 +436,24 @@ impl ControlServer {
             text.push_str(" The operator has PAUSED this session: every tool call is denied until they resume it.");
         }
         HookResponse::Context { text }
+    }
+
+    fn observe_launch(&self, req: &HookRequest) {
+        let (Some(launches), Some(launch)) = (&self.launches, req.launch_id.as_deref()) else {
+            return;
+        };
+        // Re-validated: the field crossed a socket, and only the shape we mint is routed on.
+        if !is_launch_id(launch) || req.session_id.is_empty() {
+            return;
+        }
+        let session = self.resolve_session(req);
+        let observation = launches.observe(launch, &session);
+        if let LaunchObservation::Moved { from } = &observation {
+            tracing::info!(launch, from = %from, to = %session, "a launched process changed conversation");
+        }
+        if let Some(on_launch) = &self.on_launch {
+            on_launch(launch, &session, &observation);
+        }
     }
 
     fn resolve_session(&self, req: &HookRequest) -> SessionId {
@@ -682,6 +735,7 @@ mod tests {
             tool_name: tool.into(),
             tool_input: json!({ "file_path": "/x" }),
             cwd: "/repo".into(),
+            launch_id: None,
         }
     }
 
@@ -766,6 +820,81 @@ mod tests {
     }
 
     /// Decide directly, skipping the socket — capture is what's under test here.
+    const PROMPT_EVENT_FOR_TESTS: &str = crate::hook_registration::PROMPT_EVENT;
+
+    type Seen = Arc<Mutex<Vec<(String, SessionId, LaunchObservation)>>>;
+
+    fn launch_server() -> (ControlServer, SharedLaunches, Seen) {
+        let launches: SharedLaunches = Arc::new(crate::launches::LaunchRegistry::new());
+        let seen: Seen = Arc::default();
+        let sink = seen.clone();
+        let server = ControlServer::new(Arc::new(RwLock::new(HashMap::new())), Arc::new(TestPdp))
+            .with_launches(
+                launches.clone(),
+                Some(Arc::new(
+                    move |launch: &str, session: &SessionId, obs: &LaunchObservation| {
+                        sink.lock().unwrap().push((
+                            launch.to_string(),
+                            session.clone(),
+                            obs.clone(),
+                        ));
+                    },
+                )),
+            );
+        (server, launches, seen)
+    }
+
+    fn launched(session: &str, launch: Option<&str>, event: &str) -> HookRequest {
+        let mut r = req(session, "Read");
+        r.event = event.into();
+        r.launch_id = launch.map(str::to_string);
+        r
+    }
+
+    /// The `/resume` that broke the MCP verbs: the hooks move to the new conversation,
+    /// and the launch has to move with them.
+    #[tokio::test]
+    async fn a_hook_moves_its_launch_to_the_conversation_it_reports() {
+        let (server, launches, seen) = launch_server();
+        decide_json(
+            &server,
+            &launched("a05a347e", Some("a05a347e"), "PreToolUse"),
+        )
+        .await;
+        // The prompt hook is often the first a resumed process sends; it must count too.
+        decide_json(
+            &server,
+            &launched("213d1944", Some("a05a347e"), PROMPT_EVENT_FOR_TESTS),
+        )
+        .await;
+
+        assert_eq!(
+            launches.current("a05a347e"),
+            Some(SessionId::new("213d1944"))
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].2, LaunchObservation::New);
+        assert_eq!(
+            seen[1].2,
+            LaunchObservation::Moved {
+                from: SessionId::new("a05a347e")
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_with_no_or_a_malformed_launch_records_nothing() {
+        let (server, launches, seen) = launch_server();
+        decide_json(&server, &launched("213d1944", None, "PreToolUse")).await;
+        decide_json(
+            &server,
+            &launched("213d1944", Some("../../etc/passwd"), "PreToolUse"),
+        )
+        .await;
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(launches.launch_of(&SessionId::new("213d1944")), None);
+    }
+
     async fn decide_json(server: &ControlServer, request: &HookRequest) -> HookResponse {
         server
             .decide(&serde_json::to_vec(request).expect("serialize hook request"))
@@ -897,6 +1026,7 @@ mod tests {
             tool_name: "Bash".into(),
             tool_input: json!({ "command": command }),
             cwd: "/repo".into(),
+            launch_id: None,
         }
     }
 
@@ -1270,6 +1400,7 @@ mod tests {
             tool_name: String::new(),
             tool_input: serde_json::Value::Null,
             cwd: "/repo".into(),
+            launch_id: None,
         }
     }
 
@@ -1494,6 +1625,7 @@ mod tests {
             tool_name: "mcp__phoenix__run_select_query".into(),
             tool_input: json!({}),
             cwd: "/repo".into(),
+            launch_id: None,
         })
         .unwrap();
         // The hold times out into a deny, but the notifier was already called.
@@ -1514,6 +1646,7 @@ mod tests {
             tool_name: crate::gate::EXIT_PLAN_MODE.into(),
             tool_input: json!({ "plan": "1. do X" }),
             cwd: "/repo".into(),
+            launch_id: None,
         })
         .unwrap()
     }

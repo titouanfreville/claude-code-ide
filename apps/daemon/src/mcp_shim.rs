@@ -70,8 +70,13 @@ impl McpActor for RemoteActor {
             )
         })?;
         let url = format!("{base_url}/control/verb");
+        // The launch rides along when an IDE started this process: `CLAUDE_CODE_SESSION_ID`
+        // was read once, when Claude Code spawned this server, and goes stale the moment
+        // the process `/resume`s or `/clear`s. The daemon resolves the launch to the
+        // conversation the hooks say it is in now.
         let body = serde_json::json!({
             "session_id": req.session.as_str(),
+            "launch_id": moonlight_control::launch_id_from_env(),
             "verb": req.verb,
             "payload": req.payload,
         });

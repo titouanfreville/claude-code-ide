@@ -330,32 +330,69 @@ jobs:
           # Empty falls back to the triggering ref — see the `ref` input.
           ref: ${{ inputs.ref }}
 
+      # A versioned release that already holds this daemon keeps it: re-running a tag
+      # reuses the published bytes instead of building new ones.
+      #
+      # v0.1.3 is why. It was re-run several times; every run rebuilt the daemons and
+      # overwrote the release assets, while the marketplaces kept the first run's
+      # extensions (an already-live version is skipped). The published extension then
+      # pinned hashes for bytes the release no longer had, and every fresh install
+      # failed its checksum. Reusing the asset makes the pins of any re-run agree with
+      # what was published first.
+      #
+      # Not for `nightly`: that tag is rolling and its assets are named per commit, so
+      # an existing asset under it is never this run's.
+      - name: Reuse the daemon this release already published
+        id: reuse
+        if: inputs.tag != 'nightly'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          asset="moonlightd-${VERSION}-${TGT}.gz"
+          if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p "$asset" -D dist 2>/dev/null; then
+            echo "::notice::reusing $asset already published on $TAG"
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.reuse.outputs.hit != 'true'
         with:
           targets: ${{ matrix.target }}
 
       # Registry only, same reasoning as the release job above: four more multi-GB
       # target caches is what pushed the repo over its 10 GB allowance.
       - uses: Swatinem/rust-cache@v2
+        if: steps.reuse.outputs.hit != 'true'
         with:
           key: daemon-${{ matrix.target }}
           cache-targets: false
 
       - name: Build moonlightd
+        if: steps.reuse.outputs.hit != 'true'
         run: cargo build --release -p moonlight-daemon --target "$TGT"
         shell: bash
 
       # Gzip rather than tar: the extension fetches exactly one file and gunzips it
       # in process, so an archive format would only add an extraction step that has
       # to behave identically on three platforms.
+      #
+      # `-n` keeps the input's name and mtime out of the header, so the asset hash
+      # depends on the binary alone rather than on when this runner wrote it.
       - name: Package daemon
+        if: steps.reuse.outputs.hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
           bin="target/${TGT}/release/moonlightd"
           [ -f "$bin" ] || bin="target/${TGT}/release/moonlightd.exe"
-          gzip -9 -c "$bin" > "dist/moonlightd-${VERSION}-${TGT}.gz"
+          gzip -9 -n -c "$bin" > "dist/moonlightd-${VERSION}-${TGT}.gz"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -424,4 +461,67 @@ jobs:
         with:
           name: vsix
           path: vsix/*.vsix
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # The JetBrains plugins (PyCharm, IntelliJ, ...).
+  #
+  # Pinned from the same daemon artifacts as the .vsix, by the same script, so both
+  # clients of one release trust exactly one set of bytes. Without this job the core
+  # plugin had no `daemon-pins.json` at all and could never install a daemon.
+  # --------------------------------------------------------------------------
+  jetbrains:
+    name: jetbrains
+    needs: daemon
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      VERSION: ${{ inputs.version }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Empty falls back to the triggering ref — see the `ref` input.
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # The IntelliJ Platform Gradle Plugin needs JDK 21 (see mise.toml).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: daemon-artifacts
+          pattern: moonlightd-*
+          merge-multiple: true
+
+      # No `npm ci`: pin-daemon.js uses only Node built-ins.
+      - name: Pin the daemon build the plugins may download
+        working-directory: clients/vscode
+        run: node scripts/pin-daemon.js "$VERSION" "$TAG" "$GITHUB_WORKSPACE/daemon-artifacts"
+
+      # `pluginVersion` from the workflow rather than gradle.properties, so the nightly's
+      # `nightly-<sha>` and a tag's version both land in the zips' names and descriptors.
+      - name: Test and build
+        working-directory: clients/jetbrains
+        run: ./gradlew --no-daemon test buildPlugin -PpluginVersion="$VERSION"
+
+      - name: Collect the plugins
+        run: |
+          set -euo pipefail
+          mkdir -p jetbrains
+          find clients/jetbrains/plugins -path '*/build/distributions/*.zip' -exec cp {} jetbrains/ \;
+          ls -l jetbrains
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jetbrains
+          path: jetbrains/*.zip
           if-no-files-found: error

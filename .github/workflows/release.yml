@@ -18,9 +18,8 @@ on:
       skip:
         description: >-
           Comma-separated extension names to leave out of the marketplace publish, for
-          re-running a release whose publish half-succeeded. A marketplace rejects
-          re-publishing a version it already has, so without this the first already-live
-          extension fails the step and the ones still missing never go out.
+          re-running a release whose publish half-succeeded. Optional: a version the
+          marketplace already has is reported as a warning and skipped.
         required: false
         default: ''
         type: string
@@ -88,6 +87,62 @@ jobs:
           files: artifacts/*
 
   # --------------------------------------------------------------------------
+  # Do the extensions trust the daemons the release actually holds?
+  #
+  # v0.1.3 shipped extensions pinned to daemons the release no longer had: a re-run
+  # replaced the assets, the marketplaces kept the first run's extensions, and every
+  # fresh install failed its checksum. build.yml now reuses published daemons, and this
+  # proves it worked — the hashes come from the *release*, re-downloaded, not from this
+  # run's artifacts, so it checks what an installing user will fetch.
+  #
+  # Gates both marketplace jobs: a mismatch must stop before anything installable is out.
+  # --------------------------------------------------------------------------
+  verify-pins:
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '{vsix,jetbrains}'
+          path: packages
+          merge-multiple: true
+
+      - name: Check every pinned hash against the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -p 'moonlightd-*.gz' -D released
+          # The pins as each client will read them: the bundled extension source, and
+          # the JSON resource inside the core plugin's jar.
+          unzip -p "packages/moonlight-core-${VERSION}.vsix" 'extension/dist/extension.js' > vsix-pins.txt
+          unzip -q -o "packages/moonlight-core-${VERSION}.zip" -d core-plugin
+          for jar in core-plugin/*/lib/*.jar; do
+            unzip -p "$jar" moonlight/daemon-pins.json 2>/dev/null || true
+          done > jetbrains-pins.json
+          [ -s jetbrains-pins.json ] || { echo "::error::the core JetBrains plugin carries no daemon-pins.json"; exit 1; }
+          bad=0
+          for gz in released/*.gz; do
+            asset="$(sha256sum "$gz" | cut -d' ' -f1)"
+            binary="$(gunzip -c "$gz" | sha256sum | cut -d' ' -f1)"
+            for pins in vsix-pins.txt jetbrains-pins.json; do
+              for h in "$asset" "$binary"; do
+                if ! grep -qF "$h" "$pins"; then
+                  echo "::error::$(basename "$gz"): $h is not pinned in $pins"
+                  bad=1
+                fi
+              done
+            done
+          done
+          [ "$bad" = 0 ] && echo "all $(ls released | wc -l) daemons match both clients' pins"
+          exit "$bad"
+
+  # --------------------------------------------------------------------------
   # Marketplace publish.
   #
   # Publishes the .vsix that `build` produced, never a locally packaged one: the
@@ -104,7 +159,7 @@ jobs:
   # release with the .vsix attached, just not a published one.
   # --------------------------------------------------------------------------
   marketplace:
-    needs: [version, build, publish]
+    needs: [version, build, publish, verify-pins]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -158,7 +213,7 @@ jobs:
           [ -n "${SKIP:-}" ] && args=(--skip "$SKIP")
           node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" "${args[@]}" | while read -r pkg; do
             echo "--> $(basename "$pkg")"
-            ./node_modules/.bin/vsce publish --packagePath "$pkg"
+            scripts/publish-vsix.sh vsce "$pkg"
           done
 
       - name: Publish to Open VSX
@@ -188,7 +243,57 @@ jobs:
           # argument puts a live marketplace token in the process argument list.
           node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" "${args[@]}" | while read -r pkg; do
             echo "--> $(basename "$pkg")"
-            ./node_modules/.bin/ovsx publish --packagePath "$pkg"
+            scripts/publish-vsix.sh ovsx "$pkg"
+          done
+
+  # --------------------------------------------------------------------------
+  # JetBrains Marketplace publish.
+  #
+  # Uploads the zips `build` produced, for the same reason the VS Code job uses
+  # `--packagePath`: only those carry the daemon pins. Through the upload API rather
+  # than `gradlew publishPlugin`, which would rebuild — and a rebuilt plugin is not the
+  # one `verify-pins` checked.
+  #
+  # The API only accepts updates: each plugin's first version has to be uploaded by
+  # hand on plugins.jetbrains.com. Skips itself without a token, like the others.
+  # --------------------------------------------------------------------------
+  jetbrains-marketplace:
+    needs: [version, build, publish, verify-pins]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: jetbrains
+          path: jetbrains
+
+      - name: Publish to the JetBrains Marketplace
+        env:
+          JETBRAINS_MARKETPLACE_TOKEN: ${{ secrets.JETBRAINS_MARKETPLACE_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${JETBRAINS_MARKETPLACE_TOKEN:-}" ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "::error::JETBRAINS_MARKETPLACE_TOKEN is not set — this run was asked to publish."
+              exit 1
+            fi
+            echo "::warning::JETBRAINS_MARKETPLACE_TOKEN is not set — skipping the JetBrains Marketplace publish."
+            exit 0
+          fi
+          # Core first: every other plugin depends on it, and a dependant whose
+          # dependency is not yet available at this version is not installable.
+          for name in core status session-control agentic-support ai-review; do
+            zip="jetbrains/moonlight-${name}-${VERSION}.zip"
+            echo "--> $(basename "$zip")"
+            # The token goes in a header read from the environment, not on the
+            # command line where it would sit in the process list.
+            curl -fsS --retry 3 \
+              -H @<(printf 'Authorization: Bearer %s\n' "$JETBRAINS_MARKETPLACE_TOKEN") \
+              -F "xmlId=io.github.titouanfreville.moonlight.${name}" \
+              -F "file=@${zip}" \
+              https://plugins.jetbrains.com/plugin/uploadPlugin
+            echo
           done
 
   # --------------------------------------------------------------------------
@@ -209,7 +314,7 @@ jobs:
     # only [version, publish] it ran *concurrently* with the publish it says it follows,
     # so a red result could land while extensions were still going out — and anyone
     # reasoning "the run is red, so nothing shipped" would have been wrong.
-    needs: [version, publish, marketplace]
+    needs: [version, publish, marketplace, jetbrains-marketplace]
     if: always() && needs.publish.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10

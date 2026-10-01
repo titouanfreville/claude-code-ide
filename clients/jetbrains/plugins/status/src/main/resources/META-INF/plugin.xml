@@ -1,0 +1,31 @@
+<idea-plugin>
+    <id>io.github.titouanfreville.moonlight.status</id>
+    <name>MoonlightCode Status</name>
+    <vendor url="https://github.com/titouanfreville/moonlight-ide-plugins">titouanfreville</vendor>
+
+    <description><![CDATA[
+    <p>Status-bar indicators for MoonlightCode: whether anything is actually gated — hooks
+    installed, session adopted, and the phase that decides whether the agent in front of you
+    can write — and a Claude usage readout with the 5-hour and weekly windows, context
+    occupancy and session uptime.</p>
+    <p>Unknown figures show as <code>—</code>, never as 0.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>io.github.titouanfreville.moonlight.core</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <statusBarWidgetFactory id="MoonlightGating"
+                                implementation="io.github.titouanfreville.moonlight.status.GatingWidgetFactory"/>
+        <statusBarWidgetFactory id="MoonlightUsage"
+                                implementation="io.github.titouanfreville.moonlight.status.UsageWidgetFactory"
+                                order="after MoonlightGating"/>
+    </extensions>
+
+    <actions>
+        <action id="Moonlight.Status.RefreshUsage"
+                class="io.github.titouanfreville.moonlight.status.RefreshUsageAction"
+                text="MoonlightCode: Refresh Claude Usage"
+                description="Read Claude usage and session state from MoonlightCode now"/>
+    </actions>
+</idea-plugin>

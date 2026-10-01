@@ -42,13 +42,14 @@ export interface OwnedTerminals {
 export interface ActiveSession {
     sessionId: string;
     /**
-     * - `panel`   — linked to the agent panel you are looking at. Most specific: it
-     *              lets several panels each track their own session.
+     * - `panel`   — the agent panel you are looking at, linked by hand or matched by
+     *              its tab label. Most specific: several panels each track their own.
      * - `owned`   — we launched it, so the id is certain.
+     * - `recent`  — the agent panel you were last in, while focus is elsewhere.
      * - `pinned`  — the operator pinned it for the whole workspace.
      * - `sole`    — the only session running in this workspace; a good guess, no more.
      */
-    how: 'panel' | 'owned' | 'pinned' | 'sole';
+    how: 'panel' | 'owned' | 'recent' | 'pinned' | 'sole';
 }
 /**
  * A session that is stopped at the gate, waiting for an operator.

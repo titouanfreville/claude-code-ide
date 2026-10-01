@@ -1,2 +1,5 @@
 [tools]
 bats = "latest"
+# JetBrains clients (clients/jetbrains): the IntelliJ Platform Gradle Plugin needs JDK 21.
+java = "temurin-21"
+gradle = "9.8.0"

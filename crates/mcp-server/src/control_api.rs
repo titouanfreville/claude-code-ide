@@ -10,6 +10,7 @@
 //! reuse the exact same [`moonlight_engine::Command`] channel and domain store
 //! ports the desktop UI already drives — no new state, no new policy.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
@@ -55,6 +56,103 @@ pub struct ReviewQueueItem {
     /// couldn't be read (the item still appears so the operator knows something
     /// changed, rather than silently dropping it from the queue).
     pub diff: String,
+    /// The diff was left out — the caller asked without diffs, or it exceeded
+    /// [`MAX_QUEUE_DIFF_BYTES`]. Distinct from an empty diff, which means "unreadable".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub diff_omitted: bool,
+    /// Git ignores this path: build output, dependencies, local secrets. Not reviewed —
+    /// it is never pushed — but not hidden either: the item stands for everything
+    /// written under `file_path`, the first ignored level (`node_modules/`, `.env`),
+    /// so the operator sees *that* it changed without a diff per generated file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ignored: bool,
+    /// How many written files the ignored item stands for.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub ignored_files: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// How long a path's ignore status is trusted. Ignore rules rarely change, and the
+/// unreviewed count rides every client's five-second poll — without this each poll
+/// would run `git check-ignore` once per session.
+const IGNORE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+type IgnoreProbe = dyn Fn(&std::path::Path, &[String]) -> HashMap<String, String> + Send + Sync;
+
+/// One root's answers, and when they were read: path → its mask, or `None` when not ignored.
+type CachedMasks = (std::time::Instant, HashMap<String, Option<String>>);
+
+/// Git-ignore masks per session root, cached for [`IGNORE_TTL`]. See
+/// [`moonlight_control::ignored_masks`].
+pub struct IgnoreMasks {
+    probe: Arc<IgnoreProbe>,
+    cache: std::sync::Mutex<HashMap<String, CachedMasks>>,
+}
+
+impl IgnoreMasks {
+    pub fn new(
+        probe: impl Fn(&std::path::Path, &[String]) -> HashMap<String, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            probe: Arc::new(probe),
+            cache: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The system `git`.
+    pub fn git() -> Self {
+        Self::new(moonlight_control::ignored_masks)
+    }
+
+    /// Masks for those of `paths` that git ignores under `root`; only paths not
+    /// already cached are asked about.
+    fn masks(&self, root: Option<&str>, paths: &[String]) -> HashMap<String, String> {
+        let Some(root) = root else {
+            return HashMap::new();
+        };
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = cache
+            .entry(root.to_string())
+            .or_insert_with(|| (std::time::Instant::now(), HashMap::new()));
+        if entry.0.elapsed() > IGNORE_TTL {
+            *entry = (std::time::Instant::now(), HashMap::new());
+        }
+        let unknown: Vec<String> = paths
+            .iter()
+            .filter(|p| !entry.1.contains_key(*p))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            let found = (self.probe)(std::path::Path::new(root), &unknown);
+            for path in unknown {
+                let mask = found.get(&path).cloned();
+                entry.1.insert(path, mask);
+            }
+        }
+        paths
+            .iter()
+            .filter_map(|p| entry.1.get(p).cloned().flatten().map(|m| (p.clone(), m)))
+            .collect()
+    }
+}
+
+/// Largest diff the queue carries inline. A session that ran a build or an install
+/// writes generated files whose diffs run to megabytes each; one of those is
+/// unreadable as a preview and, summed over a fleet, made the whole queue too slow to
+/// poll. The operator still sees the file, and the diff view reads both sides itself.
+pub const MAX_QUEUE_DIFF_BYTES: usize = 512 * 1024;
+
+/// Narrows `/control/review-queue`. All optional, so a client that sends none gets
+/// the whole queue, diffs included, as before.
+#[derive(Debug, Default, Deserialize)]
+pub struct ReviewQueueQuery {
+    pub session: Option<String>,
+    pub path: Option<String>,
+    /// `false` leaves every diff out: a list of files does not need them.
+    pub diffs: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +226,12 @@ pub struct DiscoverableSession {
     ///
     /// Always 0 for an unadopted session — the ledger only records adopted ones.
     pub unreviewed_files: usize,
+    /// The launch currently in this conversation — the id an IDE minted when it started
+    /// the process — when that process changed conversation or is otherwise known by its
+    /// hooks. Lets the IDE that launched it follow it from the id it minted to the one it
+    /// is in now: its terminal, its panel link. Omitted when no launch is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -381,6 +485,11 @@ pub struct ControlApiState {
     /// build without it simply has no MCP to hand out.
     #[cfg(feature = "mcp-transport")]
     mcp: Option<Arc<crate::McpHost>>,
+    /// Which conversation each launched process is in, fed by the hook gate. `None`
+    /// reports no launch ids.
+    launches: Option<moonlight_control::SharedLaunches>,
+    /// Which written paths git ignores — kept out of review, shown as warnings.
+    ignore: Arc<IgnoreMasks>,
 }
 
 impl ControlApiState {
@@ -407,6 +516,8 @@ impl ControlApiState {
             // Opt in with `with_mcp_host`: a host that binds no MCP must not claim to.
             #[cfg(feature = "mcp-transport")]
             mcp: None,
+            launches: None,
+            ignore: Arc::new(IgnoreMasks::git()),
         }
     }
 }
@@ -424,6 +535,19 @@ impl ControlApiState {
     /// hook the gate is holding rather than a second, unrelated one.
     pub fn with_pending(mut self, pending: Arc<moonlight_control::PendingApprovals>) -> Self {
         self.pending = pending;
+        self
+    }
+
+    /// Report each conversation's launch (see [`DiscoverableSession::launch_id`]), from
+    /// the registry the hook gate feeds.
+    pub fn with_launches(mut self, launches: moonlight_control::SharedLaunches) -> Self {
+        self.launches = Some(launches);
+        self
+    }
+
+    /// Replace how ignored paths are found — tests, mostly; the default asks `git`.
+    pub fn with_ignore_masks(mut self, ignore: IgnoreMasks) -> Self {
+        self.ignore = Arc::new(ignore);
         self
     }
 }
@@ -453,6 +577,11 @@ pub struct McpEndpointResponse {
 #[derive(Debug, serde::Deserialize)]
 pub struct VerbRequest {
     pub session_id: String,
+    /// The launch the calling process belongs to, when it was started by an IDE. Wins
+    /// over `session_id` — which is the conversation the process had when its MCP server
+    /// spawned, and goes stale on `/resume` or `/clear`.
+    #[serde(default)]
+    pub launch_id: Option<String>,
     pub verb: moonlight_domain::trust::McpVerb,
     #[serde(default)]
     pub payload: String,
@@ -496,8 +625,16 @@ async fn run_verb(
     let Some(host) = state.mcp.as_ref() else {
         return Err(StatusCode::NOT_IMPLEMENTED);
     };
+    let session = match body
+        .launch_id
+        .as_deref()
+        .filter(|l| moonlight_control::is_launch_id(l))
+    {
+        Some(launch) => host.resolve_launch(launch),
+        None => SessionId::new(body.session_id),
+    };
     let request = moonlight_domain::ports::mcp::ActorRequest {
-        session: SessionId::new(body.session_id),
+        session,
         verb: body.verb,
         payload: body.payload,
     };
@@ -827,29 +964,107 @@ fn account_usage(q: moonlight_core::obs::Quota) -> AccountUsage {
     }
 }
 
-async fn review_queue(State(state): State<ControlApiState>) -> Json<Vec<ReviewQueueItem>> {
-    Json(collect_review_queue(&state.sessions, &state.changes))
+async fn review_queue(
+    State(state): State<ControlApiState>,
+    Query(q): Query<ReviewQueueQuery>,
+) -> Json<Vec<ReviewQueueItem>> {
+    Json(collect_review_queue_filtered(
+        &state.sessions,
+        &state.changes,
+        &state.ignore,
+        &q,
+    ))
 }
 
 /// Every unreviewed file across adopted managed sessions, with its diff. Kept free
 /// of the HTTP types so it's unit-testable against fake stores.
+#[cfg_attr(not(test), allow(dead_code))]
 fn collect_review_queue(
     sessions: &Arc<dyn ManagedSessionStore>,
     changes: &Arc<dyn SessionChangeStore>,
 ) -> Vec<ReviewQueueItem> {
+    collect_review_queue_filtered(
+        sessions,
+        changes,
+        &IgnoreMasks::new(|_, _| HashMap::new()),
+        &ReviewQueueQuery::default(),
+    )
+}
+
+/// [`collect_review_queue`], narrowed by `q`. Diffs are rendered only for the items
+/// returned, and only when asked for — rendering reads the file from disk, which is
+/// what made the unfiltered queue slow.
+fn collect_review_queue_filtered(
+    sessions: &Arc<dyn ManagedSessionStore>,
+    changes: &Arc<dyn SessionChangeStore>,
+    ignore: &IgnoreMasks,
+    q: &ReviewQueueQuery,
+) -> Vec<ReviewQueueItem> {
     let Ok(managed) = sessions.all_managed() else {
         return Vec::new();
     };
+    let with_diffs = q.diffs.unwrap_or(true);
     let mut items = Vec::new();
     for session in managed {
-        if !session.adopted {
+        if !session.adopted
+            || q.session
+                .as_deref()
+                .is_some_and(|id| id != session.id.as_str())
+        {
             continue;
         }
         let Ok(touched) = changes.touched_paths(&session.id) else {
             continue;
         };
-        for touch in touched.into_iter().filter(|t| !t.reviewed) {
-            let diff = render_diff(session.root.as_deref(), &session.id, &touch.path, changes);
+        let unreviewed: Vec<_> = touched
+            .into_iter()
+            .filter(|t| !t.reviewed && !created_then_deleted(session.root.as_deref(), t))
+            .collect();
+        let paths: Vec<String> = unreviewed.iter().map(|t| t.path.clone()).collect();
+        let masks = ignore.masks(session.root.as_deref(), &paths);
+        // Ignored writes collapse into one item per first ignored level, in the order
+        // the first of each was met (most recently written first).
+        let mut masked: Vec<ReviewQueueItem> = Vec::new();
+        for touch in &unreviewed {
+            let Some(mask) = masks.get(&touch.path) else {
+                continue;
+            };
+            if q.path.as_deref().is_some_and(|p| p != mask) {
+                continue;
+            }
+            match masked.iter_mut().find(|i| &i.file_path == mask) {
+                Some(item) => {
+                    item.ignored_files += 1;
+                    item.touches += touch.touches;
+                }
+                None => masked.push(ReviewQueueItem {
+                    session_id: session.id.as_str().to_string(),
+                    session_title: session.title.clone(),
+                    file_path: mask.clone(),
+                    touches: touch.touches,
+                    tool: touch.tool,
+                    created: false,
+                    from_head: false,
+                    diff: String::new(),
+                    diff_omitted: true,
+                    ignored: true,
+                    ignored_files: 1,
+                }),
+            }
+        }
+        for touch in unreviewed.into_iter().filter(|t| {
+            !masks.contains_key(&t.path) && q.path.as_deref().map_or(true, |p| p == t.path)
+        }) {
+            let (diff, diff_omitted) = if with_diffs {
+                let diff = render_diff(session.root.as_deref(), &session.id, &touch.path, changes);
+                if diff.len() > MAX_QUEUE_DIFF_BYTES {
+                    (String::new(), true)
+                } else {
+                    (diff, false)
+                }
+            } else {
+                (String::new(), true)
+            };
             items.push(ReviewQueueItem {
                 session_id: session.id.as_str().to_string(),
                 session_title: session.title.clone(),
@@ -859,10 +1074,28 @@ fn collect_review_queue(
                 from_head: touch.from_head,
                 file_path: touch.path,
                 diff,
+                diff_omitted,
+                ignored: false,
+                ignored_files: 0,
             });
         }
+        // After the reviewable files: warnings, not work.
+        items.extend(masked);
     }
     items
+}
+
+/// A file the session created and has since deleted: on disk, nothing changed, so
+/// there is nothing to review — a squashed migration, a scratch file, a removed worktree.
+fn created_then_deleted(
+    root: Option<&str>,
+    touch: &moonlight_domain::changes::TouchedPath,
+) -> bool {
+    let path = match root {
+        Some(root) => std::path::Path::new(root).join(&touch.path),
+        None => std::path::PathBuf::from(&touch.path),
+    };
+    touch.created && !path.exists()
 }
 
 /// A unified diff of `path` against `session`'s recorded baseline, or empty when
@@ -882,8 +1115,12 @@ fn render_diff(
     let Some(before) = baseline.text() else {
         return String::new();
     };
-    let Ok(after) = std::fs::read_to_string(std::path::Path::new(root).join(path)) else {
-        return String::new();
+    // A file the session deleted is a change like any other: everything it held, removed.
+    // Only a file that exists and cannot be read leaves the diff empty.
+    let after = match std::fs::read_to_string(std::path::Path::new(root).join(path)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return String::new(),
     };
     similar::TextDiff::from_lines(before, &after)
         .unified_diff()
@@ -896,12 +1133,28 @@ async fn accept(
     Json(body): Json<AcceptRequest>,
 ) -> StatusCode {
     let session = SessionId::new(body.session_id);
-    let _ = state.changes.mark_reviewed(
-        &session,
-        &body.path,
-        Some(Timestamp::from_millis(now_millis())),
-    );
+    let _ = mark_reviewed_at(&state.changes, &session, &body.path);
     StatusCode::NO_CONTENT
+}
+
+/// Mark `path` reviewed — or, for an ignored directory item (a path ending in `/`),
+/// every unreviewed file written under it: the item stands for all of them.
+fn mark_reviewed_at(
+    changes: &Arc<dyn SessionChangeStore>,
+    session: &SessionId,
+    path: &str,
+) -> Result<bool, moonlight_domain::StoreError> {
+    let at = Some(Timestamp::from_millis(now_millis()));
+    if !path.ends_with('/') {
+        return changes.mark_reviewed(session, path, at);
+    }
+    let mut any = false;
+    for touch in changes.touched_paths(session)? {
+        if !touch.reviewed && touch.path.starts_with(path) {
+            any |= changes.mark_reviewed(session, &touch.path, at)?;
+        }
+    }
+    Ok(any)
 }
 
 async fn reject(
@@ -931,14 +1184,7 @@ async fn reject(
     // the same rejected file would nag on every poll while the agent is still
     // acting on the feedback. Done even when the message couldn't be delivered, so
     // the operator's review decision isn't silently undone.
-    let reviewed = state
-        .changes
-        .mark_reviewed(
-            &session,
-            &body.path,
-            Some(Timestamp::from_millis(now_millis())),
-        )
-        .is_ok();
+    let reviewed = mark_reviewed_at(&state.changes, &session, &body.path).is_ok();
     Json(RejectResponse {
         reviewed,
         feedback: delivery,
@@ -949,11 +1195,25 @@ async fn reject(
 /// rendered, which is what makes this cheap enough to ride the client's poll.
 /// A store error counts as zero: an indicator that under-reports is a missing badge,
 /// while one that reports a number it could not read is a lie about the tree.
-fn unreviewed_count(changes: &Arc<dyn SessionChangeStore>, session: &SessionId) -> usize {
-    changes
-        .touched_paths(session)
-        .map(|touched| touched.iter().filter(|t| !t.reviewed).count())
-        .unwrap_or(0)
+///
+/// Git-ignored files are left out: they are not up for review (see
+/// [`ReviewQueueItem::ignored`]), so counting them would badge a session for its build.
+fn unreviewed_count(
+    changes: &Arc<dyn SessionChangeStore>,
+    ignore: &IgnoreMasks,
+    session: &SessionId,
+    root: Option<&str>,
+) -> usize {
+    let Ok(touched) = changes.touched_paths(session) else {
+        return 0;
+    };
+    let paths: Vec<String> = touched
+        .into_iter()
+        .filter(|t| !t.reviewed && !created_then_deleted(root, t))
+        .map(|t| t.path)
+        .collect();
+    let masked = ignore.masks(root, &paths);
+    paths.iter().filter(|p| !masked.contains_key(*p)).count()
 }
 
 async fn discoverable_sessions(
@@ -964,13 +1224,19 @@ async fn discoverable_sessions(
         .all()
         .into_iter()
         .map(|s| DiscoverableSession {
-            unreviewed_files: unreviewed_count(&state.changes, &s.id),
+            unreviewed_files: unreviewed_count(
+                &state.changes,
+                &state.ignore,
+                &s.id,
+                s.attached_path.as_deref(),
+            ),
             session_id: s.id.as_str().to_string(),
             title: s.title,
             root: s.attached_path,
             adopted: s.adopted,
             status: s.status,
             phase: s.phase,
+            launch_id: state.launches.as_ref().and_then(|l| l.launch_of(&s.id)),
         })
         .collect();
     sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -1480,7 +1746,6 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use moonlight_domain::agent::AgentKind;
@@ -1682,6 +1947,146 @@ mod tests {
         }
     }
 
+    /// Ignores `node_modules/` (as a directory) and `.env` (as a file), like a `.gitignore` would.
+    fn fake_ignores() -> IgnoreMasks {
+        IgnoreMasks::new(|_, paths| {
+            paths
+                .iter()
+                .filter_map(|p| {
+                    if let Some(i) = p.find("node_modules/") {
+                        Some((p.clone(), p[..i + "node_modules/".len()].to_string()))
+                    } else if p.ends_with("/.env") {
+                        Some((p.clone(), p.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn ignored_writes_collapse_to_their_first_ignored_level_after_the_reviewable_files() {
+        let sessions: Arc<dyn ManagedSessionStore> =
+            Arc::new(FakeSessions(vec![session("s1", "/repo", true)]));
+        let changes: Arc<dyn SessionChangeStore> = Arc::new(FakeChanges {
+            touched: HashMap::from([(
+                "s1".to_string(),
+                vec![
+                    touched("/repo/web/node_modules/a/x.js", false),
+                    touched("/repo/src/main.rs", false),
+                    touched("/repo/web/node_modules/b/y.js", false),
+                    touched("/repo/.env", false),
+                ],
+            )]),
+            ..Default::default()
+        });
+        let items = collect_review_queue_filtered(
+            &sessions,
+            &changes,
+            &fake_ignores(),
+            &ReviewQueueQuery::default(),
+        );
+        let shape: Vec<(&str, bool, u32)> = items
+            .iter()
+            .map(|i| (i.file_path.as_str(), i.ignored, i.ignored_files))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("/repo/src/main.rs", false, 0),
+                ("/repo/web/node_modules/", true, 2),
+                ("/repo/.env", true, 1)
+            ]
+        );
+        // A warning has nothing to diff.
+        assert!(items
+            .iter()
+            .filter(|i| i.ignored)
+            .all(|i| i.diff.is_empty() && i.diff_omitted));
+        // Ignored writes are not up for review, so they do not count toward the badge.
+        assert_eq!(
+            unreviewed_count(
+                &changes,
+                &fake_ignores(),
+                &SessionId::new("s1"),
+                Some("/repo")
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn marking_an_ignored_directory_reviewed_settles_every_file_under_it() {
+        let fake = Arc::new(FakeChanges {
+            touched: HashMap::from([(
+                "s1".to_string(),
+                vec![
+                    touched("/repo/web/node_modules/a/x.js", false),
+                    touched("/repo/web/node_modules/b/y.js", false),
+                    touched("/repo/src/main.rs", false),
+                ],
+            )]),
+            ..Default::default()
+        });
+        let changes: Arc<dyn SessionChangeStore> = fake.clone();
+        assert!(
+            mark_reviewed_at(&changes, &SessionId::new("s1"), "/repo/web/node_modules/").unwrap()
+        );
+        let marked: Vec<String> = fake
+            .marked_reviewed
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, p)| p.clone())
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                "/repo/web/node_modules/a/x.js",
+                "/repo/web/node_modules/b/y.js"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_reads_as_a_deletion_and_a_created_then_deleted_one_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("ml-queue-deleted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_string_lossy().into_owned();
+        let gone = format!("{root}/gone.py");
+        let scratch = format!("{root}/scratch.py");
+        let sessions: Arc<dyn ManagedSessionStore> =
+            Arc::new(FakeSessions(vec![session("s1", &root, true)]));
+        let changes: Arc<dyn SessionChangeStore> = Arc::new(FakeChanges {
+            touched: HashMap::from([(
+                "s1".to_string(),
+                vec![
+                    touched(&gone, false),
+                    TouchedPath {
+                        created: true,
+                        ..touched(&scratch, false)
+                    },
+                ],
+            )]),
+            baselines: HashMap::from([(
+                ("s1".to_string(), gone.clone()),
+                Baseline::Content("print('hi')\n".to_string()),
+            )]),
+            ..Default::default()
+        });
+        let items = collect_review_queue(&sessions, &changes);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].file_path, gone);
+        assert!(items[0].diff.contains("-print('hi')"), "{}", items[0].diff);
+        let none = IgnoreMasks::new(|_, _| HashMap::new());
+        assert_eq!(
+            unreviewed_count(&changes, &none, &SessionId::new("s1"), Some(&root)),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn unreviewed_count_counts_only_what_is_still_unreviewed() {
         let changes: Arc<dyn SessionChangeStore> = Arc::new(FakeChanges {
@@ -1695,10 +2100,88 @@ mod tests {
             )]),
             ..Default::default()
         });
-        assert_eq!(unreviewed_count(&changes, &SessionId::new("s1")), 2);
+        let none = IgnoreMasks::new(|_, _| HashMap::new());
+        assert_eq!(
+            unreviewed_count(&changes, &none, &SessionId::new("s1"), Some("/repo")),
+            2
+        );
         // A session with nothing in the ledger — every unadopted one — reads zero
         // rather than erroring, so the badge simply does not appear.
-        assert_eq!(unreviewed_count(&changes, &SessionId::new("ghost")), 0);
+        assert_eq!(
+            unreviewed_count(&changes, &none, &SessionId::new("ghost"), Some("/repo")),
+            0
+        );
+    }
+
+    #[test]
+    fn queue_narrows_by_session_and_path_and_can_leave_diffs_out() {
+        let sessions: Arc<dyn ManagedSessionStore> = Arc::new(FakeSessions(vec![
+            session("s1", "/repo", true),
+            session("s2", "/repo", true),
+        ]));
+        let changes: Arc<dyn SessionChangeStore> = Arc::new(FakeChanges {
+            touched: HashMap::from([
+                (
+                    "s1".to_string(),
+                    vec![touched("a.txt", false), touched("b.txt", false)],
+                ),
+                ("s2".to_string(), vec![touched("c.txt", false)]),
+            ]),
+            ..Default::default()
+        });
+        let q = |session: Option<&str>, path: Option<&str>, diffs: Option<bool>| ReviewQueueQuery {
+            session: session.map(str::to_string),
+            path: path.map(str::to_string),
+            diffs,
+        };
+        let paths = |items: Vec<ReviewQueueItem>| {
+            items.into_iter().map(|i| i.file_path).collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            paths(collect_review_queue_filtered(
+                &sessions,
+                &changes,
+                &IgnoreMasks::new(|_, _| HashMap::new()),
+                &q(Some("s1"), None, None)
+            )),
+            ["a.txt", "b.txt"]
+        );
+        assert_eq!(
+            paths(collect_review_queue_filtered(
+                &sessions,
+                &changes,
+                &IgnoreMasks::new(|_, _| HashMap::new()),
+                &q(Some("s1"), Some("b.txt"), None)
+            )),
+            ["b.txt"]
+        );
+        assert_eq!(
+            collect_review_queue_filtered(
+                &sessions,
+                &changes,
+                &IgnoreMasks::new(|_, _| HashMap::new()),
+                &q(None, None, None)
+            )
+            .len(),
+            3
+        );
+
+        // Without diffs every item says so, rather than reading as an unreadable file.
+        let bare = collect_review_queue_filtered(
+            &sessions,
+            &changes,
+            &IgnoreMasks::new(|_, _| HashMap::new()),
+            &q(None, None, Some(false)),
+        );
+        assert!(
+            bare.iter().all(|i| i.diff.is_empty() && i.diff_omitted),
+            "{bare:?}"
+        );
+        // The default keeps today's shape: nothing omitted.
+        assert!(collect_review_queue(&sessions, &changes)
+            .iter()
+            .all(|i| !i.diff_omitted));
     }
 
     #[test]
@@ -1864,6 +2347,7 @@ mod tests {
             State(state),
             Json(VerbRequest {
                 session_id: "s1".into(),
+                launch_id: None,
                 verb: moonlight_domain::trust::McpVerb::PhaseStatus,
                 payload: String::new(),
             }),
@@ -1877,6 +2361,53 @@ mod tests {
             "the reason must survive: {}",
             body.output
         );
+    }
+
+    /// An actor that answers with the session it was asked about.
+    struct EchoSessionActor;
+
+    #[async_trait::async_trait]
+    impl moonlight_domain::ports::mcp::McpActor for EchoSessionActor {
+        async fn run(
+            &self,
+            req: &moonlight_domain::ports::mcp::ActorRequest,
+        ) -> Result<moonlight_domain::ports::mcp::ActorResult, moonlight_domain::ControlError>
+        {
+            Ok(moonlight_domain::ports::mcp::ActorResult {
+                ok: true,
+                compact_output: req.session.as_str().to_string(),
+            })
+        }
+    }
+
+    /// The stdio shim's `CLAUDE_CODE_SESSION_ID` is fixed when it spawns; after `/resume`
+    /// only the launch id leads to the conversation the process is in now.
+    #[tokio::test]
+    async fn a_verb_from_a_launch_acts_on_the_conversation_the_hooks_report() {
+        let launches: moonlight_control::SharedLaunches =
+            Arc::new(moonlight_control::LaunchRegistry::new());
+        launches.observe("a05a347e", &SessionId::new("213d1944"));
+        let host = crate::McpHost::with_scope(
+            Arc::new(EchoSessionActor),
+            Arc::new(crate::BusPolicyView::new()),
+            crate::VerbScope::WorkflowOnly,
+        )
+        .with_launches(launches);
+        let state = threaded_state().with_mcp_host(Arc::new(host));
+
+        let verb = |launch_id: Option<&str>| VerbRequest {
+            session_id: "a05a347e".into(),
+            launch_id: launch_id.map(str::to_string),
+            verb: moonlight_domain::trust::McpVerb::PhaseStatus,
+            payload: String::new(),
+        };
+        let Json(resumed) = run_verb(State(state.clone()), Json(verb(Some("a05a347e"))))
+            .await
+            .unwrap();
+        assert_eq!(resumed.output, "213d1944");
+        // Without a launch id the request is taken at its word, exactly as before.
+        let Json(plain) = run_verb(State(state), Json(verb(None))).await.unwrap();
+        assert_eq!(plain.output, "a05a347e");
     }
 
     /// State backed by a real store, so the thread tests exercise actual persistence

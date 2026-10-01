@@ -22,6 +22,12 @@ pub struct HookRequest {
     pub tool_input: Value,
     #[serde(default)]
     pub cwd: String,
+    /// The launch this hook's process belongs to — [`crate::launches::LAUNCH_ENV`], read
+    /// by the hook client from its own environment, never from Claude Code's payload.
+    /// It is what ties a process that changed conversation (`/resume`, `/clear`) back to
+    /// the MCP endpoint it was launched with. Absent for sessions no IDE launched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
 }
 
 /// The control server's verdict for a hook request.
@@ -68,6 +74,20 @@ mod tests {
         let req: HookRequest = serde_json::from_str(&raw).unwrap();
         assert_eq!(req.tool_name, "Edit");
         assert_eq!(req.session_id, "abc");
+    }
+
+    /// Old clients and old daemons must keep talking: the field is optional both ways.
+    #[test]
+    fn a_launch_id_round_trips_and_is_omitted_when_absent() {
+        let req: HookRequest =
+            serde_json::from_str(r#"{"session_id":"213d1944","launch_id":"a05a347e"}"#).unwrap();
+        assert_eq!(req.launch_id.as_deref(), Some("a05a347e"));
+
+        let without: HookRequest = serde_json::from_str(r#"{"session_id":"213d1944"}"#).unwrap();
+        assert_eq!(without.launch_id, None);
+        assert!(!serde_json::to_string(&without)
+            .unwrap()
+            .contains("launch_id"));
     }
 
     #[test]

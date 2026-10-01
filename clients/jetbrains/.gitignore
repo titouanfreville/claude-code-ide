@@ -1,0 +1,9 @@
+# Gradle: caches and build output are reproducible from the wrapper and the build files.
+.gradle/
+.intellijPlatform/
+.kotlin/
+build/
+
+# Written by CI from the release artifacts (see scripts/pin-daemon.js). Absent in the repo
+# on purpose: a locally built plugin never downloads a daemon.
+plugins/core/src/main/resources/moonlight/daemon-pins.json

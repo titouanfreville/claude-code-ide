@@ -29,9 +29,8 @@ on:
       skip:
         description: >-
           Comma-separated extension names to leave out (e.g. moonlight-core when it
-          is already live at this version). A marketplace rejects re-publishing a
-          version it already has, so resuming a half-finished publish means naming
-          what already went out.
+          is already live at this version). Optional: a version the marketplace
+          already has is reported as a warning and skipped.
         required: false
         default: ''
         type: string
@@ -117,7 +116,7 @@ jobs:
           [ -n "${SKIP:-}" ] && args=(--skip "$SKIP")
           node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" "${args[@]}" | while read -r pkg; do
             echo "--> $(basename "$pkg")"
-            ./node_modules/.bin/vsce publish --packagePath "$pkg"
+            scripts/publish-vsix.sh vsce "$pkg"
           done
 
       - name: Publish to Open VSX
@@ -153,5 +152,5 @@ jobs:
           [ -n "${SKIP:-}" ] && args=(--skip "$SKIP")
           node scripts/publish-order.js "$GITHUB_WORKSPACE/vsix" "${args[@]}" | while read -r pkg; do
             echo "--> $(basename "$pkg")"
-            ./node_modules/.bin/ovsx publish --packagePath "$pkg"
+            scripts/publish-vsix.sh ovsx "$pkg"
           done

@@ -160,12 +160,14 @@ async function activate(context) {
         }
         if (active) {
             lines.push('', active.how === 'panel'
-                ? 'Session identified: linked to this agent panel.'
+                ? 'Session identified: this agent panel.'
                 : active.how === 'owned'
                     ? 'Session identified: MoonlightCode started it.'
-                    : active.how === 'pinned'
-                        ? 'Session identified: pinned for this workspace.'
-                        : 'Session identified: only one running here — a guess. Pin one to be sure.');
+                    : active.how === 'recent'
+                        ? 'Session identified: the agent panel you were last in.'
+                        : active.how === 'pinned'
+                            ? 'Session identified: pinned for this workspace.'
+                            : 'Session identified: only one running here — a guess. Pin one to be sure.');
         }
         item.tooltip = lines.join('\n');
         item.show();

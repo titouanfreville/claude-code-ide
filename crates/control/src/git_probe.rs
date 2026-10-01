@@ -83,6 +83,145 @@ fn head_blob(root: &Path, rel_path: &str) -> Option<String> {
     String::from_utf8(out.stdout).ok()
 }
 
+/// The candidates git is asked about for one repo-relative path: every ancestor
+/// directory (trailing `/`, which `check-ignore` reads as a directory even once it no
+/// longer exists), shallowest first, then the path itself.
+fn ignore_candidates(rel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(i) = rel[at..].find('/') {
+        at += i + 1;
+        out.push(rel[..at].to_string());
+    }
+    out.push(rel.to_string());
+    out
+}
+
+/// Where `rel` is ignored from: its shallowest ignored ancestor, else itself. `None`
+/// unless git ignores the path itself — a tracked file under an ignored directory is
+/// not subject to the ignore rules, and `check-ignore` does not report it.
+fn ignore_mask(rel: &str, ignored: &std::collections::HashSet<String>) -> Option<String> {
+    if !ignored.contains(rel) {
+        return None;
+    }
+    ignore_candidates(rel)
+        .into_iter()
+        .find(|c| ignored.contains(c))
+}
+
+/// For each of `paths` (absolute) that its git repository ignores, the mask to show
+/// it under: the absolute path of its shallowest ignored ancestor (with a trailing
+/// `/`), or the file itself when only the file is ignored (`.env`).
+///
+/// Each path is checked against **its own** repository, not `root`'s: a session can
+/// write outside the directory it was started in. `root` is only the first guess, and
+/// a path under a repository already found costs no further lookup. One
+/// `git check-ignore` per repository; a path in no repository is never masked, and
+/// neither is anything when `git` is unavailable.
+pub fn ignored_masks(root: &Path, paths: &[String]) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+
+    let mut tops: Vec<PathBuf> = toplevel(root).into_iter().collect();
+    let mut outside: Vec<PathBuf> = Vec::new();
+    let mut by_top: HashMap<PathBuf, Vec<(&String, String)>> = HashMap::new();
+    for abs in paths {
+        let path = Path::new(abs);
+        let top = match tops.iter().find(|t| path.starts_with(t)) {
+            Some(top) => Some(top.clone()),
+            None => {
+                // The nearest directory that still exists: a deleted file's own
+                // directory may be gone too.
+                let dir = path.ancestors().skip(1).find(|d| d.is_dir());
+                match dir {
+                    Some(dir) if !outside.iter().any(|o| o == dir) => match toplevel(dir) {
+                        Some(top) => {
+                            tops.push(top.clone());
+                            Some(top)
+                        }
+                        None => {
+                            outside.push(dir.to_path_buf());
+                            None
+                        }
+                    },
+                    _ => None,
+                }
+            }
+        };
+        let Some(top) = top else { continue };
+        let Ok(rel) = path.strip_prefix(&top) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().into_owned();
+        if !rel.is_empty() {
+            by_top.entry(top).or_default().push((abs, rel));
+        }
+    }
+    let mut masks = HashMap::new();
+    for (top, rels) in by_top {
+        let ignored = check_ignore(
+            &top,
+            rels.iter().flat_map(|(_, rel)| ignore_candidates(rel)),
+        );
+        for (abs, rel) in rels {
+            if let Some(mask) = ignore_mask(&rel, &ignored) {
+                // `join` keeps the candidate's trailing `/`, so a directory mask stays one.
+                masks.insert(abs.clone(), top.join(&mask).to_string_lossy().into_owned());
+            }
+        }
+    }
+    masks
+}
+
+/// The `candidates` git ignores in the repository at `top`, from one `check-ignore`.
+/// Empty on any error: an error must mask nothing.
+fn check_ignore(
+    top: &Path,
+    candidates: impl Iterator<Item = String>,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let unique: HashSet<String> = candidates.collect();
+    let Ok(mut child) = Command::new("git")
+        .arg("-C")
+        .arg(top)
+        .args(["check-ignore", "--stdin", "-z"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return HashSet::new();
+    };
+    let input = unique.iter().fold(String::new(), |mut acc, c| {
+        acc.push_str(c);
+        acc.push('\0');
+        acc
+    });
+    // Written from a thread: git answers while it reads, and a large batch would fill
+    // the stdout pipe before stdin was drained.
+    let stdin = child.stdin.take();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(input.as_bytes());
+        }
+    });
+    let Ok(out) = child.wait_with_output() else {
+        return HashSet::new();
+    };
+    let _ = writer.join();
+    // 0: some ignored; 1: none; anything else is an error.
+    if !matches!(out.status.code(), Some(0) | Some(1)) {
+        return HashSet::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Answers "what is dirty here?" and "what did this file hold at HEAD?" from the
 /// system `git` — the [`WorkspaceProbe`] that makes a shell command's writes
 /// attributable (a `sed -i`, a redirect, a generated file: nothing that declared
@@ -189,6 +328,62 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn candidates_walk_from_the_shallowest_directory_to_the_file() {
+        assert_eq!(ignore_candidates("a/b/c.txt"), ["a/", "a/b/", "a/b/c.txt"]);
+        assert_eq!(ignore_candidates(".env"), [".env"]);
+    }
+
+    #[test]
+    fn a_path_is_masked_at_its_first_ignored_level_and_only_if_itself_ignored() {
+        let ignored: std::collections::HashSet<String> = [
+            "pkg/node_modules/",
+            "pkg/node_modules/x/",
+            "pkg/node_modules/x/y.js",
+            ".env",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            ignore_mask("pkg/node_modules/x/y.js", &ignored).as_deref(),
+            Some("pkg/node_modules/")
+        );
+        assert_eq!(ignore_mask(".env", &ignored).as_deref(), Some(".env"));
+        // Tracked under an ignored directory: git does not report the file itself.
+        assert_eq!(ignore_mask("pkg/node_modules/tracked.js", &ignored), None);
+        assert_eq!(ignore_mask("src/a.rs", &ignored), None);
+    }
+
+    #[test]
+    fn ignored_masks_reads_the_repository_ignore_rules() {
+        let repo = TempRepo::new("ignored-masks");
+        std::fs::write(repo.0.join(".gitignore"), "build/\n.env\n").unwrap();
+        let abs = |rel: &str| repo.0.join(rel).to_string_lossy().into_owned();
+        let paths = vec![
+            abs("mod/build/out/a.class"),
+            abs(".env"),
+            abs("src/a.rs"),
+            "/elsewhere/x".to_string(),
+        ];
+        let masks = ignored_masks(&repo.0, &paths);
+        assert_eq!(
+            masks.get(&abs("mod/build/out/a.class")),
+            Some(&(abs("mod/build") + "/"))
+        );
+        assert_eq!(masks.get(&abs(".env")), Some(&abs(".env")));
+        assert!(!masks.contains_key(&abs("src/a.rs")));
+        assert!(!masks.contains_key("/elsewhere/x"));
+
+        // A session started elsewhere that wrote into this repository: its own rules apply.
+        let other = TempRepo::new("ignored-masks-other-root");
+        let masks = ignored_masks(&other.0, &[abs("mod/build/out/a.class")]);
+        assert_eq!(
+            masks.get(&abs("mod/build/out/a.class")),
+            Some(&(abs("mod/build") + "/"))
+        );
     }
 
     #[test]

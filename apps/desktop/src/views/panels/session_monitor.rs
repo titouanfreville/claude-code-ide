@@ -1038,7 +1038,9 @@ pub fn attach_command(
         mcp_url,
     });
     // Statusline `--settings` is Claude-only; AGY would reject it (see wrap_statusline).
-    crate::agent_backend::wrap_statusline(agent, command)
+    let command = crate::agent_backend::wrap_statusline(agent, command);
+    // The launch id, so the session keeps its MCP verbs across `/resume` and `/clear`.
+    crate::agent_backend::with_launch_env(agent, id.as_str(), command)
 }
 
 /// A placeholder session record so the header/facts render before discovery, in

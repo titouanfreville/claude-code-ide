@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { ensureDaemon, resolveDaemonBinary } from './daemon';
-import { isSafeSessionId, mcpConfigFlag, safeEndpointUrl } from './index';
+import { isSafeSessionId, launchCommand, mcpConfigFlag, safeEndpointUrl } from './index';
 
 /**
  * Resolution order is the whole contract of the setting: an operator who points the
@@ -89,4 +89,20 @@ test('a session id that is not the shape we mint is refused', () => {
   assert.ok(!isSafeSessionId("abc'; id; echo '"));
   assert.ok(!isSafeSessionId('../../etc/passwd'));
   assert.ok(!isSafeSessionId(''));
+});
+
+/**
+ * The launch id has to reach `claude`'s environment: that is what its hooks inherit, and
+ * what lets the daemon follow the process across `/resume` and `/clear`.
+ */
+test('the launch command exports the launch id and pins the session', () => {
+  const id = 'c391cd75-fef3-47a8-9ff9-2544aff34d09';
+  assert.equal(
+    launchCommand(id, " --mcp-config '{}'"),
+    `env MOONLIGHT_LAUNCH_ID=${id} claude --session-id ${id} --mcp-config '{}'`
+  );
+});
+
+test('a malformed id builds no launch command', () => {
+  assert.equal(launchCommand("abc'; id; echo '", ''), undefined);
 });

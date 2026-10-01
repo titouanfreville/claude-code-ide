@@ -7,13 +7,16 @@
  *   node scripts/pin-daemon.js <version> <tag> <artifacts-dir>
  *
  * It hashes every `moonlightd-<version>-<target>.gz` it finds and writes the result
- * into `extensions/moonlight-core/src/daemon-pins.ts`, so the hashes the extension
- * verifies against are computed from the exact bytes the same release publishes.
+ * into `extensions/moonlight-core/src/daemon-pins.ts` and, for the JetBrains plugins,
+ * `clients/jetbrains/plugins/core/src/main/resources/moonlight/daemon-pins.json`, so the
+ * hashes both clients verify against are computed from the exact bytes the same release
+ * publishes.
  * Fetching a checksum file from the release at runtime would prove only that the
  * download matches whatever that release currently says — which is not a check.
  *
- * The generated file is a build artifact. It is not committed: the repo keeps
- * `DAEMON_PINS` undefined so a locally packaged .vsix never reaches for a release.
+ * The generated files are build artifacts. They are not committed: the repo keeps
+ * `DAEMON_PINS` undefined and the JSON absent, so a locally packaged extension or plugin
+ * never reaches for a release.
  */
 const crypto = require('crypto');
 const fs = require('fs');
@@ -54,6 +57,8 @@ if (targets.length === 0) {
   process.exit(1);
 }
 
+const pins = { version, tag, assets: Object.fromEntries(targets.map((t) => [t, assets[t]])) };
+
 const out = path.join(__dirname, '..', 'extensions', 'moonlight-core', 'src', 'daemon-pins.ts');
 const source = fs.readFileSync(out, 'utf8');
 const marker = source.indexOf('export const DAEMON_PINS');
@@ -68,12 +73,16 @@ const body = source.slice(0, marker);
 
 fs.writeFileSync(
   out,
-  `${body}export const DAEMON_PINS: DaemonPins | undefined = ${JSON.stringify(
-    { version, tag, assets: Object.fromEntries(targets.map((t) => [t, assets[t]])) },
-    null,
-    2
-  )};\n`
+  `${body}export const DAEMON_PINS: DaemonPins | undefined = ${JSON.stringify(pins, null, 2)};\n`
 );
+
+// Same shape `DaemonPins.parse` reads in the JetBrains core plugin. Written from the same
+// object, so the two clients cannot be pinned to different builds by one release.
+const jsonOut = path.join(
+  __dirname, '..', '..', 'jetbrains', 'plugins', 'core', 'src', 'main', 'resources', 'moonlight', 'daemon-pins.json'
+);
+fs.mkdirSync(path.dirname(jsonOut), { recursive: true });
+fs.writeFileSync(jsonOut, `${JSON.stringify(pins, null, 2)}\n`);
 
 console.log(`pinned moonlightd ${version} (tag ${tag}) for ${targets.length} target(s):`);
 for (const t of targets) console.log(`  ${t}  asset=${assets[t].asset} binary=${assets[t].binary}`);

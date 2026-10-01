@@ -87,8 +87,13 @@ export class SessionTerminals implements OwnedTerminals {
       );
     }
     // `--session-id` pins the id, the same flag the desktop app uses, so the session
-    // we start is the session we can adopt, govern and deliver reviews to.
-    terminal.sendText(`claude --session-id ${sessionId}${flags}`, true);
+    // we start is the session we can adopt, govern and deliver reviews to. The launch id
+    // exported with it is what keeps the verbs working after `/resume` or `/clear`.
+    const command = controlApi.launchCommand(sessionId, flags);
+    if (command === undefined) {
+      return;
+    }
+    terminal.sendText(command, true);
   }
 
   get(sessionId: string): vscode.Terminal | undefined {
