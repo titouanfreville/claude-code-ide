@@ -152,11 +152,24 @@ mod tests {
     /// host follows the launch through them after `/resume`.
     #[test]
     fn a_claude_launch_exports_its_launch_id_and_agy_does_not() {
-        let cmd = super::with_launch_env(AgentKind::ClaudeCode, "abc12345", "claude --session-id abc12345".into());
-        assert_eq!(cmd, "env MOONLIGHT_LAUNCH_ID=abc12345 claude --session-id abc12345");
-        assert_eq!(super::with_launch_env(AgentKind::Antigravity, "abc12345", "agy".into()), "agy");
+        let cmd = super::with_launch_env(
+            AgentKind::ClaudeCode,
+            "abc12345",
+            "claude --session-id abc12345".into(),
+        );
+        assert_eq!(
+            cmd,
+            "env MOONLIGHT_LAUNCH_ID=abc12345 claude --session-id abc12345"
+        );
+        assert_eq!(
+            super::with_launch_env(AgentKind::Antigravity, "abc12345", "agy".into()),
+            "agy"
+        );
         // A malformed id lands on no command line.
-        assert_eq!(super::with_launch_env(AgentKind::ClaudeCode, "x; rm -rf ~", "claude".into()), "claude");
+        assert_eq!(
+            super::with_launch_env(AgentKind::ClaudeCode, "x; rm -rf ~", "claude".into()),
+            "claude"
+        );
     }
 
     use super::*;
