@@ -121,16 +121,25 @@ jobs:
           # The pins as each client will read them: the bundled extension source, and
           # the JSON resource inside the core plugin's jar.
           unzip -p "packages/moonlight-core-${VERSION}.vsix" 'extension/dist/extension.js' > vsix-pins.txt
-          unzip -q -o "packages/moonlight-core-${VERSION}.zip" -d core-plugin
-          for jar in core-plugin/*/lib/*.jar; do
-            unzip -p "$jar" moonlight/daemon-pins.json 2>/dev/null || true
-          done > jetbrains-pins.json
-          [ -s jetbrains-pins.json ] || { echo "::error::the core JetBrains plugin carries no daemon-pins.json"; exit 1; }
+          sources=(vsix-pins.txt)
+          # The JetBrains build is `continue-on-error`, so its absence is a warning, not
+          # a reason to hold back the VS Code publish. A zip that *is* there must pin
+          # correctly — `jetbrains-marketplace` would otherwise ship a broken install.
+          if [ -f "packages/moonlight-core-${VERSION}.zip" ]; then
+            unzip -q -o "packages/moonlight-core-${VERSION}.zip" -d core-plugin
+            for jar in core-plugin/*/lib/*.jar; do
+              unzip -p "$jar" moonlight/daemon-pins.json 2>/dev/null || true
+            done > jetbrains-pins.json
+            [ -s jetbrains-pins.json ] || { echo "::error::the core JetBrains plugin carries no daemon-pins.json"; exit 1; }
+            sources+=(jetbrains-pins.json)
+          else
+            echo "::warning::no JetBrains plugins in this release — checking the VS Code pins only."
+          fi
           bad=0
           for gz in released/*.gz; do
             asset="$(sha256sum "$gz" | cut -d' ' -f1)"
             binary="$(gunzip -c "$gz" | sha256sum | cut -d' ' -f1)"
-            for pins in vsix-pins.txt jetbrains-pins.json; do
+            for pins in "${sources[@]}"; do
               for h in "$asset" "$binary"; do
                 if ! grep -qF "$h" "$pins"; then
                   echo "::error::$(basename "$gz"): $h is not pinned in $pins"
@@ -262,10 +271,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # `pattern`, not `name`: a named download fails when the artifact is absent, and
+      # a failed JetBrains build is allowed to leave it absent.
       - uses: actions/download-artifact@v4
         with:
-          name: jetbrains
+          pattern: jetbrains
           path: jetbrains
+          merge-multiple: true
 
       - name: Publish to the JetBrains Marketplace
         env:
@@ -273,12 +285,14 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
+          # Always a warning, even on a manual run: unlike VSCE_PAT, an unset token is
+          # the expected state until each plugin's first version is uploaded by hand.
           if [ -z "${JETBRAINS_MARKETPLACE_TOKEN:-}" ]; then
-            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-              echo "::error::JETBRAINS_MARKETPLACE_TOKEN is not set — this run was asked to publish."
-              exit 1
-            fi
             echo "::warning::JETBRAINS_MARKETPLACE_TOKEN is not set — skipping the JetBrains Marketplace publish."
+            exit 0
+          fi
+          if ! ls jetbrains/*.zip >/dev/null 2>&1; then
+            echo "::warning::no JetBrains plugins were built — nothing to publish."
             exit 0
           fi
           # Core first: every other plugin depends on it, and a dependant whose

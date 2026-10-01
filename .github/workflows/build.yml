@@ -475,6 +475,9 @@ jobs:
     needs: daemon
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    # Same trade as the desktop job: a JetBrains failure must not stop the VS Code
+    # extensions shipping. `verify-pins` in release.yml reports the missing plugins.
+    continue-on-error: true
     env:
       VERSION: ${{ inputs.version }}
       TAG: ${{ inputs.tag }}
